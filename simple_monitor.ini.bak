@@ -1,29 +1,26 @@
 [layout]
-; Left and right padding inside the overlay.
+; Horizontal padding inside the overlay content area.
 content_padding_x=8
 
-; Space between the three text columns.
+; Default gap between the main metric columns.
 column_gap=24
 
-; Optional per-column gaps. -1 uses column_gap.
+; Optional per-column overrides. Use -1 to fall back to column_gap.
 gap_after_network=10
 gap_after_system=14
 gap_after_disk=12
 
-; Distance between overlay right edge and the tray area.
+; Horizontal offset between the overlay and the tray-side anchor.
 offset_right=-52
 
-; DirectWrite font size in logical pixels before DPI scaling.
+; Base DirectWrite font size in logical pixels before DPI scaling.
 font_size=13
 key_font_size=14
 
-; Network arrow style: thin, triangle, heavy, chevron.
+; Network arrow glyph set: thin, triangle, heavy, chevron.
 network_arrow_style=thin
 network_arrow_font_size=17
 network_arrow_gap=3
 
-; Label used for disk usage.
-disk_label=SSD
-
-; Shows a compact CAP/INS/NUM status widget after the disk column.
+; Show the compact CAP/INS/NUM status widget after the disk column.
 show_key_widget=1

@@ -119,7 +119,6 @@ struct Config {
     bool show_key_widget = true;
     int gap_after_disk_dip = 14;
     std::wstring network_arrow_style = L"thin";
-    std::wstring disk_label = L"SSD";
 };
 
 struct AppState {
@@ -260,7 +259,6 @@ void LoadConfig() {
     g_app.config.show_key_widget = ReadConfigBool(L"show_key_widget", true);
     g_app.config.gap_after_disk_dip = ReadConfigInt(L"gap_after_disk", 14, 0, 220);
     g_app.config.network_arrow_style = LowerString(ReadConfigString(L"network_arrow_style", L"thin"));
-    g_app.config.disk_label = ReadConfigString(L"disk_label", L"SSD");
 }
 
 bool IsStartupEnabled() {
@@ -870,9 +868,9 @@ int CalculateOverlayWidthDip() {
         EstimatedTextWidthDip(1, g_app.config.network_arrow_font_size_dip) +
         EstimatedTextWidthDip(1) +
         g_app.config.network_arrow_gap_dip +
-        EstimatedTextWidthDip(11); // "999.9MB/s" with extra room for DirectWrite metrics
-    const int system_width = EstimatedTextWidthDip(9);  // "RAM: 100%"
-    const int disk_label_chars = static_cast<int>(g_app.config.disk_label.size());
+        EstimatedTextWidthDip(11); // Reserve enough width for the largest network rate label.
+    const int system_width = EstimatedTextWidthDip(9);  // Covers strings like "RAM: 100%".
+    const int disk_label_chars = 3;
     const int disk_width = EstimatedTextWidthDip(std::max(9, disk_label_chars + 6));
     const int key_width = g_app.config.show_key_widget ? EstimatedTextWidthDip(11, g_app.config.key_font_size_dip) : 0;
 
@@ -1541,7 +1539,7 @@ void RenderOverlay(HWND hwnd) {
         pad_y,
         static_cast<FLOAT>(width) - pad_x,
         static_cast<FLOAT>(height) - pad_y};
-    const std::wstring disk_text = g_app.config.disk_label + L": " + FormatPercent(g_app.metrics.disk);
+    const std::wstring disk_text = L"SSD: " + FormatPercent(g_app.metrics.disk);
     std::vector<TextColumn> columns{
         MakeNetworkColumn(
             FormatRate(g_app.metrics.up_bps),
@@ -1555,7 +1553,7 @@ void RenderOverlay(HWND hwnd) {
         MakeTextColumn(
             L"GPU: " + FormatPercent(g_app.metrics.gpu),
             disk_text,
-            g_app.config.disk_label + L": 100%",
+            L"SSD: 100%",
             g_app.config.show_key_widget ? static_cast<FLOAT>(Scale(g_app.config.gap_after_disk_dip, g_app.dpi)) : -1.0f),
     };
     if (g_app.config.show_key_widget) {

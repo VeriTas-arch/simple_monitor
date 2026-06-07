@@ -50,7 +50,6 @@ key_font_size=13
 network_arrow_style=thin
 network_arrow_font_size=17
 network_arrow_gap=3
-disk_label=SSD
 show_key_widget=1
 ```
 

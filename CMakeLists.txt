@@ -27,19 +27,23 @@ target_link_libraries(simple_monitor PRIVATE
     oleacc
 )
 
-# MinGW Unicode 入口点支持：
-# 使用 wWinMain，而不是 WinMain。
+# Enable MinGW Unicode entry point handling so the app uses `wWinMain`
+# instead of the ANSI `WinMain` startup path.
 if(MINGW)
     target_compile_options(simple_monitor PRIVATE
         -municode
+        $<$<CONFIG:Release>:-ffunction-sections>
+        $<$<CONFIG:Release>:-fdata-sections>
     )
 
     target_link_options(simple_monitor PRIVATE
         -municode
+        $<$<CONFIG:Release>:-Wl,--gc-sections>
     )
 endif()
 
-# 检查当前编译器和链接器是否支持 IPO/LTO。
+# Probe whether the active compiler and linker support IPO/LTO before
+# enabling it for the Release configuration.
 include(CheckIPOSupported)
 
 check_ipo_supported(
@@ -49,7 +53,7 @@ check_ipo_supported(
 )
 
 if(IPO_SUPPORTED)
-    # 仅在 Release 配置中启用 IPO/LTO。
+    # Keep IPO/LTO scoped to Release builds to avoid slower debug iteration.
     set_property(
         TARGET simple_monitor
         PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE
