@@ -21,6 +21,7 @@
 #include <dwrite.h>
 #include <wincodec.h>
 #include <objbase.h>
+#include <oleacc.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -46,6 +47,7 @@ constexpr UINT kStateIntervalMs = 100;
 constexpr UINT kPlacementIntervalMs = 5000;
 constexpr UINT kTrayIconId = 1;
 constexpr UINT WM_TRAYICON = WM_APP + 1;
+constexpr UINT WM_TRAY_LAYOUT_CHANGED = WM_APP + 2;
 constexpr int kAppIconResource = 101;
 
 enum MenuId : UINT {
@@ -130,10 +132,12 @@ struct AppState {
     bool maintaining_z_order = false;
     bool com_initialized = false;
     bool overlay_update_frozen = false;
+    LONG tray_layout_update_pending = 0;
     DWORD refresh_resume_tick = 0;
     std::vector<BYTE> last_frame;
     int last_frame_width = 0;
     int last_frame_height = 0;
+    std::vector<HWINEVENTHOOK> tray_event_hooks;
     CpuSampler cpu;
     NetworkSampler network;
     PdhGroup gpu;
@@ -387,6 +391,67 @@ HWND TaskbarWindow() {
     return FindWindowW(L"Shell_TrayWnd", nullptr);
 }
 
+bool IsTaskbarRelatedWindow(HWND hwnd) {
+    if (!hwnd) {
+        return false;
+    }
+
+    HWND taskbar = TaskbarWindow();
+    if (!taskbar) {
+        return false;
+    }
+
+    if (hwnd == taskbar) {
+        return true;
+    }
+
+    return IsChild(taskbar, hwnd) != 0 || GetAncestor(hwnd, GA_ROOT) == taskbar;
+}
+
+void CALLBACK TrayEventProc(
+    HWINEVENTHOOK,
+    DWORD,
+    HWND hwnd,
+    LONG id_object,
+    LONG,
+    DWORD,
+    DWORD) {
+    if (!g_app.hwnd || !IsWindow(g_app.hwnd) || !IsTaskbarRelatedWindow(hwnd)) {
+        return;
+    }
+
+    if (id_object != OBJID_WINDOW && id_object != OBJID_CLIENT) {
+        return;
+    }
+
+    if (InterlockedCompareExchange(&g_app.tray_layout_update_pending, 1, 0) == 0) {
+        PostMessageW(g_app.hwnd, WM_TRAY_LAYOUT_CHANGED, 0, 0);
+    }
+}
+
+void RegisterTrayEventHooks() {
+    const DWORD flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+    const DWORD events[] = {
+        EVENT_OBJECT_SHOW,
+        EVENT_OBJECT_HIDE,
+        EVENT_OBJECT_REORDER,
+        EVENT_OBJECT_LOCATIONCHANGE,
+    };
+
+    for (DWORD event : events) {
+        if (HWINEVENTHOOK hook = SetWinEventHook(event, event, nullptr, TrayEventProc, 0, 0, flags)) {
+            g_app.tray_event_hooks.push_back(hook);
+        }
+    }
+}
+
+void UnregisterTrayEventHooks() {
+    for (HWINEVENTHOOK hook : g_app.tray_event_hooks) {
+        UnhookWinEvent(hook);
+    }
+    g_app.tray_event_hooks.clear();
+}
+
 void AttachToTaskbarOwner(HWND hwnd) {
     HWND taskbar = TaskbarWindow();
     if (!taskbar || taskbar == g_app.taskbar_owner) {
@@ -632,6 +697,169 @@ HWND FindDescendantWindow(HWND parent, const wchar_t* class_name) {
     return nullptr;
 }
 
+bool TryGetTrayNotifyRect(RECT& rect) {
+    HWND tray = TaskbarWindow();
+    HWND notify = tray ? FindDescendantWindow(tray, L"TrayNotifyWnd") : nullptr;
+    if (!notify) {
+        return false;
+    }
+    return GetWindowRect(notify, &rect) != 0;
+}
+
+bool IsAccessibleVisible(IAccessible* accessible, VARIANT child_id) {
+    VARIANT state{};
+    VariantInit(&state);
+    const HRESULT hr = accessible->get_accState(child_id, &state);
+    const bool visible =
+        SUCCEEDED(hr) &&
+        state.vt == VT_I4 &&
+        (state.lVal & (STATE_SYSTEM_INVISIBLE | STATE_SYSTEM_OFFSCREEN | STATE_SYSTEM_UNAVAILABLE)) == 0;
+    VariantClear(&state);
+    return visible;
+}
+
+bool TryGetAccessibleRect(IAccessible* accessible, VARIANT child_id, RECT& rect) {
+    LONG left = 0;
+    LONG top = 0;
+    LONG width = 0;
+    LONG height = 0;
+    if (FAILED(accessible->accLocation(&left, &top, &width, &height, child_id)) || width <= 0 || height <= 0) {
+        return false;
+    }
+
+    rect = {left, top, left + width, top + height};
+    return true;
+}
+
+bool IsUsefulAnchorRect(const RECT& rect, const RECT& tray_rect) {
+    RECT overlap{};
+    if (!IntersectRect(&overlap, &rect, &tray_rect)) {
+        return false;
+    }
+
+    const int width = rect.right - rect.left;
+    const int height = rect.bottom - rect.top;
+    const int tray_width = tray_rect.right - tray_rect.left;
+    const int tray_height = tray_rect.bottom - tray_rect.top;
+    if (width < 4 || height < 4) {
+        return false;
+    }
+
+    if (width >= tray_width - 4 && height >= tray_height - 4) {
+        return false;
+    }
+
+    return true;
+}
+
+void ConsiderAnchorRect(const RECT& candidate, RECT& best_rect, bool& found) {
+    if (!found ||
+        candidate.left < best_rect.left ||
+        (candidate.left == best_rect.left && candidate.top < best_rect.top) ||
+        (candidate.left == best_rect.left && candidate.top == best_rect.top &&
+         (candidate.right - candidate.left) > (best_rect.right - best_rect.left))) {
+        best_rect = candidate;
+        found = true;
+    }
+}
+
+void CollectAccessibleAnchorRects(
+    IAccessible* accessible,
+    const RECT& tray_rect,
+    int depth,
+    bool include_self,
+    RECT& best_rect,
+    bool& found) {
+    VARIANT self_id{};
+    VariantInit(&self_id);
+    self_id.vt = VT_I4;
+    self_id.lVal = CHILDID_SELF;
+
+    if (include_self && IsAccessibleVisible(accessible, self_id)) {
+        RECT rect{};
+        if (TryGetAccessibleRect(accessible, self_id, rect) && IsUsefulAnchorRect(rect, tray_rect)) {
+            ConsiderAnchorRect(rect, best_rect, found);
+        }
+    }
+
+    if (depth <= 0) {
+        return;
+    }
+
+    LONG child_count = 0;
+    if (FAILED(accessible->get_accChildCount(&child_count)) || child_count <= 0) {
+        return;
+    }
+
+    std::vector<VARIANT> children(static_cast<size_t>(child_count));
+    for (VARIANT& child : children) {
+        VariantInit(&child);
+    }
+
+    LONG obtained = 0;
+    if (FAILED(AccessibleChildren(accessible, 0, child_count, children.data(), &obtained))) {
+        for (VARIANT& child : children) {
+            VariantClear(&child);
+        }
+        return;
+    }
+
+    for (LONG i = 0; i < obtained; ++i) {
+        VARIANT& child = children[static_cast<size_t>(i)];
+        if (child.vt == VT_I4) {
+            if (IsAccessibleVisible(accessible, child)) {
+                RECT rect{};
+                if (TryGetAccessibleRect(accessible, child, rect) && IsUsefulAnchorRect(rect, tray_rect)) {
+                    ConsiderAnchorRect(rect, best_rect, found);
+                }
+            }
+        } else if (child.vt == VT_DISPATCH && child.pdispVal) {
+            IAccessible* child_accessible = nullptr;
+            if (SUCCEEDED(child.pdispVal->QueryInterface(IID_IAccessible, reinterpret_cast<void**>(&child_accessible))) &&
+                child_accessible) {
+                CollectAccessibleAnchorRects(child_accessible, tray_rect, depth - 1, true, best_rect, found);
+                child_accessible->Release();
+            }
+        }
+        VariantClear(&child);
+    }
+}
+
+bool TryGetTrayAnchorRect(RECT& rect) {
+    RECT tray_rect{};
+    if (!TryGetTrayNotifyRect(tray_rect)) {
+        return false;
+    }
+
+    HWND tray = TaskbarWindow();
+    HWND notify = tray ? FindDescendantWindow(tray, L"TrayNotifyWnd") : nullptr;
+    if (!notify) {
+        return false;
+    }
+
+    IAccessible* accessible = nullptr;
+    HRESULT hr = AccessibleObjectFromWindow(
+        notify,
+        OBJID_CLIENT,
+        IID_IAccessible,
+        reinterpret_cast<void**>(&accessible));
+    if (FAILED(hr) || !accessible) {
+        return false;
+    }
+
+    RECT best_rect{};
+    bool found = false;
+    CollectAccessibleAnchorRects(accessible, tray_rect, 2, false, best_rect, found);
+    accessible->Release();
+
+    if (!found) {
+        return false;
+    }
+
+    rect = best_rect;
+    return true;
+}
+
 int EstimatedTextWidthDip(int chars, int font_size_dip = 0) {
     const int font_size = font_size_dip > 0 ? font_size_dip : g_app.config.font_size_dip;
     return chars * font_size * 6 / 10 + 2;
@@ -698,11 +926,12 @@ void RepositionWindow() {
 
     if (horizontal) {
         int tray_left = taskbar.right - Scale(360, g_app.dpi);
-        HWND tray = TaskbarWindow();
-        HWND notify = tray ? FindDescendantWindow(tray, L"TrayNotifyWnd") : nullptr;
-        if (notify) {
+        RECT anchor_rect{};
+        if (TryGetTrayAnchorRect(anchor_rect)) {
+            tray_left = anchor_rect.left;
+        } else {
             RECT notify_rect{};
-            if (GetWindowRect(notify, &notify_rect)) {
+            if (TryGetTrayNotifyRect(notify_rect)) {
                 tray_left = notify_rect.left;
             }
         }
@@ -1383,6 +1612,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         LoadConfig();
         AddTrayIcon(hwnd);
         AttachToTaskbarOwner(hwnd);
+        RegisterTrayEventHooks();
         InitPdhGroup(g_app.gpu, L"\\GPU Engine(*)\\Utilization Percentage");
         InitPdhGroup(g_app.disk, L"\\PhysicalDisk(_Total)\\% Disk Time");
         SampleMetrics();
@@ -1422,9 +1652,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
 
         if (wparam == kRefreshTimer) {
             SampleMetrics();
+            RepositionWindow();
             KeepOverlayOnTop();
             RenderOverlay(hwnd);
         } else if (wparam == kPlacementTimer) {
+            RepositionWindow();
             KeepOverlayOnTop();
         }
         return 0;
@@ -1482,6 +1714,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         HandleMenuCommand(hwnd, LOWORD(wparam));
         return 0;
 
+    case WM_TRAY_LAYOUT_CHANGED:
+        InterlockedExchange(&g_app.tray_layout_update_pending, 0);
+        AttachToTaskbarOwner(hwnd);
+        RepositionWindow();
+        KeepOverlayOnTop();
+        RenderOverlay(hwnd);
+        return 0;
+
     case WM_TRAYICON:
         if (LOWORD(lparam) == WM_CONTEXTMENU || LOWORD(lparam) == WM_RBUTTONUP) {
             ShowTrayMenu(hwnd);
@@ -1494,6 +1734,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         KillTimer(hwnd, kRefreshTimer);
         KillTimer(hwnd, kPlacementTimer);
         KillTimer(hwnd, kStateTimer);
+        UnregisterTrayEventHooks();
         RemoveTrayIcon(hwnd);
         if (g_app.gpu.query) {
             PdhCloseQuery(g_app.gpu.query);

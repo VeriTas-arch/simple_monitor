@@ -23,6 +23,8 @@ target_link_libraries(simple_monitor PRIVATE
     dwrite
     windowscodecs
     ole32
+    oleaut32
+    oleacc
 )
 
 # MinGW Unicode 入口点支持：
