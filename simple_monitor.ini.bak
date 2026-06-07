@@ -1,24 +1,21 @@
 [layout]
-; Optional minimum overlay width. 0 means content-driven width.
-min_width=0
-
 ; Left and right padding inside the overlay.
 content_padding_x=8
 
 ; Space between the three text columns.
-column_gap=28
+column_gap=24
 
 ; Optional per-column gaps. -1 uses column_gap.
-gap_after_network=14
-gap_after_system=28
+gap_after_network=10
+gap_after_system=14
 gap_after_disk=12
 
 ; Distance between overlay right edge and the tray area.
-offset_right=8
+offset_right=-52
 
 ; DirectWrite font size in logical pixels before DPI scaling.
 font_size=13
-key_font_size=13
+key_font_size=14
 
 ; Network arrow style: thin, triangle, heavy, chevron.
 network_arrow_style=thin
@@ -30,6 +27,3 @@ disk_label=SSD
 
 ; Shows a compact CAP/INS/NUM status widget after the disk column.
 show_key_widget=1
-
-; 0 shows only disk usage in the last column. 1 shows CAP/NUM/SCR before it.
-show_key_status=0

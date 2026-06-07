@@ -28,7 +28,7 @@ build/simple_monitor.exe
 GPU and disk usage use Windows PDH counters. If a counter is unavailable on a
 machine or Windows language setup, the value is shown as `--`.
 
-Network speed uses a compact format such as `850B`, `1.2K`, `12K`, or `1.2M`
+Network speed uses a compact format such as `1.2KB/s`, `12KB/s`, or `1.2MB/s`
 to keep the taskbar layout stable while values change.
 
 ## Configuration
@@ -39,7 +39,6 @@ example, when running `build\simple_monitor.exe`, place the config at
 
 ```ini
 [layout]
-min_width=0
 content_padding_x=8
 column_gap=28
 gap_after_network=14
@@ -53,15 +52,12 @@ network_arrow_font_size=17
 network_arrow_gap=3
 disk_label=SSD
 show_key_widget=1
-show_key_status=0
 ```
 
-Width is calculated from the displayed content; use `min_width` only as a
-fallback lower bound. Use `font_size` to tune text size. Use `column_gap` as the default spacing, or
+Width is calculated from the displayed content. Use `font_size` to tune text size. Use `column_gap` as the default spacing, or
 override it with `gap_after_network` and `gap_after_system`. Use
-`offset_right` to tune the distance from the tray area. Use `show_key_status=1`
-to show `CAP/NUM/SCR` before the disk item. After editing the file, use the tray
-menu's `Reposition` command or restart the program.
+`offset_right` to tune the distance from the tray area. After editing the file,
+use the tray menu's `Reposition` command or restart the program.
 
 `show_key_widget=1` adds a compact `CAP INS NUM` status column after the disk
 column. Active keys are white; inactive keys are dimmed.

@@ -46,6 +46,7 @@ constexpr UINT kStateIntervalMs = 100;
 constexpr UINT kPlacementIntervalMs = 5000;
 constexpr UINT kTrayIconId = 1;
 constexpr UINT WM_TRAYICON = WM_APP + 1;
+constexpr int kAppIconResource = 101;
 
 enum MenuId : UINT {
     ID_REPOSITION = 1001,
@@ -88,7 +89,6 @@ struct Metrics {
     bool caps = false;
     bool insert = false;
     bool num = false;
-    bool scroll = false;
 };
 
 struct RenderResources {
@@ -105,7 +105,6 @@ struct RenderResources {
 };
 
 struct Config {
-    int min_width_dip = 0;
     int content_padding_x_dip = 8;
     int column_gap_dip = 28;
     int gap_after_network_dip = -1;
@@ -115,7 +114,6 @@ struct Config {
     int network_arrow_font_size_dip = 17;
     int network_arrow_gap_dip = 3;
     int key_font_size_dip = 13;
-    bool show_key_status = false;
     bool show_key_widget = true;
     int gap_after_disk_dip = 14;
     std::wstring network_arrow_style = L"thin";
@@ -244,7 +242,6 @@ std::wstring LowerString(std::wstring value) {
 }
 
 void LoadConfig() {
-    g_app.config.min_width_dip = ReadConfigInt(L"min_width", 0, 0, 900);
     g_app.config.content_padding_x_dip = ReadConfigInt(L"content_padding_x", 8, 0, 80);
     g_app.config.column_gap_dip = ReadConfigInt(L"column_gap", 28, 0, 220);
     g_app.config.gap_after_network_dip = ReadConfigInt(L"gap_after_network", -1, -1, 220);
@@ -254,7 +251,6 @@ void LoadConfig() {
     g_app.config.network_arrow_font_size_dip = ReadConfigInt(L"network_arrow_font_size", 17, 8, 36);
     g_app.config.network_arrow_gap_dip = ReadConfigInt(L"network_arrow_gap", 3, 0, 20);
     g_app.config.key_font_size_dip = ReadConfigInt(L"key_font_size", g_app.config.font_size_dip, 8, 36);
-    g_app.config.show_key_status = ReadConfigBool(L"show_key_status", false);
     g_app.config.show_key_widget = ReadConfigBool(L"show_key_widget", true);
     g_app.config.gap_after_disk_dip = ReadConfigInt(L"gap_after_disk", 14, 0, 220);
     g_app.config.network_arrow_style = LowerString(ReadConfigString(L"network_arrow_style", L"thin"));
@@ -401,26 +397,17 @@ void AttachToTaskbarOwner(HWND hwnd) {
 
 std::wstring FormatRate(double bytes_per_second) {
     wchar_t buffer[32]{};
-    if (bytes_per_second < 1024.0) {
-        std::swprintf(buffer, 32, L"%.0fB", bytes_per_second);
-        return buffer;
-    }
-
     double value = bytes_per_second / 1024.0;
-    wchar_t unit = L'K';
-    if (value >= 100.0) {
+    const wchar_t* unit = L"KB/s";
+    if (value >= 1024.0) {
         value /= 1024.0;
-        unit = L'M';
-    }
-    if (value >= 100.0) {
-        value /= 1024.0;
-        unit = L'G';
+        unit = L"MB/s";
     }
 
     if (value < 10.0) {
-        std::swprintf(buffer, 32, L"%.1f%c", value, unit);
+        std::swprintf(buffer, 32, L"%.1f%ls", value, unit);
     } else {
-        std::swprintf(buffer, 32, L"%.0f%c", value, unit);
+        std::swprintf(buffer, 32, L"%.0f%ls", value, unit);
     }
     return buffer;
 }
@@ -602,7 +589,6 @@ void SampleKeys(Metrics& metrics) {
     metrics.caps = (GetKeyState(VK_CAPITAL) & 1) != 0;
     metrics.insert = (GetKeyState(VK_INSERT) & 1) != 0;
     metrics.num = (GetKeyState(VK_NUMLOCK) & 1) != 0;
-    metrics.scroll = (GetKeyState(VK_SCROLL) & 1) != 0;
 }
 
 bool SampleKeysIfChanged() {
@@ -611,13 +597,11 @@ bool SampleKeysIfChanged() {
     const bool changed =
         next.caps != g_app.metrics.caps ||
         next.insert != g_app.metrics.insert ||
-        next.num != g_app.metrics.num ||
-        next.scroll != g_app.metrics.scroll;
+        next.num != g_app.metrics.num;
     if (changed) {
         g_app.metrics.caps = next.caps;
         g_app.metrics.insert = next.insert;
         g_app.metrics.num = next.num;
-        g_app.metrics.scroll = next.scroll;
     }
     return changed;
 }
@@ -653,9 +637,10 @@ int EstimatedTextWidthDip(int chars, int font_size_dip = 0) {
 
 int CalculateOverlayWidthDip() {
     const int network_width =
-        EstimatedTextWidthDip(2, g_app.config.network_arrow_font_size_dip) +
+        EstimatedTextWidthDip(1, g_app.config.network_arrow_font_size_dip) +
+        EstimatedTextWidthDip(1) +
         g_app.config.network_arrow_gap_dip +
-        EstimatedTextWidthDip(5); // "99.9M"
+        EstimatedTextWidthDip(11); // "999.9MB/s" with extra room for DirectWrite metrics
     const int system_width = EstimatedTextWidthDip(9);  // "RAM: 100%"
     const int disk_label_chars = static_cast<int>(g_app.config.disk_label.size());
     const int disk_width = EstimatedTextWidthDip(std::max(9, disk_label_chars + 6));
@@ -675,7 +660,7 @@ int CalculateOverlayWidthDip() {
         disk_width +
         (g_app.config.show_key_widget ? g_app.config.gap_after_disk_dip + key_width : 0);
 
-    return std::max(g_app.config.min_width_dip, content_width);
+    return content_width;
 }
 
 bool GetTaskbarRect(RECT& rect) {
@@ -747,6 +732,23 @@ void RepositionWindow() {
     }
 }
 
+HICON LoadAppIcon(HINSTANCE instance, int width, int height) {
+    HICON icon = reinterpret_cast<HICON>(LoadImageW(
+        instance,
+        MAKEINTRESOURCEW(kAppIconResource),
+        IMAGE_ICON,
+        width,
+        height,
+        LR_DEFAULTCOLOR | LR_SHARED));
+    if (!icon) {
+        icon = LoadIconW(instance, MAKEINTRESOURCEW(kAppIconResource));
+    }
+    if (!icon) {
+        icon = LoadIconW(nullptr, IDI_APPLICATION);
+    }
+    return icon;
+}
+
 void AddTrayIcon(HWND hwnd) {
     NOTIFYICONDATAW nid{};
     nid.cbSize = sizeof(nid);
@@ -754,7 +756,7 @@ void AddTrayIcon(HWND hwnd) {
     nid.uID = kTrayIconId;
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon = LoadIconW(nullptr, IDI_INFORMATION);
+    nid.hIcon = LoadAppIcon(g_app.instance, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
     std::wcsncpy(nid.szTip, L"Simple Monitor", ARRAYSIZE(nid.szTip) - 1);
     Shell_NotifyIconW(NIM_ADD, &nid);
 
@@ -971,15 +973,15 @@ struct TextColumn {
 std::wstring NetworkArrow(bool upload) {
     const std::wstring& style = g_app.config.network_arrow_style;
     if (style == L"triangle") {
-        return upload ? L"▲:" : L"▼:";
+        return upload ? L"▲" : L"▼";
     }
     if (style == L"heavy") {
-        return upload ? L"⬆:" : L"⬇:";
+        return upload ? L"⬆" : L"⬇";
     }
     if (style == L"chevron") {
-        return upload ? L"▴:" : L"▾:";
+        return upload ? L"▴" : L"▾";
     }
-    return upload ? L"↑:" : L"↓:";
+    return upload ? L"↑" : L"↓";
 }
 
 TextColumn MakeTextColumn(
@@ -1012,9 +1014,9 @@ TextColumn MakeNetworkColumn(const std::wstring& up_value, const std::wstring& d
     column.top_value = up_value;
     column.bottom_prefix = NetworkArrow(false);
     column.bottom_value = down_value;
-    column.top = column.top_prefix + L" " + column.top_value;
-    column.bottom = column.bottom_prefix + L" " + column.bottom_value;
-    column.width_sample = NetworkArrow(false) + L" 99.9M";
+    column.top = column.top_prefix + L": " + column.top_value;
+    column.bottom = column.bottom_prefix + L": " + column.bottom_value;
+    column.width_sample = NetworkArrow(false) + L": 99.9MB/s";
     column.gap_after = gap_after;
     return column;
 }
@@ -1023,6 +1025,7 @@ FLOAT MeasureSplitLineWidth(const TextColumn& column, bool top) {
     const std::wstring& prefix = top ? column.top_prefix : column.bottom_prefix;
     const std::wstring& value = top ? column.top_value : column.bottom_value;
     return MeasureTextWidthWithFormat(g_app.render.arrow_text_format, prefix) +
+           MeasureTextWidth(L":") +
            static_cast<FLOAT>(Scale(g_app.config.network_arrow_gap_dip, g_app.dpi)) +
            MeasureTextWidth(value);
 }
@@ -1034,10 +1037,13 @@ void DrawSplitLine(
     const std::wstring& prefix,
     const std::wstring& value) {
     const FLOAT prefix_width = MeasureTextWidthWithFormat(g_app.render.arrow_text_format, prefix);
+    const FLOAT colon_width = MeasureTextWidth(L":");
     const FLOAT gap = static_cast<FLOAT>(Scale(g_app.config.network_arrow_gap_dip, g_app.dpi));
     D2D1_RECT_F prefix_rect{rect.left, rect.top, rect.left + prefix_width, rect.bottom};
-    D2D1_RECT_F value_rect{prefix_rect.right + gap, rect.top, rect.right, rect.bottom};
+    D2D1_RECT_F colon_rect{prefix_rect.right, rect.top, prefix_rect.right + colon_width, rect.bottom};
+    D2D1_RECT_F value_rect{colon_rect.right + gap, rect.top, rect.right, rect.bottom};
     DrawTextCellWithFormat(target, brush, g_app.render.arrow_text_format, prefix_rect, prefix, DWRITE_TEXT_ALIGNMENT_LEADING);
+    DrawTextCell(target, brush, colon_rect, L":", DWRITE_TEXT_ALIGNMENT_LEADING);
     DrawTextCell(target, brush, value_rect, value, DWRITE_TEXT_ALIGNMENT_LEADING);
 }
 
@@ -1098,8 +1104,9 @@ void DrawAdaptiveColumnsDwrite(
                 column.width = std::max(
                     column.width,
                     MeasureTextWidthWithFormat(g_app.render.arrow_text_format, NetworkArrow(false)) +
+                        MeasureTextWidth(L":") +
                         static_cast<FLOAT>(Scale(g_app.config.network_arrow_gap_dip, g_app.dpi)) +
-                        MeasureTextWidth(L"99.9M"));
+                        MeasureTextWidth(L"99.9MB/s"));
             } else {
                 column.width = std::max(column.width, MeasureTextWidth(column.width_sample));
             }
@@ -1266,13 +1273,7 @@ void RenderOverlay(HWND hwnd) {
         pad_y,
         static_cast<FLOAT>(width) - pad_x,
         static_cast<FLOAT>(height) - pad_y};
-    const std::wstring disk_text =
-        g_app.config.show_key_status
-            ? std::wstring(g_app.metrics.caps ? L"CAP " : L"cap ") +
-                  (g_app.metrics.num ? L"NUM " : L"num ") +
-                  (g_app.metrics.scroll ? L"SCR  " : L"scr  ") +
-                  g_app.config.disk_label + L": " + FormatPercent(g_app.metrics.disk)
-            : g_app.config.disk_label + L": " + FormatPercent(g_app.metrics.disk);
+    const std::wstring disk_text = g_app.config.disk_label + L": " + FormatPercent(g_app.metrics.disk);
     std::vector<TextColumn> columns{
         MakeNetworkColumn(
             FormatRate(g_app.metrics.up_bps),
@@ -1490,6 +1491,8 @@ bool RegisterWindowClass(HINSTANCE instance) {
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = instance;
+    wc.hIcon = LoadAppIcon(instance, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+    wc.hIconSm = LoadAppIcon(instance, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = nullptr;
     wc.lpszClassName = kWindowClass;
