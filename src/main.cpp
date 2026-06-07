@@ -145,6 +145,8 @@ struct AppState {
 
 AppState g_app;
 
+void RenderOverlay(HWND hwnd);
+
 ULONGLONG FileTimeToU64(const FILETIME& ft) {
     ULARGE_INTEGER value{};
     value.LowPart = ft.dwLowDateTime;
@@ -772,23 +774,60 @@ void RemoveTrayIcon(HWND hwnd) {
     Shell_NotifyIconW(NIM_DELETE, &nid);
 }
 
-void ShowTrayMenu(HWND hwnd) {
-    HMENU menu = CreatePopupMenu();
-    if (!menu) {
-        return;
+bool HandleMenuCommand(HWND hwnd, UINT command) {
+    switch (command) {
+    case ID_REPOSITION:
+        LoadConfig();
+        RepositionWindow();
+        RenderOverlay(hwnd);
+        return true;
+    case ID_CLICK_THROUGH:
+        g_app.click_through = !g_app.click_through;
+        UpdateLayeredStyle(hwnd);
+        return true;
+    case ID_STARTUP:
+        SetStartupEnabled(!IsStartupEnabled());
+        return true;
+    case ID_EXIT:
+        DestroyWindow(hwnd);
+        return true;
     }
+    return false;
+}
 
-    AppendMenuW(menu, MF_STRING, ID_REPOSITION, L"Reposition");
-    AppendMenuW(menu, MF_STRING | (g_app.click_through ? MF_CHECKED : MF_UNCHECKED), ID_CLICK_THROUGH, L"Click-through");
-    AppendMenuW(menu, MF_STRING | (IsStartupEnabled() ? MF_CHECKED : MF_UNCHECKED), ID_STARTUP, L"Start with Windows");
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, ID_EXIT, L"Exit");
-
+void ShowTrayMenu(HWND hwnd) {
     POINT pt{};
     GetCursorPos(&pt);
     SetForegroundWindow(hwnd);
-    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, nullptr);
-    DestroyMenu(menu);
+
+    bool keep_open = true;
+    while (keep_open) {
+        HMENU menu = CreatePopupMenu();
+        if (!menu) {
+            return;
+        }
+
+        AppendMenuW(menu, MF_STRING, ID_REPOSITION, L"Reposition");
+        AppendMenuW(menu, MF_STRING | (g_app.click_through ? MF_CHECKED : MF_UNCHECKED), ID_CLICK_THROUGH, L"Click-through");
+        AppendMenuW(menu, MF_STRING | (IsStartupEnabled() ? MF_CHECKED : MF_UNCHECKED), ID_STARTUP, L"Start with Windows");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, ID_EXIT, L"Exit");
+
+        const UINT command = TrackPopupMenu(
+            menu,
+            TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN | TPM_RETURNCMD | TPM_NOANIMATION,
+            pt.x,
+            pt.y,
+            0,
+            hwnd,
+            nullptr);
+        DestroyMenu(menu);
+
+        if (command == 0 || !HandleMenuCommand(hwnd, command)) {
+            break;
+        }
+        keep_open = command == ID_CLICK_THROUGH || command == ID_STARTUP;
+    }
 }
 
 HRESULT EnsureRenderResources() {
@@ -1440,23 +1479,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         return 0;
 
     case WM_COMMAND:
-        switch (LOWORD(wparam)) {
-        case ID_REPOSITION:
-            LoadConfig();
-            RepositionWindow();
-            RenderOverlay(hwnd);
-            break;
-        case ID_CLICK_THROUGH:
-            g_app.click_through = !g_app.click_through;
-            UpdateLayeredStyle(hwnd);
-            break;
-        case ID_STARTUP:
-            SetStartupEnabled(!IsStartupEnabled());
-            break;
-        case ID_EXIT:
-            DestroyWindow(hwnd);
-            break;
-        }
+        HandleMenuCommand(hwnd, LOWORD(wparam));
         return 0;
 
     case WM_TRAYICON:
