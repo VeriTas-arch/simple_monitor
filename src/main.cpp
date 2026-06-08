@@ -13,7 +13,6 @@
 
 #include <windows.h>
 #include <shellapi.h>
-#include <shlobj.h>
 #include <iphlpapi.h>
 #include <pdh.h>
 #include <pdhmsg.h>
@@ -1145,14 +1144,6 @@ void RepositionWindow() {
     }
 }
 
-void RepositionAndRenderOverlay(HWND hwnd, bool keep_on_top = false) {
-    RepositionWindow();
-    if (keep_on_top) {
-        KeepOverlayOnTop();
-    }
-    RenderOverlay(hwnd);
-}
-
 // Tray icon and context menu.
 HICON LoadAppIcon(HINSTANCE instance, int width, int height) {
     HICON icon = reinterpret_cast<HICON>(LoadImageW(
@@ -1199,7 +1190,8 @@ void ReloadConfigAndRefresh(HWND hwnd) {
     if (UpdateOverlaySuppression(hwnd)) {
         return;
     }
-    RepositionAndRenderOverlay(hwnd);
+    RepositionWindow();
+    RenderOverlay(hwnd);
 }
 
 bool HandleMenuCommand(HWND hwnd, UINT command) {
@@ -1728,20 +1720,6 @@ bool UpdateFreezeState(HWND hwnd) {
     return false;
 }
 
-bool ShouldHoldLastFrame(DWORD now) {
-    return g_app.refresh_resume_tick != 0 && !TickPassed(now, g_app.refresh_resume_tick);
-}
-
-bool HandleResumeDelay(HWND hwnd) {
-    if (!ShouldHoldLastFrame(GetTickCount())) {
-        return false;
-    }
-
-    ReapplyLastFrame(hwnd);
-    KeepOverlayOnTop();
-    return true;
-}
-
 bool HandleOverlayStateGuards(HWND hwnd) {
     if (UpdateOverlaySuppression(hwnd)) {
         return true;
@@ -1749,7 +1727,9 @@ bool HandleOverlayStateGuards(HWND hwnd) {
     if (UpdateFreezeState(hwnd)) {
         return true;
     }
-    if (HandleResumeDelay(hwnd)) {
+    if (g_app.refresh_resume_tick != 0 && !TickPassed(GetTickCount(), g_app.refresh_resume_tick)) {
+        ReapplyLastFrame(hwnd);
+        KeepOverlayOnTop();
         return true;
     }
 
@@ -1867,7 +1847,8 @@ LRESULT HandleTaskbarCreated(HWND hwnd) {
     if (UpdateOverlaySuppression(hwnd)) {
         return 0;
     }
-    RepositionAndRenderOverlay(hwnd);
+    RepositionWindow();
+    RenderOverlay(hwnd);
     return 0;
 }
 
@@ -1887,7 +1868,8 @@ LRESULT HandleCreate(HWND hwnd) {
     if (UpdateOverlaySuppression(hwnd)) {
         return 0;
     }
-    RepositionAndRenderOverlay(hwnd);
+    RepositionWindow();
+    RenderOverlay(hwnd);
     return 0;
 }
 
@@ -1908,7 +1890,9 @@ LRESULT HandleTimer(HWND hwnd, UINT_PTR timer_id) {
 
     if (timer_id == kRefreshTimer) {
         SampleMetrics();
-        RepositionAndRenderOverlay(hwnd, true);
+        RepositionWindow();
+        KeepOverlayOnTop();
+        RenderOverlay(hwnd);
     } else if (timer_id == kPlacementTimer) {
         RepositionWindow();
         KeepOverlayOnTop();
@@ -1932,7 +1916,8 @@ LRESULT HandleDpiChanged(HWND hwnd, WPARAM wparam, LPARAM lparam) {
     if (UpdateOverlaySuppression(hwnd)) {
         return 0;
     }
-    RepositionAndRenderOverlay(hwnd);
+    RepositionWindow();
+    RenderOverlay(hwnd);
     return 0;
 }
 
@@ -1941,7 +1926,8 @@ LRESULT HandleDisplayChange(HWND hwnd) {
     if (UpdateOverlaySuppression(hwnd)) {
         return 0;
     }
-    RepositionAndRenderOverlay(hwnd);
+    RepositionWindow();
+    RenderOverlay(hwnd);
     return 0;
 }
 
@@ -1965,7 +1951,9 @@ LRESULT HandleTrayLayoutChanged(HWND hwnd) {
     if (UpdateOverlaySuppression(hwnd)) {
         return 0;
     }
-    RepositionAndRenderOverlay(hwnd, true);
+    RepositionWindow();
+    KeepOverlayOnTop();
+    RenderOverlay(hwnd);
     return 0;
 }
 
