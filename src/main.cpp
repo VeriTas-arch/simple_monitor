@@ -366,6 +366,22 @@ std::wstring Basename(std::wstring path) {
     return path;
 }
 
+bool WindowClassIs(HWND hwnd, const wchar_t* class_name) {
+    wchar_t current_class[128]{};
+    return GetClassNameW(hwnd, current_class, ARRAYSIZE(current_class)) != 0 &&
+           std::wcscmp(current_class, class_name) == 0;
+}
+
+bool IsShellPopupOrDesktopWindow(HWND hwnd) {
+    if (!hwnd) {
+        return false;
+    }
+
+    return WindowClassIs(hwnd, L"#32768") ||
+           WindowClassIs(hwnd, L"Progman") ||
+           WindowClassIs(hwnd, L"WorkerW");
+}
+
 bool IsBuiltinScreenshotForeground() {
     HWND foreground = GetForegroundWindow();
     if (!foreground || foreground == g_app.hwnd) {
@@ -440,12 +456,17 @@ const wchar_t* SuppressedNotificationStateReason() {
 
 bool IsFullscreenForegroundWindow() {
     HWND foreground = GetForegroundWindow();
-    if (!foreground || foreground == g_app.hwnd || IsTaskbarRelatedWindow(foreground)) {
+    if (!foreground || foreground == g_app.hwnd || IsTaskbarRelatedWindow(foreground) || IsShellPopupOrDesktopWindow(foreground)) {
         return false;
     }
 
     HWND root = GetAncestor(foreground, GA_ROOT);
-    if (!root || root == g_app.hwnd || IsTaskbarRelatedWindow(root) || !IsWindowVisible(root) || IsIconic(root)) {
+    if (!root ||
+        root == g_app.hwnd ||
+        IsTaskbarRelatedWindow(root) ||
+        IsShellPopupOrDesktopWindow(root) ||
+        !IsWindowVisible(root) ||
+        IsIconic(root)) {
         return false;
     }
 
