@@ -131,6 +131,7 @@ struct AppState {
     bool maintaining_z_order = false;
     bool com_initialized = false;
     bool overlay_update_frozen = false;
+    bool overlay_suppressed = false;
     LONG tray_layout_update_pending = 0;
     DWORD refresh_resume_tick = 0;
     std::vector<BYTE> last_frame;
@@ -149,6 +150,8 @@ struct AppState {
 AppState g_app;
 
 void RenderOverlay(HWND hwnd);
+bool IsTaskbarRelatedWindow(HWND hwnd);
+void RepositionWindow();
 
 ULONGLONG FileTimeToU64(const FILETIME& ft) {
     ULARGE_INTEGER value{};
@@ -324,6 +327,53 @@ bool ShouldFreezeOverlayUpdate() {
     return IsBuiltinScreenshotForeground();
 }
 
+bool IsSuppressedNotificationState() {
+    QUERY_USER_NOTIFICATION_STATE state = QUNS_ACCEPTS_NOTIFICATIONS;
+    if (FAILED(SHQueryUserNotificationState(&state))) {
+        return false;
+    }
+
+    return state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE;
+}
+
+bool IsFullscreenForegroundWindow() {
+    HWND foreground = GetForegroundWindow();
+    if (!foreground || foreground == g_app.hwnd || IsTaskbarRelatedWindow(foreground)) {
+        return false;
+    }
+
+    HWND root = GetAncestor(foreground, GA_ROOT);
+    if (!root || root == g_app.hwnd || IsTaskbarRelatedWindow(root) || !IsWindowVisible(root) || IsIconic(root)) {
+        return false;
+    }
+
+    RECT window_rect{};
+    if (!GetWindowRect(root, &window_rect)) {
+        return false;
+    }
+
+    HMONITOR monitor = MonitorFromWindow(root, MONITOR_DEFAULTTONEAREST);
+    if (!monitor) {
+        return false;
+    }
+
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(monitor, &mi)) {
+        return false;
+    }
+
+    const int tolerance = Scale(2, WindowDpi(g_app.hwnd ? g_app.hwnd : root));
+    return std::abs(window_rect.left - mi.rcMonitor.left) <= tolerance &&
+           std::abs(window_rect.top - mi.rcMonitor.top) <= tolerance &&
+           std::abs(window_rect.right - mi.rcMonitor.right) <= tolerance &&
+           std::abs(window_rect.bottom - mi.rcMonitor.bottom) <= tolerance;
+}
+
+bool ShouldSuppressOverlay() {
+    return IsSuppressedNotificationState() || IsFullscreenForegroundWindow();
+}
+
 bool TickPassed(DWORD now, DWORD deadline) {
     return static_cast<LONG>(now - deadline) >= 0;
 }
@@ -362,6 +412,9 @@ void UpdateLayeredStyle(HWND hwnd) {
 
 void KeepOverlayOnTop() {
     if (!g_app.hwnd || !IsWindow(g_app.hwnd)) {
+        return;
+    }
+    if (g_app.overlay_suppressed) {
         return;
     }
     if (g_app.maintaining_z_order) {
@@ -1473,6 +1526,28 @@ bool ReapplyLastFrame(HWND hwnd) {
     return PresentPixels(hwnd, g_app.last_frame.data(), g_app.last_frame_width, g_app.last_frame_height);
 }
 
+bool UpdateOverlaySuppression(HWND hwnd) {
+    const bool should_suppress = ShouldSuppressOverlay();
+    if (should_suppress) {
+        g_app.overlay_suppressed = true;
+        if (IsWindowVisible(hwnd)) {
+            ShowWindow(hwnd, SW_HIDE);
+        }
+        return true;
+    }
+
+    if (g_app.overlay_suppressed) {
+        g_app.overlay_suppressed = false;
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        RepositionWindow();
+        ReapplyLastFrame(hwnd);
+        RenderOverlay(hwnd);
+        return true;
+    }
+
+    return false;
+}
+
 bool UpdateFreezeState(HWND hwnd) {
     if (ShouldFreezeOverlayUpdate()) {
         g_app.overlay_update_frozen = true;
@@ -1598,6 +1673,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     if (msg == g_app.taskbar_created) {
         AttachToTaskbarOwner(hwnd);
         AddTrayIcon(hwnd);
+        if (UpdateOverlaySuppression(hwnd)) {
+            return 0;
+        }
         RepositionWindow();
         RenderOverlay(hwnd);
         return 0;
@@ -1617,12 +1695,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         SetTimer(hwnd, kRefreshTimer, 1000, nullptr);
         SetTimer(hwnd, kPlacementTimer, kPlacementIntervalMs, nullptr);
         SetTimer(hwnd, kStateTimer, kStateIntervalMs, nullptr);
+        if (UpdateOverlaySuppression(hwnd)) {
+            return 0;
+        }
         RepositionWindow();
         RenderOverlay(hwnd);
         return 0;
 
     case WM_TIMER:
         if (wparam == kStateTimer) {
+            if (UpdateOverlaySuppression(hwnd)) {
+                return 0;
+            }
             if (UpdateFreezeState(hwnd)) {
                 return 0;
             }
@@ -1638,6 +1722,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             return 0;
         }
 
+        if (UpdateOverlaySuppression(hwnd)) {
+            return 0;
+        }
         if (UpdateFreezeState(hwnd)) {
             return 0;
         }
@@ -1676,6 +1763,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 suggested->bottom - suggested->top,
                 SWP_NOACTIVATE);
         }
+        if (UpdateOverlaySuppression(hwnd)) {
+            return 0;
+        }
         RepositionWindow();
         RenderOverlay(hwnd);
         return 0;
@@ -1684,6 +1774,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     case WM_SETTINGCHANGE:
     case WM_DEVICECHANGE:
         AttachToTaskbarOwner(hwnd);
+        if (UpdateOverlaySuppression(hwnd)) {
+            return 0;
+        }
         RepositionWindow();
         RenderOverlay(hwnd);
         return 0;
@@ -1697,6 +1790,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             SetTimer(hwnd, kPlacementTimer, 100, nullptr);
         } else {
             SetTimer(hwnd, kPlacementTimer, kPlacementIntervalMs, nullptr);
+            if (UpdateOverlaySuppression(hwnd)) {
+                return 0;
+            }
             if (UpdateFreezeState(hwnd)) {
                 return 0;
             }
@@ -1715,6 +1811,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     case WM_TRAY_LAYOUT_CHANGED:
         InterlockedExchange(&g_app.tray_layout_update_pending, 0);
         AttachToTaskbarOwner(hwnd);
+        if (UpdateOverlaySuppression(hwnd)) {
+            return 0;
+        }
         RepositionWindow();
         KeepOverlayOnTop();
         RenderOverlay(hwnd);
