@@ -60,6 +60,7 @@ key_font_size=13
 network_arrow_style=thin
 network_arrow_font_size=17
 network_arrow_gap=3
+debug_log=0
 show_key_widget=1
 ```
 
@@ -73,6 +74,10 @@ column. Active keys are white; inactive keys are dimmed.
 
 Network arrow styles are `thin` (`↑`/`↓`), `triangle` (`▲`/`▼`), `heavy`
 (`⬆`/`⬇`), and `chevron` (`▴`/`▾`).
+
+Set `debug_log=1` to write event-oriented diagnostics to `debug.log` next to
+the executable. The log records placement changes, tray layout events,
+fullscreen or presentation suppression, and screenshot freeze transitions.
 
 ## Design boundary
 

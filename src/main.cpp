@@ -24,6 +24,7 @@
 #include <oleacc.h>
 
 #include <algorithm>
+#include <cstdarg>
 #include <cstdint>
 #include <cwchar>
 #include <cwctype>
@@ -118,6 +119,7 @@ struct Config {
     int network_arrow_gap_dip = 3;
     int key_font_size_dip = 13;
     bool show_key_widget = true;
+    bool debug_log = false;
     int gap_after_disk_dip = 14;
     std::wstring network_arrow_style = L"thin";
 };
@@ -135,6 +137,13 @@ struct AppState {
     bool overlay_suppressed = false;
     LONG tray_layout_update_pending = 0;
     DWORD refresh_resume_tick = 0;
+    RECT last_logged_taskbar_rect{};
+    RECT last_logged_anchor_rect{};
+    RECT last_logged_overlay_rect{};
+    bool has_last_logged_taskbar_rect = false;
+    bool has_last_logged_anchor_rect = false;
+    bool has_last_logged_overlay_rect = false;
+    int last_logged_anchor_mode = -1;
     std::vector<BYTE> last_frame;
     int last_frame_width = 0;
     int last_frame_height = 0;
@@ -229,6 +238,10 @@ std::wstring ConfigPath() {
     return ModuleDir() + L"\\simple_monitor.ini";
 }
 
+std::wstring DebugLogPath() {
+    return ModuleDir() + L"\\debug.log";
+}
+
 int ReadConfigInt(const wchar_t* key, int fallback, int min_value, int max_value) {
     const UINT raw = GetPrivateProfileIntW(L"layout", key, fallback, ConfigPath().c_str());
     const int value = static_cast<int>(raw);
@@ -252,6 +265,63 @@ std::wstring LowerString(std::wstring value) {
     return value;
 }
 
+bool RectEquals(const RECT& a, const RECT& b) {
+    return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
+}
+
+void AppendDebugLog(const wchar_t* format, ...) {
+    if (!g_app.config.debug_log) {
+        return;
+    }
+
+    wchar_t message[1024]{};
+    va_list args;
+    va_start(args, format);
+    _vsnwprintf_s(message, _countof(message), _TRUNCATE, format, args);
+    va_end(args);
+
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+
+    wchar_t line[1280]{};
+    _snwprintf_s(
+        line,
+        _countof(line),
+        _TRUNCATE,
+        L"[%04u-%02u-%02u %02u:%02u:%02u.%03u] %ls\r\n",
+        st.wYear,
+        st.wMonth,
+        st.wDay,
+        st.wHour,
+        st.wMinute,
+        st.wSecond,
+        st.wMilliseconds,
+        message);
+
+    HANDLE file = CreateFileW(
+        DebugLogPath().c_str(),
+        FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    const int bytes_to_write = WideCharToMultiByte(CP_UTF8, 0, line, -1, nullptr, 0, nullptr, nullptr);
+    if (bytes_to_write > 1) {
+        std::vector<char> buffer(static_cast<size_t>(bytes_to_write - 1));
+        if (WideCharToMultiByte(CP_UTF8, 0, line, -1, buffer.data(), bytes_to_write - 1, nullptr, nullptr) > 0) {
+            DWORD written = 0;
+            WriteFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &written, nullptr);
+        }
+    }
+
+    CloseHandle(file);
+}
+
 // Configuration and environment state.
 void LoadConfig() {
     g_app.config.content_padding_x_dip = ReadConfigInt(L"content_padding_x", 8, 0, 80);
@@ -264,6 +334,7 @@ void LoadConfig() {
     g_app.config.network_arrow_gap_dip = ReadConfigInt(L"network_arrow_gap", 3, 0, 20);
     g_app.config.key_font_size_dip = ReadConfigInt(L"key_font_size", g_app.config.font_size_dip, 8, 36);
     g_app.config.show_key_widget = ReadConfigBool(L"show_key_widget", true);
+    g_app.config.debug_log = ReadConfigBool(L"debug_log", false);
     g_app.config.gap_after_disk_dip = ReadConfigInt(L"gap_after_disk", 14, 0, 220);
     g_app.config.network_arrow_style = LowerString(ReadConfigString(L"network_arrow_style", L"thin"));
 }
@@ -331,13 +402,19 @@ bool ShouldFreezeOverlayUpdate() {
     return IsBuiltinScreenshotForeground();
 }
 
-bool IsSuppressedNotificationState() {
+const wchar_t* SuppressedNotificationStateReason() {
     QUERY_USER_NOTIFICATION_STATE state = QUNS_ACCEPTS_NOTIFICATIONS;
     if (FAILED(SHQueryUserNotificationState(&state))) {
-        return false;
+        return nullptr;
     }
 
-    return state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE;
+    if (state == QUNS_RUNNING_D3D_FULL_SCREEN) {
+        return L"d3d_fullscreen";
+    }
+    if (state == QUNS_PRESENTATION_MODE) {
+        return L"presentation";
+    }
+    return nullptr;
 }
 
 bool IsFullscreenForegroundWindow() {
@@ -375,7 +452,17 @@ bool IsFullscreenForegroundWindow() {
 }
 
 bool ShouldSuppressOverlay() {
-    return IsSuppressedNotificationState() || IsFullscreenForegroundWindow();
+    return SuppressedNotificationStateReason() != nullptr || IsFullscreenForegroundWindow();
+}
+
+const wchar_t* OverlaySuppressionReason() {
+    if (const wchar_t* state_reason = SuppressedNotificationStateReason()) {
+        return state_reason;
+    }
+    if (IsFullscreenForegroundWindow()) {
+        return L"fullscreen_window";
+    }
+    return nullptr;
 }
 
 bool TickPassed(DWORD now, DWORD deadline) {
@@ -815,7 +902,7 @@ void ConsiderAnchorRect(const RECT& candidate, RECT& best_rect, bool& found) {
         candidate.left < best_rect.left ||
         (candidate.left == best_rect.left && candidate.top < best_rect.top) ||
         (candidate.left == best_rect.left && candidate.top == best_rect.top &&
-         (candidate.right - candidate.left) > (best_rect.right - best_rect.left))) {
+        (candidate.right - candidate.left) > (best_rect.right - best_rect.left))) {
         best_rect = candidate;
         found = true;
     }
@@ -981,16 +1068,20 @@ void RepositionWindow() {
 
     int x = taskbar.left;
     int y = taskbar.top;
+    int anchor_mode = 0;
+    RECT anchor_rect{};
 
     if (horizontal) {
         int tray_left = taskbar.right - Scale(360, g_app.dpi);
-        RECT anchor_rect{};
         if (TryGetTrayAnchorRect(anchor_rect)) {
             tray_left = anchor_rect.left;
+            anchor_mode = 1;
         } else {
             RECT notify_rect{};
             if (TryGetTrayNotifyRect(notify_rect)) {
                 tray_left = notify_rect.left;
+                anchor_rect = notify_rect;
+                anchor_mode = 2;
             }
         }
 
@@ -1013,6 +1104,38 @@ void RepositionWindow() {
         height,
         SWP_NOACTIVATE | SWP_SHOWWINDOW);
     KeepOverlayOnTop();
+
+    RECT overlay_rect{x, y, x + width, y + height};
+    const bool taskbar_changed = !g_app.has_last_logged_taskbar_rect || !RectEquals(taskbar, g_app.last_logged_taskbar_rect);
+    const bool anchor_changed =
+        anchor_mode != g_app.last_logged_anchor_mode ||
+        (anchor_mode == 0 ? g_app.has_last_logged_anchor_rect :
+                            !g_app.has_last_logged_anchor_rect || !RectEquals(anchor_rect, g_app.last_logged_anchor_rect));
+    const bool overlay_changed = !g_app.has_last_logged_overlay_rect || !RectEquals(overlay_rect, g_app.last_logged_overlay_rect);
+    if (taskbar_changed || anchor_changed || overlay_changed) {
+        AppendDebugLog(
+            L"placement taskbar=(%ld,%ld,%ld,%ld) anchor_mode=%d anchor=(%ld,%ld,%ld,%ld) overlay=(%ld,%ld,%ld,%ld)",
+            taskbar.left,
+            taskbar.top,
+            taskbar.right,
+            taskbar.bottom,
+            anchor_mode,
+            anchor_rect.left,
+            anchor_rect.top,
+            anchor_rect.right,
+            anchor_rect.bottom,
+            overlay_rect.left,
+            overlay_rect.top,
+            overlay_rect.right,
+            overlay_rect.bottom);
+        g_app.last_logged_taskbar_rect = taskbar;
+        g_app.last_logged_anchor_rect = anchor_rect;
+        g_app.last_logged_overlay_rect = overlay_rect;
+        g_app.has_last_logged_taskbar_rect = true;
+        g_app.has_last_logged_anchor_rect = anchor_mode != 0;
+        g_app.has_last_logged_overlay_rect = true;
+        g_app.last_logged_anchor_mode = anchor_mode;
+    }
 
     if (monitor) {
         MONITORINFO mi{};
@@ -1537,8 +1660,12 @@ bool ReapplyLastFrame(HWND hwnd) {
 }
 
 bool UpdateOverlaySuppression(HWND hwnd) {
-    const bool should_suppress = ShouldSuppressOverlay();
+    const wchar_t* reason = OverlaySuppressionReason();
+    const bool should_suppress = reason != nullptr;
     if (should_suppress) {
+        if (!g_app.overlay_suppressed) {
+            AppendDebugLog(L"suppression=on reason=%ls", reason);
+        }
         g_app.overlay_suppressed = true;
         if (IsWindowVisible(hwnd)) {
             ShowWindow(hwnd, SW_HIDE);
@@ -1548,6 +1675,7 @@ bool UpdateOverlaySuppression(HWND hwnd) {
 
     if (g_app.overlay_suppressed) {
         g_app.overlay_suppressed = false;
+        AppendDebugLog(L"suppression=off");
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         RepositionWindow();
         ReapplyLastFrame(hwnd);
@@ -1560,6 +1688,9 @@ bool UpdateOverlaySuppression(HWND hwnd) {
 
 bool UpdateFreezeState(HWND hwnd) {
     if (ShouldFreezeOverlayUpdate()) {
+        if (!g_app.overlay_update_frozen) {
+            AppendDebugLog(L"freeze=on reason=screenshot");
+        }
         g_app.overlay_update_frozen = true;
         ReapplyLastFrame(hwnd);
         return true;
@@ -1567,6 +1698,7 @@ bool UpdateFreezeState(HWND hwnd) {
 
     if (g_app.overlay_update_frozen) {
         g_app.overlay_update_frozen = false;
+        AppendDebugLog(L"freeze=off");
         g_app.refresh_resume_tick = GetTickCount() + 800;
         ReapplyLastFrame(hwnd);
         KeepOverlayOnTop();
@@ -1682,6 +1814,7 @@ void ValidatePaint(HWND hwnd) {
 // Window message handling and process startup.
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     if (msg == g_app.taskbar_created) {
+        AppendDebugLog(L"event=taskbar_created");
         AttachToTaskbarOwner(hwnd);
         AddTrayIcon(hwnd);
         if (UpdateOverlaySuppression(hwnd)) {
@@ -1821,6 +1954,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
 
     case WM_TRAY_LAYOUT_CHANGED:
         InterlockedExchange(&g_app.tray_layout_update_pending, 0);
+        AppendDebugLog(L"event=tray_layout_changed");
         AttachToTaskbarOwner(hwnd);
         if (UpdateOverlaySuppression(hwnd)) {
             return 0;

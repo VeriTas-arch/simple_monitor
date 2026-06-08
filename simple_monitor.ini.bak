@@ -21,6 +21,7 @@ key_font_size=14
 network_arrow_style=thin
 network_arrow_font_size=17
 network_arrow_gap=3
+debug_log=0
 
 ; Show the compact CAP/INS/NUM status widget after the disk column.
 show_key_widget=1
