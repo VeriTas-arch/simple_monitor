@@ -53,10 +53,11 @@ constexpr UINT WM_TRAY_LAYOUT_CHANGED = WM_APP + 2;
 constexpr int kAppIconResource = 101;
 
 enum MenuId : UINT {
-    ID_REPOSITION = 1001,
     ID_CLICK_THROUGH = 1002,
     ID_STARTUP = 1003,
     ID_EXIT = 1004,
+    ID_OPEN_CONFIG = 1005,
+    ID_RELOAD_CONFIG = 1006,
 };
 
 struct CpuSampler {
@@ -161,8 +162,7 @@ AppState g_app;
 
 // Forward declarations for cross-section entry points.
 void RenderOverlay(HWND hwnd);
-bool IsTaskbarRelatedWindow(HWND hwnd);
-void RepositionWindow();
+bool UpdateOverlaySuppression(HWND hwnd);
 
 // Shared utility helpers.
 ULONGLONG FileTimeToU64(const FILETIME& ft) {
@@ -310,10 +310,11 @@ void AppendDebugLog(const wchar_t* format, ...) {
         return;
     }
 
-    const int bytes_to_write = WideCharToMultiByte(CP_UTF8, 0, line, -1, nullptr, 0, nullptr, nullptr);
-    if (bytes_to_write > 1) {
-        std::vector<char> buffer(static_cast<size_t>(bytes_to_write - 1));
-        if (WideCharToMultiByte(CP_UTF8, 0, line, -1, buffer.data(), bytes_to_write - 1, nullptr, nullptr) > 0) {
+    const int line_chars = static_cast<int>(std::wcslen(line));
+    const int bytes_to_write = WideCharToMultiByte(CP_UTF8, 0, line, line_chars, nullptr, 0, nullptr, nullptr);
+    if (bytes_to_write > 0) {
+        std::vector<char> buffer(static_cast<size_t>(bytes_to_write));
+        if (WideCharToMultiByte(CP_UTF8, 0, line, line_chars, buffer.data(), bytes_to_write, nullptr, nullptr) > 0) {
             DWORD written = 0;
             WriteFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &written, nullptr);
         }
@@ -400,6 +401,27 @@ bool IsBuiltinScreenshotForeground() {
 
 bool ShouldFreezeOverlayUpdate() {
     return IsBuiltinScreenshotForeground();
+}
+
+HWND TaskbarWindow() {
+    return FindWindowW(L"Shell_TrayWnd", nullptr);
+}
+
+bool IsTaskbarRelatedWindow(HWND hwnd) {
+    if (!hwnd) {
+        return false;
+    }
+
+    HWND taskbar = TaskbarWindow();
+    if (!taskbar) {
+        return false;
+    }
+
+    if (hwnd == taskbar) {
+        return true;
+    }
+
+    return IsChild(taskbar, hwnd) != 0 || GetAncestor(hwnd, GA_ROOT) == taskbar;
 }
 
 const wchar_t* SuppressedNotificationStateReason() {
@@ -528,27 +550,6 @@ void KeepOverlayOnTop() {
         0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     g_app.maintaining_z_order = false;
-}
-
-HWND TaskbarWindow() {
-    return FindWindowW(L"Shell_TrayWnd", nullptr);
-}
-
-bool IsTaskbarRelatedWindow(HWND hwnd) {
-    if (!hwnd) {
-        return false;
-    }
-
-    HWND taskbar = TaskbarWindow();
-    if (!taskbar) {
-        return false;
-    }
-
-    if (hwnd == taskbar) {
-        return true;
-    }
-
-    return IsChild(taskbar, hwnd) != 0 || GetAncestor(hwnd, GA_ROOT) == taskbar;
 }
 
 void CALLBACK TrayEventProc(
@@ -1144,6 +1145,14 @@ void RepositionWindow() {
     }
 }
 
+void RepositionAndRenderOverlay(HWND hwnd, bool keep_on_top = false) {
+    RepositionWindow();
+    if (keep_on_top) {
+        KeepOverlayOnTop();
+    }
+    RenderOverlay(hwnd);
+}
+
 // Tray icon and context menu.
 HICON LoadAppIcon(HINSTANCE instance, int width, int height) {
     HICON icon = reinterpret_cast<HICON>(LoadImageW(
@@ -1185,12 +1194,21 @@ void RemoveTrayIcon(HWND hwnd) {
     Shell_NotifyIconW(NIM_DELETE, &nid);
 }
 
+void ReloadConfigAndRefresh(HWND hwnd) {
+    LoadConfig();
+    if (UpdateOverlaySuppression(hwnd)) {
+        return;
+    }
+    RepositionAndRenderOverlay(hwnd);
+}
+
 bool HandleMenuCommand(HWND hwnd, UINT command) {
     switch (command) {
-    case ID_REPOSITION:
-        LoadConfig();
-        RepositionWindow();
-        RenderOverlay(hwnd);
+    case ID_OPEN_CONFIG:
+        ShellExecuteW(hwnd, L"open", ConfigPath().c_str(), nullptr, ModuleDir().c_str(), SW_SHOWNORMAL);
+        return true;
+    case ID_RELOAD_CONFIG:
+        ReloadConfigAndRefresh(hwnd);
         return true;
     case ID_CLICK_THROUGH:
         g_app.click_through = !g_app.click_through;
@@ -1218,7 +1236,9 @@ void ShowTrayMenu(HWND hwnd) {
             return;
         }
 
-        AppendMenuW(menu, MF_STRING, ID_REPOSITION, L"Reposition");
+        AppendMenuW(menu, MF_STRING, ID_OPEN_CONFIG, L"Open config");
+        AppendMenuW(menu, MF_STRING, ID_RELOAD_CONFIG, L"Reload config");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING | (g_app.click_through ? MF_CHECKED : MF_UNCHECKED), ID_CLICK_THROUGH, L"Click-through");
         AppendMenuW(menu, MF_STRING | (IsStartupEnabled() ? MF_CHECKED : MF_UNCHECKED), ID_STARTUP, L"Start with Windows");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -1708,6 +1728,35 @@ bool UpdateFreezeState(HWND hwnd) {
     return false;
 }
 
+bool ShouldHoldLastFrame(DWORD now) {
+    return g_app.refresh_resume_tick != 0 && !TickPassed(now, g_app.refresh_resume_tick);
+}
+
+bool HandleResumeDelay(HWND hwnd) {
+    if (!ShouldHoldLastFrame(GetTickCount())) {
+        return false;
+    }
+
+    ReapplyLastFrame(hwnd);
+    KeepOverlayOnTop();
+    return true;
+}
+
+bool HandleOverlayStateGuards(HWND hwnd) {
+    if (UpdateOverlaySuppression(hwnd)) {
+        return true;
+    }
+    if (UpdateFreezeState(hwnd)) {
+        return true;
+    }
+    if (HandleResumeDelay(hwnd)) {
+        return true;
+    }
+
+    g_app.refresh_resume_tick = 0;
+    return false;
+}
+
 void RenderOverlay(HWND hwnd) {
     RECT client{};
     GetClientRect(hwnd, &client);
@@ -1811,182 +1860,185 @@ void ValidatePaint(HWND hwnd) {
     EndPaint(hwnd, &ps);
 }
 
+LRESULT HandleTaskbarCreated(HWND hwnd) {
+    AppendDebugLog(L"event=taskbar_created");
+    AttachToTaskbarOwner(hwnd);
+    AddTrayIcon(hwnd);
+    if (UpdateOverlaySuppression(hwnd)) {
+        return 0;
+    }
+    RepositionAndRenderOverlay(hwnd);
+    return 0;
+}
+
+LRESULT HandleCreate(HWND hwnd) {
+    g_app.hwnd = hwnd;
+    g_app.dpi = WindowDpi(hwnd);
+    LoadConfig();
+    AddTrayIcon(hwnd);
+    AttachToTaskbarOwner(hwnd);
+    RegisterTrayEventHooks();
+    InitPdhGroup(g_app.gpu, L"\\GPU Engine(*)\\Utilization Percentage");
+    InitPdhGroup(g_app.disk, L"\\PhysicalDisk(_Total)\\% Disk Time");
+    SampleMetrics();
+    SetTimer(hwnd, kRefreshTimer, 1000, nullptr);
+    SetTimer(hwnd, kPlacementTimer, kPlacementIntervalMs, nullptr);
+    SetTimer(hwnd, kStateTimer, kStateIntervalMs, nullptr);
+    if (UpdateOverlaySuppression(hwnd)) {
+        return 0;
+    }
+    RepositionAndRenderOverlay(hwnd);
+    return 0;
+}
+
+LRESULT HandleTimer(HWND hwnd, UINT_PTR timer_id) {
+    if (timer_id == kStateTimer) {
+        if (HandleOverlayStateGuards(hwnd)) {
+            return 0;
+        }
+        if (g_app.config.show_key_widget && SampleKeysIfChanged()) {
+            RenderOverlay(hwnd);
+        }
+        return 0;
+    }
+
+    if (HandleOverlayStateGuards(hwnd)) {
+        return 0;
+    }
+
+    if (timer_id == kRefreshTimer) {
+        SampleMetrics();
+        RepositionAndRenderOverlay(hwnd, true);
+    } else if (timer_id == kPlacementTimer) {
+        RepositionWindow();
+        KeepOverlayOnTop();
+    }
+    return 0;
+}
+
+LRESULT HandleDpiChanged(HWND hwnd, WPARAM wparam, LPARAM lparam) {
+    g_app.dpi = HIWORD(wparam);
+    if (lparam) {
+        const RECT* suggested = reinterpret_cast<const RECT*>(lparam);
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            suggested->left,
+            suggested->top,
+            suggested->right - suggested->left,
+            suggested->bottom - suggested->top,
+            SWP_NOACTIVATE);
+    }
+    if (UpdateOverlaySuppression(hwnd)) {
+        return 0;
+    }
+    RepositionAndRenderOverlay(hwnd);
+    return 0;
+}
+
+LRESULT HandleDisplayChange(HWND hwnd) {
+    AttachToTaskbarOwner(hwnd);
+    if (UpdateOverlaySuppression(hwnd)) {
+        return 0;
+    }
+    RepositionAndRenderOverlay(hwnd);
+    return 0;
+}
+
+LRESULT HandleShowWindow(HWND hwnd, WPARAM wparam) {
+    if (!wparam) {
+        SetTimer(hwnd, kPlacementTimer, 100, nullptr);
+    } else {
+        SetTimer(hwnd, kPlacementTimer, kPlacementIntervalMs, nullptr);
+        if (HandleOverlayStateGuards(hwnd)) {
+            return 0;
+        }
+        RenderOverlay(hwnd);
+    }
+    return 0;
+}
+
+LRESULT HandleTrayLayoutChanged(HWND hwnd) {
+    InterlockedExchange(&g_app.tray_layout_update_pending, 0);
+    AppendDebugLog(L"event=tray_layout_changed");
+    AttachToTaskbarOwner(hwnd);
+    if (UpdateOverlaySuppression(hwnd)) {
+        return 0;
+    }
+    RepositionAndRenderOverlay(hwnd, true);
+    return 0;
+}
+
+LRESULT HandleTrayIcon(HWND hwnd, LPARAM lparam) {
+    if (LOWORD(lparam) == WM_CONTEXTMENU) {
+        ShowTrayMenu(hwnd);
+    } else if (LOWORD(lparam) == WM_LBUTTONDBLCLK) {
+        RepositionWindow();
+    }
+    return 0;
+}
+
+LRESULT HandleDestroy(HWND hwnd) {
+    KillTimer(hwnd, kRefreshTimer);
+    KillTimer(hwnd, kPlacementTimer);
+    KillTimer(hwnd, kStateTimer);
+    UnregisterTrayEventHooks();
+    RemoveTrayIcon(hwnd);
+    if (g_app.gpu.query) {
+        PdhCloseQuery(g_app.gpu.query);
+    }
+    if (g_app.disk.query) {
+        PdhCloseQuery(g_app.disk.query);
+    }
+    ReleaseRenderResources();
+    PostQuitMessage(0);
+    return 0;
+}
+
 // Window message handling and process startup.
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     if (msg == g_app.taskbar_created) {
-        AppendDebugLog(L"event=taskbar_created");
-        AttachToTaskbarOwner(hwnd);
-        AddTrayIcon(hwnd);
-        if (UpdateOverlaySuppression(hwnd)) {
-            return 0;
-        }
-        RepositionWindow();
-        RenderOverlay(hwnd);
-        return 0;
+        return HandleTaskbarCreated(hwnd);
     }
 
     switch (msg) {
     case WM_CREATE:
-        g_app.hwnd = hwnd;
-        g_app.dpi = WindowDpi(hwnd);
-        LoadConfig();
-        AddTrayIcon(hwnd);
-        AttachToTaskbarOwner(hwnd);
-        RegisterTrayEventHooks();
-        InitPdhGroup(g_app.gpu, L"\\GPU Engine(*)\\Utilization Percentage");
-        InitPdhGroup(g_app.disk, L"\\PhysicalDisk(_Total)\\% Disk Time");
-        SampleMetrics();
-        SetTimer(hwnd, kRefreshTimer, 1000, nullptr);
-        SetTimer(hwnd, kPlacementTimer, kPlacementIntervalMs, nullptr);
-        SetTimer(hwnd, kStateTimer, kStateIntervalMs, nullptr);
-        if (UpdateOverlaySuppression(hwnd)) {
-            return 0;
-        }
-        RepositionWindow();
-        RenderOverlay(hwnd);
-        return 0;
+        return HandleCreate(hwnd);
 
     case WM_TIMER:
-        if (wparam == kStateTimer) {
-            if (UpdateOverlaySuppression(hwnd)) {
-                return 0;
-            }
-            if (UpdateFreezeState(hwnd)) {
-                return 0;
-            }
-            if (g_app.refresh_resume_tick != 0 && !TickPassed(GetTickCount(), g_app.refresh_resume_tick)) {
-                ReapplyLastFrame(hwnd);
-                KeepOverlayOnTop();
-                return 0;
-            }
-            g_app.refresh_resume_tick = 0;
-            if (g_app.config.show_key_widget && SampleKeysIfChanged()) {
-                RenderOverlay(hwnd);
-            }
-            return 0;
-        }
-
-        if (UpdateOverlaySuppression(hwnd)) {
-            return 0;
-        }
-        if (UpdateFreezeState(hwnd)) {
-            return 0;
-        }
-        if (g_app.refresh_resume_tick != 0 && !TickPassed(GetTickCount(), g_app.refresh_resume_tick)) {
-            ReapplyLastFrame(hwnd);
-            KeepOverlayOnTop();
-            return 0;
-        }
-        g_app.refresh_resume_tick = 0;
-
-        if (wparam == kRefreshTimer) {
-            SampleMetrics();
-            RepositionWindow();
-            KeepOverlayOnTop();
-            RenderOverlay(hwnd);
-        } else if (wparam == kPlacementTimer) {
-            RepositionWindow();
-            KeepOverlayOnTop();
-        }
-        return 0;
+        return HandleTimer(hwnd, static_cast<UINT_PTR>(wparam));
 
     case WM_PAINT:
         ValidatePaint(hwnd);
         return 0;
 
     case WM_DPICHANGED:
-        g_app.dpi = HIWORD(wparam);
-        if (lparam) {
-            const RECT* suggested = reinterpret_cast<const RECT*>(lparam);
-            SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                suggested->left,
-                suggested->top,
-                suggested->right - suggested->left,
-                suggested->bottom - suggested->top,
-                SWP_NOACTIVATE);
-        }
-        if (UpdateOverlaySuppression(hwnd)) {
-            return 0;
-        }
-        RepositionWindow();
-        RenderOverlay(hwnd);
-        return 0;
+        return HandleDpiChanged(hwnd, wparam, lparam);
 
     case WM_DISPLAYCHANGE:
     case WM_SETTINGCHANGE:
     case WM_DEVICECHANGE:
-        AttachToTaskbarOwner(hwnd);
-        if (UpdateOverlaySuppression(hwnd)) {
-            return 0;
-        }
-        RepositionWindow();
-        RenderOverlay(hwnd);
-        return 0;
+        return HandleDisplayChange(hwnd);
 
     case WM_WINDOWPOSCHANGED:
         KeepOverlayOnTop();
         break;
 
     case WM_SHOWWINDOW:
-        if (!wparam) {
-            SetTimer(hwnd, kPlacementTimer, 100, nullptr);
-        } else {
-            SetTimer(hwnd, kPlacementTimer, kPlacementIntervalMs, nullptr);
-            if (UpdateOverlaySuppression(hwnd)) {
-                return 0;
-            }
-            if (UpdateFreezeState(hwnd)) {
-                return 0;
-            }
-            if (g_app.refresh_resume_tick != 0 && !TickPassed(GetTickCount(), g_app.refresh_resume_tick)) {
-                ReapplyLastFrame(hwnd);
-                return 0;
-            }
-            RenderOverlay(hwnd);
-        }
-        return 0;
+        return HandleShowWindow(hwnd, wparam);
 
     case WM_COMMAND:
         HandleMenuCommand(hwnd, LOWORD(wparam));
         return 0;
 
     case WM_TRAY_LAYOUT_CHANGED:
-        InterlockedExchange(&g_app.tray_layout_update_pending, 0);
-        AppendDebugLog(L"event=tray_layout_changed");
-        AttachToTaskbarOwner(hwnd);
-        if (UpdateOverlaySuppression(hwnd)) {
-            return 0;
-        }
-        RepositionWindow();
-        KeepOverlayOnTop();
-        RenderOverlay(hwnd);
-        return 0;
+        return HandleTrayLayoutChanged(hwnd);
 
     case WM_TRAYICON:
-        if (LOWORD(lparam) == WM_CONTEXTMENU || LOWORD(lparam) == WM_RBUTTONUP) {
-            ShowTrayMenu(hwnd);
-        } else if (LOWORD(lparam) == WM_LBUTTONDBLCLK) {
-            RepositionWindow();
-        }
-        return 0;
+        return HandleTrayIcon(hwnd, lparam);
 
     case WM_DESTROY:
-        KillTimer(hwnd, kRefreshTimer);
-        KillTimer(hwnd, kPlacementTimer);
-        KillTimer(hwnd, kStateTimer);
-        UnregisterTrayEventHooks();
-        RemoveTrayIcon(hwnd);
-        if (g_app.gpu.query) {
-            PdhCloseQuery(g_app.gpu.query);
-        }
-        if (g_app.disk.query) {
-            PdhCloseQuery(g_app.disk.query);
-        }
-        ReleaseRenderResources();
-        PostQuitMessage(0);
-        return 0;
+        return HandleDestroy(hwnd);
     }
 
     return DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -2011,6 +2063,7 @@ int Run(HINSTANCE instance) {
     const HRESULT co_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     g_app.com_initialized = SUCCEEDED(co_result);
     LoadConfig();
+    AppendDebugLog(L"startup debug_log=1");
 
     using DpiAwarenessContext = HANDLE;
     using SetProcessDpiAwarenessContextFn = BOOL(WINAPI*)(DpiAwarenessContext);
