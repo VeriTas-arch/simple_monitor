@@ -22,9 +22,8 @@ For the usual edit-build-run loop during development, use:
 .\dev-rebuild.ps1
 ```
 
-It stops any running `simple_monitor.exe`, rebuilds the project, and starts the
-new executable again. Use `.\dev-rebuild.ps1 -NoLaunch` to rebuild without
-starting the app.
+It stops any running `simple_monitor.exe` and rebuilds the project. Start the
+new executable manually after the build completes.
 
 ## Current MVP
 

@@ -52,11 +52,11 @@ constexpr UINT WM_TRAY_LAYOUT_CHANGED = WM_APP + 2;
 constexpr int kAppIconResource = 101;
 
 enum MenuId : UINT {
-    ID_CLICK_THROUGH = 1002,
-    ID_STARTUP = 1003,
-    ID_EXIT = 1004,
-    ID_OPEN_CONFIG = 1005,
-    ID_RELOAD_CONFIG = 1006,
+    ID_CLICK_THROUGH = 1001,
+    ID_STARTUP = 1002,
+    ID_EXIT = 1003,
+    ID_OPEN_CONFIG = 1004,
+    ID_RELOAD_CONFIG = 1005,
 };
 
 struct CpuSampler {
