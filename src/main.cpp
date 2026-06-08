@@ -37,6 +37,7 @@ namespace {
 #define WM_DPICHANGED 0x02E0
 #endif
 
+// Core constants, message IDs, and long-lived application state.
 constexpr wchar_t kWindowClass[] = L"SimpleMonitorOverlayWindow";
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValue[] = L"SimpleMonitor";
@@ -149,10 +150,12 @@ struct AppState {
 
 AppState g_app;
 
+// Forward declarations for cross-section entry points.
 void RenderOverlay(HWND hwnd);
 bool IsTaskbarRelatedWindow(HWND hwnd);
 void RepositionWindow();
 
+// Shared utility helpers.
 ULONGLONG FileTimeToU64(const FILETIME& ft) {
     ULARGE_INTEGER value{};
     value.LowPart = ft.dwLowDateTime;
@@ -249,6 +252,7 @@ std::wstring LowerString(std::wstring value) {
     return value;
 }
 
+// Configuration and environment state.
 void LoadConfig() {
     g_app.config.content_padding_x_dip = ReadConfigInt(L"content_padding_x", 8, 0, 80);
     g_app.config.column_gap_dip = ReadConfigInt(L"column_gap", 28, 0, 220);
@@ -400,6 +404,7 @@ void SetStartupEnabled(bool enabled) {
     RegCloseKey(key);
 }
 
+// Overlay visibility, suppression, and top-level window state.
 void UpdateLayeredStyle(HWND hwnd) {
     LONG_PTR ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
     if (g_app.click_through) {
@@ -513,6 +518,7 @@ void AttachToTaskbarOwner(HWND hwnd) {
     g_app.taskbar_owner = taskbar;
 }
 
+// Metric formatting and sampling.
 std::wstring FormatRate(double bytes_per_second) {
     wchar_t buffer[32]{};
     double value = bytes_per_second / 1024.0;
@@ -733,6 +739,7 @@ void SampleMetrics() {
     SampleKeys(g_app.metrics);
 }
 
+// Taskbar anchoring and placement.
 HWND FindDescendantWindow(HWND parent, const wchar_t* class_name) {
     HWND child = nullptr;
     while ((child = FindWindowExW(parent, child, nullptr, nullptr)) != nullptr) {
@@ -1014,6 +1021,7 @@ void RepositionWindow() {
     }
 }
 
+// Tray icon and context menu.
 HICON LoadAppIcon(HINSTANCE instance, int width, int height) {
     HICON icon = reinterpret_cast<HICON>(LoadImageW(
         instance,
@@ -1110,6 +1118,7 @@ void ShowTrayMenu(HWND hwnd) {
     }
 }
 
+// DirectWrite/Direct2D text layout and rendering helpers.
 HRESULT EnsureRenderResources() {
     RenderResources& render = g_app.render;
     HRESULT hr = S_OK;
@@ -1467,6 +1476,7 @@ void DrawAdaptiveColumnsDwrite(
     }
 }
 
+// Layered-window presentation and overlay frame lifecycle.
 bool PresentPixels(HWND hwnd, const BYTE* source_pixels, int width, int height) {
     RECT window_rect{};
     if (!GetWindowRect(hwnd, &window_rect) || width <= 0 || height <= 0 || !source_pixels) {
@@ -1669,6 +1679,7 @@ void ValidatePaint(HWND hwnd) {
     EndPaint(hwnd, &ps);
 }
 
+// Window message handling and process startup.
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     if (msg == g_app.taskbar_created) {
         AttachToTaskbarOwner(hwnd);

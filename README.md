@@ -5,16 +5,26 @@ independent top-level window, not an Explorer taskbar component or DeskBand.
 
 ## Build with MinGW
 
-```powershell
+```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
 The executable is generated at:
 
-```text
+```bash
 build/simple_monitor.exe
 ```
+
+For the usual edit-build-run loop during development, use:
+
+```pwsh
+.\dev-rebuild.ps1
+```
+
+It stops any running `simple_monitor.exe`, rebuilds the project, and starts the
+new executable again. Use `.\dev-rebuild.ps1 -NoLaunch` to rebuild without
+starting the app.
 
 ## Current MVP
 
