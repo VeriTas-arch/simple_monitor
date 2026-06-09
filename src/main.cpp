@@ -369,6 +369,30 @@ std::wstring Basename(std::wstring path) {
     return path;
 }
 
+std::wstring WindowProcessBasename(HWND hwnd) {
+    DWORD process_id = 0;
+    GetWindowThreadProcessId(hwnd, &process_id);
+    if (process_id == 0) {
+        return L"";
+    }
+
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
+    if (!process) {
+        return L"";
+    }
+
+    std::wstring path(MAX_PATH, L'\0');
+    DWORD size = static_cast<DWORD>(path.size());
+    const bool ok = QueryFullProcessImageNameW(process, 0, path.data(), &size) != 0;
+    CloseHandle(process);
+    if (!ok) {
+        return L"";
+    }
+
+    path.resize(size);
+    return Basename(path);
+}
+
 bool WindowClassIs(HWND hwnd, const wchar_t* class_name) {
     wchar_t current_class[128]{};
     return GetClassNameW(hwnd, current_class, ARRAYSIZE(current_class)) != 0 &&
@@ -385,33 +409,18 @@ bool IsShellPopupOrDesktopWindow(HWND hwnd) {
            WindowClassIs(hwnd, L"WorkerW");
 }
 
+bool IsTaskbarWindowClass(HWND hwnd) {
+    return WindowClassIs(hwnd, L"Shell_TrayWnd") ||
+           WindowClassIs(hwnd, L"Shell_SecondaryTrayWnd");
+}
+
 bool IsBuiltinScreenshotForeground() {
     HWND foreground = GetForegroundWindow();
     if (!foreground || foreground == g_app.hwnd) {
         return false;
     }
 
-    DWORD process_id = 0;
-    GetWindowThreadProcessId(foreground, &process_id);
-    if (process_id == 0) {
-        return false;
-    }
-
-    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
-    if (!process) {
-        return false;
-    }
-
-    std::wstring path(MAX_PATH, L'\0');
-    DWORD size = static_cast<DWORD>(path.size());
-    bool ok = QueryFullProcessImageNameW(process, 0, path.data(), &size) != 0;
-    CloseHandle(process);
-    if (!ok) {
-        return false;
-    }
-
-    path.resize(size);
-    const std::wstring exe = Basename(path);
+    const std::wstring exe = WindowProcessBasename(foreground);
     return exe == L"snippingtool.exe" ||
            exe == L"screenclippinghost.exe" ||
            exe == L"snipandsketch.exe";
@@ -430,6 +439,10 @@ bool IsTaskbarRelatedWindow(HWND hwnd) {
         return false;
     }
 
+    if (IsTaskbarWindowClass(hwnd)) {
+        return true;
+    }
+
     HWND taskbar = TaskbarWindow();
     if (!taskbar) {
         return false;
@@ -439,7 +452,19 @@ bool IsTaskbarRelatedWindow(HWND hwnd) {
         return true;
     }
 
-    return IsChild(taskbar, hwnd) != 0 || GetAncestor(hwnd, GA_ROOT) == taskbar;
+    if (IsChild(taskbar, hwnd) != 0 ||
+        GetAncestor(hwnd, GA_ROOT) == taskbar ||
+        GetAncestor(hwnd, GA_ROOTOWNER) == taskbar) {
+        return true;
+    }
+
+    for (HWND owner = GetWindow(hwnd, GW_OWNER); owner; owner = GetWindow(owner, GW_OWNER)) {
+        if (owner == taskbar || IsTaskbarWindowClass(owner)) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 const wchar_t* SuppressedNotificationStateReason() {
@@ -470,6 +495,10 @@ bool IsFullscreenForegroundWindow() {
         IsShellPopupOrDesktopWindow(root) ||
         !IsWindowVisible(root) ||
         IsIconic(root)) {
+        return false;
+    }
+
+    if (WindowProcessBasename(root) == L"explorer.exe") {
         return false;
     }
 
