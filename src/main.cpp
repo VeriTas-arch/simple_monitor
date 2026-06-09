@@ -46,6 +46,7 @@ constexpr UINT_PTR kPlacementTimer = 2;
 constexpr UINT_PTR kStateTimer = 3;
 constexpr UINT kStateIntervalMs = 100;
 constexpr UINT kPlacementIntervalMs = 5000;
+constexpr DWORD kGpuGroupRefreshIntervalMs = 5000;
 constexpr UINT kTrayIconId = 1;
 constexpr UINT WM_TRAYICON = WM_APP + 1;
 constexpr UINT WM_TRAY_LAYOUT_CHANGED = WM_APP + 2;
@@ -81,6 +82,8 @@ struct PdhGroup {
     std::vector<HCOUNTER> counters;
     bool ready = false;
     double value = -1.0;
+    std::wstring wildcard_path;
+    DWORD last_refresh_tick = 0;
 };
 
 struct Metrics {
@@ -731,7 +734,19 @@ void SampleNetwork(NetworkSampler& sampler, Metrics& metrics) {
     metrics.up_bps = sampler.up_bps;
 }
 
+void ResetPdhGroup(PdhGroup& group) {
+    if (group.query) {
+        PdhCloseQuery(group.query);
+        group.query = nullptr;
+    }
+    group.counters.clear();
+    group.ready = false;
+    group.last_refresh_tick = 0;
+}
+
 void InitPdhGroup(PdhGroup& group, const wchar_t* wildcard_path) {
+    group.wildcard_path = wildcard_path;
+    ResetPdhGroup(group);
     if (PdhOpenQueryW(nullptr, 0, &group.query) != ERROR_SUCCESS) {
         return;
     }
@@ -783,6 +798,32 @@ void InitPdhGroup(PdhGroup& group, const wchar_t* wildcard_path) {
 
     PdhCollectQueryData(group.query);
     group.ready = true;
+    group.last_refresh_tick = GetTickCount();
+}
+
+void RebuildPdhGroup(PdhGroup& group) {
+    if (group.wildcard_path.empty()) {
+        return;
+    }
+
+    ResetPdhGroup(group);
+    InitPdhGroup(group, group.wildcard_path.c_str());
+}
+
+void RefreshPdhGroupIfDue(PdhGroup& group) {
+    if (group.wildcard_path.empty()) {
+        return;
+    }
+
+    if (!group.ready || group.query == nullptr) {
+        RebuildPdhGroup(group);
+        return;
+    }
+
+    const DWORD now = GetTickCount();
+    if (TickPassed(now, group.last_refresh_tick + kGpuGroupRefreshIntervalMs)) {
+        RebuildPdhGroup(group);
+    }
 }
 
 double SamplePdhGroup(PdhGroup& group, bool sum_values) {
@@ -842,6 +883,7 @@ void SampleMetrics() {
     SampleCpu(g_app.cpu, g_app.metrics);
     SampleMemory(g_app.metrics);
     SampleNetwork(g_app.network, g_app.metrics);
+    RefreshPdhGroupIfDue(g_app.gpu);
     g_app.metrics.gpu = SamplePdhGroup(g_app.gpu, true);
     g_app.metrics.disk = SamplePdhGroup(g_app.disk, false);
     SampleKeys(g_app.metrics);
