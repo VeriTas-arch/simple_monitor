@@ -90,6 +90,7 @@ struct PdhGroup {
     HQUERY query = nullptr;
     std::vector<HCOUNTER> counters;
     bool ready = false;
+    bool needs_second_sample = false;
     double value = -1.0;
     std::wstring wildcard_path;
     DWORD last_refresh_tick = 0;
@@ -147,6 +148,7 @@ struct AppState {
     bool com_initialized = false;
     bool overlay_update_frozen = false;
     bool overlay_suppressed = false;
+    bool placement_timer_fast = false;
     LONG tray_layout_update_pending = 0;
     DWORD refresh_resume_tick = 0;
     RECT last_logged_taskbar_rect{};
@@ -491,23 +493,29 @@ const wchar_t* SuppressedNotificationStateReason() {
     return nullptr;
 }
 
+bool IsIgnoredShellWindow(HWND hwnd) {
+    return !hwnd ||
+           hwnd == g_app.hwnd ||
+           IsTaskbarRelatedWindow(hwnd) ||
+           IsShellPopupOrDesktopWindow(hwnd) ||
+           WindowProcessBasename(hwnd) == L"explorer.exe";
+}
+
+bool IsEligibleFullscreenAppWindow(HWND hwnd) {
+    return hwnd &&
+           !IsIgnoredShellWindow(hwnd) &&
+           IsWindowVisible(hwnd) &&
+           !IsIconic(hwnd);
+}
+
 bool IsFullscreenForegroundWindow() {
     HWND foreground = GetForegroundWindow();
-    if (!foreground || foreground == g_app.hwnd || IsTaskbarRelatedWindow(foreground) || IsShellPopupOrDesktopWindow(foreground)) {
+    if (IsIgnoredShellWindow(foreground)) {
         return false;
     }
 
     HWND root = GetAncestor(foreground, GA_ROOT);
-    if (!root ||
-        root == g_app.hwnd ||
-        IsTaskbarRelatedWindow(root) ||
-        IsShellPopupOrDesktopWindow(root) ||
-        !IsWindowVisible(root) ||
-        IsIconic(root)) {
-        return false;
-    }
-
-    if (WindowProcessBasename(root) == L"explorer.exe") {
+    if (!IsEligibleFullscreenAppWindow(root)) {
         return false;
     }
 
@@ -667,6 +675,17 @@ void AttachToTaskbarOwner(HWND hwnd) {
     g_app.taskbar_owner = taskbar;
 }
 
+void SetPlacementTimer(HWND hwnd, UINT interval_ms, bool fast) {
+    SetTimer(hwnd, kPlacementTimer, interval_ms, nullptr);
+    g_app.placement_timer_fast = fast;
+}
+
+void RestorePlacementTimer(HWND hwnd) {
+    if (g_app.placement_timer_fast) {
+        SetPlacementTimer(hwnd, kPlacementIntervalMs, false);
+    }
+}
+
 // Metric formatting and sampling.
 std::wstring FormatRate(double bytes_per_second) {
     wchar_t buffer[32]{};
@@ -804,6 +823,7 @@ void ResetPdhGroup(PdhGroup& group) {
     }
     group.counters.clear();
     group.ready = false;
+    group.needs_second_sample = false;
     group.last_refresh_tick = 0;
 }
 
@@ -859,6 +879,7 @@ void InitPdhGroup(PdhGroup& group, const wchar_t* wildcard_path) {
 
     PdhCollectQueryData(group.query);
     group.ready = true;
+    group.needs_second_sample = true;
     group.last_refresh_tick = GetTickCount();
 }
 
@@ -896,6 +917,11 @@ double SamplePdhGroup(PdhGroup& group, bool sum_values) {
         return -1.0;
     }
 
+    if (group.needs_second_sample) {
+        group.needs_second_sample = false;
+        return group.value;
+    }
+
     double total = 0.0;
     double max_value = -1.0;
     bool any = false;
@@ -916,7 +942,8 @@ double SamplePdhGroup(PdhGroup& group, bool sum_values) {
         return -1.0;
     }
 
-    return ClampPercent(sum_values ? total : max_value);
+    group.value = ClampPercent(sum_values ? total : max_value);
+    return group.value;
 }
 
 void SampleKeys(Metrics& metrics) {
@@ -1803,6 +1830,7 @@ bool UpdateOverlaySuppression(HWND hwnd) {
             AppendDebugLog(L"suppression=on reason=%ls", reason);
         }
         g_app.overlay_suppressed = true;
+        RestorePlacementTimer(hwnd);
         if (IsWindowVisible(hwnd)) {
             ShowWindow(hwnd, SW_HIDE);
         }
@@ -1812,6 +1840,7 @@ bool UpdateOverlaySuppression(HWND hwnd) {
     if (g_app.overlay_suppressed) {
         g_app.overlay_suppressed = false;
         AppendDebugLog(L"suppression=off");
+        RestorePlacementTimer(hwnd);
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         RepositionWindow();
         ReapplyLastFrame(hwnd);
@@ -1987,7 +2016,7 @@ LRESULT HandleCreate(HWND hwnd) {
     InitPdhGroup(g_app.disk, L"\\PhysicalDisk(_Total)\\% Disk Time");
     SampleMetrics();
     SetTimer(hwnd, kRefreshTimer, 1000, nullptr);
-    SetTimer(hwnd, kPlacementTimer, kPlacementIntervalMs, nullptr);
+    SetPlacementTimer(hwnd, kPlacementIntervalMs, false);
     SetTimer(hwnd, kStateTimer, kStateIntervalMs, nullptr);
     if (UpdateOverlaySuppression(hwnd)) {
         return 0;
@@ -2057,9 +2086,11 @@ LRESULT HandleDisplayChange(HWND hwnd) {
 
 LRESULT HandleShowWindow(HWND hwnd, WPARAM wparam) {
     if (!wparam) {
-        SetTimer(hwnd, kPlacementTimer, 100, nullptr);
+        if (!g_app.overlay_suppressed) {
+            SetPlacementTimer(hwnd, 100, true);
+        }
     } else {
-        SetTimer(hwnd, kPlacementTimer, kPlacementIntervalMs, nullptr);
+        SetPlacementTimer(hwnd, kPlacementIntervalMs, false);
         if (HandleOverlayStateGuards(hwnd)) {
             return 0;
         }
