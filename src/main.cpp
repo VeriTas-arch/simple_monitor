@@ -11,9 +11,12 @@
 #define _UNICODE
 #endif
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <shellapi.h>
 #include <iphlpapi.h>
+#include <netioapi.h>
 #include <pdh.h>
 #include <pdhmsg.h>
 #include <d2d1.h>
@@ -722,36 +725,35 @@ void SampleMemory(Metrics& metrics) {
 }
 
 void SampleNetwork(NetworkSampler& sampler, Metrics& metrics) {
-    DWORD size = 0;
-    DWORD result = GetIfTable(nullptr, &size, FALSE);
-    if (result != ERROR_INSUFFICIENT_BUFFER || size == 0) {
-        return;
-    }
-
-    std::vector<BYTE> buffer(size);
-    auto* table = reinterpret_cast<MIB_IFTABLE*>(buffer.data());
-    if (GetIfTable(table, &size, FALSE) != NO_ERROR) {
+    PMIB_IF_TABLE2 table = nullptr;
+    if (GetIfTable2(&table) != NO_ERROR || table == nullptr) {
         return;
     }
 
     uint64_t in_bytes = 0;
     uint64_t out_bytes = 0;
-    for (DWORD i = 0; i < table->dwNumEntries; ++i) {
-        const MIB_IFROW& row = table->table[i];
-        if (row.dwOperStatus != MIB_IF_OPER_STATUS_OPERATIONAL || row.dwType == IF_TYPE_SOFTWARE_LOOPBACK) {
+    for (ULONG i = 0; i < table->NumEntries; ++i) {
+        const MIB_IF_ROW2& row = table->Table[i];
+        if (row.OperStatus != IfOperStatusUp || row.Type == IF_TYPE_SOFTWARE_LOOPBACK) {
             continue;
         }
-        in_bytes += row.dwInOctets;
-        out_bytes += row.dwOutOctets;
+        in_bytes += row.InOctets;
+        out_bytes += row.OutOctets;
     }
+    FreeMibTable(table);
 
     const DWORD now = GetTickCount();
     if (sampler.has_sample) {
         const DWORD elapsed_ms = now - sampler.tick;
         if (elapsed_ms > 0) {
-            const double seconds = elapsed_ms / 1000.0;
-            sampler.down_bps = (in_bytes - sampler.in_bytes) / seconds;
-            sampler.up_bps = (out_bytes - sampler.out_bytes) / seconds;
+            if (in_bytes >= sampler.in_bytes && out_bytes >= sampler.out_bytes) {
+                const double seconds = elapsed_ms / 1000.0;
+                sampler.down_bps = (in_bytes - sampler.in_bytes) / seconds;
+                sampler.up_bps = (out_bytes - sampler.out_bytes) / seconds;
+            } else {
+                sampler.down_bps = 0.0;
+                sampler.up_bps = 0.0;
+            }
         }
     }
 
