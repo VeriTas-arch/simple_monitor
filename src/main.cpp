@@ -782,7 +782,6 @@ void InitPdhGroup(PdhGroup& group, const wchar_t* wildcard_path) {
         return;
     }
 
-    DWORD path_count = 0;
     DWORD buffer_size = 0;
     PDH_STATUS expand_result = PdhExpandWildCardPathW(
         nullptr,
@@ -818,7 +817,6 @@ void InitPdhGroup(PdhGroup& group, const wchar_t* wildcard_path) {
             group.counters.push_back(counter);
         }
         cursor += std::wcslen(cursor) + 1;
-        ++path_count;
     }
 
     if (group.counters.empty()) {
@@ -837,8 +835,8 @@ void RebuildPdhGroup(PdhGroup& group) {
         return;
     }
 
-    ResetPdhGroup(group);
-    InitPdhGroup(group, group.wildcard_path.c_str());
+    const std::wstring wildcard_path = group.wildcard_path;
+    InitPdhGroup(group, wildcard_path.c_str());
 }
 
 void RefreshPdhGroupIfDue(PdhGroup& group) {
@@ -2157,6 +2155,9 @@ int Run(HINSTANCE instance) {
     }
 
     if (!RegisterWindowClass(instance)) {
+        if (g_app.com_initialized) {
+            CoUninitialize();
+        }
         return 1;
     }
 
@@ -2181,6 +2182,9 @@ int Run(HINSTANCE instance) {
         nullptr);
 
     if (!hwnd) {
+        if (g_app.com_initialized) {
+            CoUninitialize();
+        }
         return 1;
     }
 
