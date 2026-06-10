@@ -72,8 +72,14 @@ struct CpuSampler {
 };
 
 struct NetworkSampler {
-    uint64_t in_bytes = 0;
-    uint64_t out_bytes = 0;
+    struct InterfaceSample {
+        uint64_t luid = 0;
+        uint64_t in_bytes = 0;
+        uint64_t out_bytes = 0;
+        bool seen = false;
+    };
+
+    std::vector<InterfaceSample> interfaces;
     DWORD tick = 0;
     bool has_sample = false;
     double down_bps = 0.0;
@@ -724,45 +730,71 @@ void SampleMemory(Metrics& metrics) {
     }
 }
 
+NetworkSampler::InterfaceSample* FindNetworkInterfaceSample(NetworkSampler& sampler, uint64_t luid) {
+    for (NetworkSampler::InterfaceSample& sample : sampler.interfaces) {
+        if (sample.luid == luid) {
+            return &sample;
+        }
+    }
+    return nullptr;
+}
+
 void SampleNetwork(NetworkSampler& sampler, Metrics& metrics) {
     PMIB_IF_TABLE2 table = nullptr;
     if (GetIfTable2(&table) != NO_ERROR || table == nullptr) {
         return;
     }
 
-    uint64_t in_bytes = 0;
-    uint64_t out_bytes = 0;
+    const DWORD now = GetTickCount();
+    const DWORD elapsed_ms = sampler.has_sample ? now - sampler.tick : 0;
+    const double seconds = elapsed_ms > 0 ? elapsed_ms / 1000.0 : 0.0;
+    double down_bps = 0.0;
+    double up_bps = 0.0;
+
+    for (NetworkSampler::InterfaceSample& sample : sampler.interfaces) {
+        sample.seen = false;
+    }
+
     for (ULONG i = 0; i < table->NumEntries; ++i) {
         const MIB_IF_ROW2& row = table->Table[i];
         if (row.OperStatus != IfOperStatusUp || row.Type == IF_TYPE_SOFTWARE_LOOPBACK) {
             continue;
         }
-        in_bytes += row.InOctets;
-        out_bytes += row.OutOctets;
+
+        NetworkSampler::InterfaceSample* sample = FindNetworkInterfaceSample(sampler, row.InterfaceLuid.Value);
+        if (!sample) {
+            sampler.interfaces.push_back({row.InterfaceLuid.Value, row.InOctets, row.OutOctets, true});
+            continue;
+        }
+
+        sample->seen = true;
+        if (sampler.has_sample && seconds > 0.0 &&
+            row.InOctets >= sample->in_bytes &&
+            row.OutOctets >= sample->out_bytes) {
+            down_bps += (row.InOctets - sample->in_bytes) / seconds;
+            up_bps += (row.OutOctets - sample->out_bytes) / seconds;
+        }
+
+        sample->in_bytes = row.InOctets;
+        sample->out_bytes = row.OutOctets;
     }
     FreeMibTable(table);
 
-    const DWORD now = GetTickCount();
-    if (sampler.has_sample) {
-        const DWORD elapsed_ms = now - sampler.tick;
-        if (elapsed_ms > 0) {
-            if (in_bytes >= sampler.in_bytes && out_bytes >= sampler.out_bytes) {
-                const double seconds = elapsed_ms / 1000.0;
-                sampler.down_bps = (in_bytes - sampler.in_bytes) / seconds;
-                sampler.up_bps = (out_bytes - sampler.out_bytes) / seconds;
-            } else {
-                sampler.down_bps = 0.0;
-                sampler.up_bps = 0.0;
-            }
-        }
-    }
+    sampler.interfaces.erase(
+        std::remove_if(
+            sampler.interfaces.begin(),
+            sampler.interfaces.end(),
+            [](const NetworkSampler::InterfaceSample& sample) {
+                return !sample.seen;
+            }),
+        sampler.interfaces.end());
 
-    sampler.in_bytes = in_bytes;
-    sampler.out_bytes = out_bytes;
     sampler.tick = now;
     sampler.has_sample = true;
-    metrics.down_bps = sampler.down_bps;
-    metrics.up_bps = sampler.up_bps;
+    sampler.down_bps = down_bps;
+    sampler.up_bps = up_bps;
+    metrics.down_bps = down_bps;
+    metrics.up_bps = up_bps;
 }
 
 void ResetPdhGroup(PdhGroup& group) {
