@@ -313,6 +313,10 @@ bool RectEquals(const RECT& a, const RECT& b) {
     return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
 }
 
+bool TickPassed(DWORD now, DWORD deadline) {
+    return static_cast<LONG>(now - deadline) >= 0;
+}
+
 void ResetDebugLog() {
     if (!g_app.config.debug_log) {
         return;
@@ -385,7 +389,7 @@ void AppendDebugLog(const wchar_t* format, ...) {
     CloseHandle(file);
 }
 
-// Configuration and environment state.
+// Configuration.
 void LoadConfig() {
     g_app.config.content_padding_x_dip = ReadConfigInt(L"content_padding_x", 8, 0, 80);
     g_app.config.column_gap_dip = ReadConfigInt(L"column_gap", 28, 0, 220);
@@ -402,6 +406,7 @@ void LoadConfig() {
     g_app.config.network_arrow_style = LowerString(ReadConfigString(L"network_arrow_style", L"thin"));
 }
 
+// Startup integration.
 bool IsStartupEnabled() {
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_READ, &key) != ERROR_SUCCESS) {
@@ -417,6 +422,43 @@ bool IsStartupEnabled() {
     return result == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ);
 }
 
+void DeleteLegacyRunStartup() {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &key) == ERROR_SUCCESS) {
+        RegDeleteValueW(key, kRunValue);
+        RegCloseKey(key);
+    }
+}
+
+bool SetLegacyRunStartup() {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &key) != ERROR_SUCCESS) {
+        return false;
+    }
+
+    std::wstring command = L"\"" + ModulePath() + L"\" --startup";
+    LONG result = RegSetValueExW(
+        key,
+        kRunValue,
+        0,
+        REG_SZ,
+        reinterpret_cast<const BYTE*>(command.c_str()),
+        static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(key);
+    return result == ERROR_SUCCESS;
+}
+
+void SetStartupEnabled(bool enabled) {
+    if (enabled) {
+        if (!SetLegacyRunStartup()) {
+            AppendDebugLog(L"startup_hkcu_run=set_failed");
+        }
+    } else {
+        DeleteLegacyRunStartup();
+    }
+}
+
+// Foreground, fullscreen, and suppression detection.
 std::wstring Basename(std::wstring path) {
     const size_t slash = path.find_last_of(L"\\/");
     if (slash != std::wstring::npos) {
@@ -666,150 +708,6 @@ void LogFullscreenSuppressionContext() {
         monitor_rect.top,
         monitor_rect.right,
         monitor_rect.bottom);
-}
-
-bool TickPassed(DWORD now, DWORD deadline) {
-    return static_cast<LONG>(now - deadline) >= 0;
-}
-
-void DeleteLegacyRunStartup() {
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &key) == ERROR_SUCCESS) {
-        RegDeleteValueW(key, kRunValue);
-        RegCloseKey(key);
-    }
-}
-
-bool SetLegacyRunStartup() {
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &key) != ERROR_SUCCESS) {
-        return false;
-    }
-
-    std::wstring command = L"\"" + ModulePath() + L"\" --startup";
-    LONG result = RegSetValueExW(
-        key,
-        kRunValue,
-        0,
-        REG_SZ,
-        reinterpret_cast<const BYTE*>(command.c_str()),
-        static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
-    RegCloseKey(key);
-    return result == ERROR_SUCCESS;
-}
-
-void SetStartupEnabled(bool enabled) {
-    if (enabled) {
-        if (!SetLegacyRunStartup()) {
-            AppendDebugLog(L"startup_hkcu_run=set_failed");
-        }
-    } else {
-        DeleteLegacyRunStartup();
-    }
-}
-
-// Overlay visibility, suppression, and top-level window state.
-void UpdateLayeredStyle(HWND hwnd) {
-    LONG_PTR ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    if (g_app.tray.click_through) {
-        ex_style |= WS_EX_TRANSPARENT;
-    } else {
-        ex_style &= ~WS_EX_TRANSPARENT;
-    }
-    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style);
-}
-
-void KeepOverlayOnTop() {
-    if (!g_app.window.hwnd || !IsWindow(g_app.window.hwnd)) {
-        return;
-    }
-    if (g_app.suppression.overlay_suppressed) {
-        return;
-    }
-    if (g_app.placement.maintaining_z_order) {
-        return;
-    }
-
-    g_app.placement.maintaining_z_order = true;
-
-    if (!IsWindowVisible(g_app.window.hwnd)) {
-        ShowWindow(g_app.window.hwnd, SW_SHOWNOACTIVATE);
-    }
-
-    SetWindowPos(
-        g_app.window.hwnd,
-        HWND_TOPMOST,
-        0,
-        0,
-        0,
-        0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    g_app.placement.maintaining_z_order = false;
-}
-
-void CALLBACK TrayEventProc(
-    HWINEVENTHOOK,
-    DWORD,
-    HWND hwnd,
-    LONG id_object,
-    LONG,
-    DWORD,
-    DWORD) {
-    if (!g_app.window.hwnd || !IsWindow(g_app.window.hwnd) || !IsTaskbarRelatedWindow(hwnd)) {
-        return;
-    }
-
-    if (id_object != OBJID_WINDOW && id_object != OBJID_CLIENT) {
-        return;
-    }
-
-    if (InterlockedCompareExchange(&g_app.placement.tray_layout_update_pending, 1, 0) == 0) {
-        PostMessageW(g_app.window.hwnd, WM_TRAY_LAYOUT_CHANGED, 0, 0);
-    }
-}
-
-void RegisterTrayEventHooks() {
-    const DWORD flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
-    const DWORD events[] = {
-        EVENT_OBJECT_SHOW,
-        EVENT_OBJECT_HIDE,
-        EVENT_OBJECT_REORDER,
-        EVENT_OBJECT_LOCATIONCHANGE,
-    };
-
-    for (DWORD event : events) {
-        if (HWINEVENTHOOK hook = SetWinEventHook(event, event, nullptr, TrayEventProc, 0, 0, flags)) {
-            g_app.tray.event_hooks.push_back(hook);
-        }
-    }
-}
-
-void UnregisterTrayEventHooks() {
-    for (HWINEVENTHOOK hook : g_app.tray.event_hooks) {
-        UnhookWinEvent(hook);
-    }
-    g_app.tray.event_hooks.clear();
-}
-
-void AttachToTaskbarOwner(HWND hwnd) {
-    HWND taskbar = TaskbarWindow();
-    if (!taskbar || taskbar == g_app.placement.taskbar_owner) {
-        return;
-    }
-
-    SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(taskbar));
-    g_app.placement.taskbar_owner = taskbar;
-}
-
-void SetPlacementTimer(HWND hwnd, UINT interval_ms, bool fast) {
-    SetTimer(hwnd, kPlacementTimer, interval_ms, nullptr);
-    g_app.placement.timer_fast = fast;
-}
-
-void RestorePlacementTimer(HWND hwnd) {
-    if (g_app.placement.timer_fast) {
-        SetPlacementTimer(hwnd, kPlacementIntervalMs, false);
-    }
 }
 
 // Metric formatting and sampling.
@@ -1101,6 +999,110 @@ void SampleMetrics() {
     g_app.metrics.current.gpu = SamplePdhGroup(g_app.metrics.gpu, true);
     g_app.metrics.current.disk = SamplePdhGroup(g_app.metrics.disk, false);
     SampleKeys(g_app.metrics.current);
+}
+
+// Overlay visibility, z-order, and tray layout events.
+void UpdateLayeredStyle(HWND hwnd) {
+    LONG_PTR ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if (g_app.tray.click_through) {
+        ex_style |= WS_EX_TRANSPARENT;
+    } else {
+        ex_style &= ~WS_EX_TRANSPARENT;
+    }
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style);
+}
+
+void KeepOverlayOnTop() {
+    if (!g_app.window.hwnd || !IsWindow(g_app.window.hwnd)) {
+        return;
+    }
+    if (g_app.suppression.overlay_suppressed) {
+        return;
+    }
+    if (g_app.placement.maintaining_z_order) {
+        return;
+    }
+
+    g_app.placement.maintaining_z_order = true;
+
+    if (!IsWindowVisible(g_app.window.hwnd)) {
+        ShowWindow(g_app.window.hwnd, SW_SHOWNOACTIVATE);
+    }
+
+    SetWindowPos(
+        g_app.window.hwnd,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    g_app.placement.maintaining_z_order = false;
+}
+
+void CALLBACK TrayEventProc(
+    HWINEVENTHOOK,
+    DWORD,
+    HWND hwnd,
+    LONG id_object,
+    LONG,
+    DWORD,
+    DWORD) {
+    if (!g_app.window.hwnd || !IsWindow(g_app.window.hwnd) || !IsTaskbarRelatedWindow(hwnd)) {
+        return;
+    }
+
+    if (id_object != OBJID_WINDOW && id_object != OBJID_CLIENT) {
+        return;
+    }
+
+    if (InterlockedCompareExchange(&g_app.placement.tray_layout_update_pending, 1, 0) == 0) {
+        PostMessageW(g_app.window.hwnd, WM_TRAY_LAYOUT_CHANGED, 0, 0);
+    }
+}
+
+void RegisterTrayEventHooks() {
+    const DWORD flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+    const DWORD events[] = {
+        EVENT_OBJECT_SHOW,
+        EVENT_OBJECT_HIDE,
+        EVENT_OBJECT_REORDER,
+        EVENT_OBJECT_LOCATIONCHANGE,
+    };
+
+    for (DWORD event : events) {
+        if (HWINEVENTHOOK hook = SetWinEventHook(event, event, nullptr, TrayEventProc, 0, 0, flags)) {
+            g_app.tray.event_hooks.push_back(hook);
+        }
+    }
+}
+
+void UnregisterTrayEventHooks() {
+    for (HWINEVENTHOOK hook : g_app.tray.event_hooks) {
+        UnhookWinEvent(hook);
+    }
+    g_app.tray.event_hooks.clear();
+}
+
+void AttachToTaskbarOwner(HWND hwnd) {
+    HWND taskbar = TaskbarWindow();
+    if (!taskbar || taskbar == g_app.placement.taskbar_owner) {
+        return;
+    }
+
+    SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(taskbar));
+    g_app.placement.taskbar_owner = taskbar;
+}
+
+void SetPlacementTimer(HWND hwnd, UINT interval_ms, bool fast) {
+    SetTimer(hwnd, kPlacementTimer, interval_ms, nullptr);
+    g_app.placement.timer_fast = fast;
+}
+
+void RestorePlacementTimer(HWND hwnd) {
+    if (g_app.placement.timer_fast) {
+        SetPlacementTimer(hwnd, kPlacementIntervalMs, false);
+    }
 }
 
 // Taskbar anchoring and placement.
