@@ -284,6 +284,24 @@ bool RectEquals(const RECT& a, const RECT& b) {
     return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
 }
 
+void ResetDebugLog() {
+    if (!g_app.config.debug_log) {
+        return;
+    }
+
+    HANDLE file = CreateFileW(
+        DebugLogPath().c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        CloseHandle(file);
+    }
+}
+
 void AppendDebugLog(const wchar_t* format, ...) {
     if (!g_app.config.debug_log) {
         return;
@@ -2288,6 +2306,7 @@ int Run(HINSTANCE instance) {
     const HRESULT co_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     g_app.com_initialized = SUCCEEDED(co_result);
     LoadConfig();
+    ResetDebugLog();
     g_app.startup_warmup_until = GetTickCount() + kStartupWarmupMs;
     AppendDebugLog(L"startup debug_log=1 command_line=%ls warmup_ms=%lu", GetCommandLineW(), kStartupWarmupMs);
 
