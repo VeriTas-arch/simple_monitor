@@ -18,7 +18,6 @@ target_link_libraries(simple_monitor PRIVATE
     advapi32
     iphlpapi
     pdh
-    shlwapi
     d2d1
     dwrite
     windowscodecs
