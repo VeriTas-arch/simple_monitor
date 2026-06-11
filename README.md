@@ -32,7 +32,8 @@ new executable manually after the build completes.
 - Uses DirectWrite/Direct2D with per-pixel alpha so only text is visible over
   the taskbar.
 - Handles DPI, display changes, and Explorer taskbar recreation.
-- Provides a tray menu for repositioning, click-through mode, startup, and exit.
+- Provides a tray menu for opening/reloading config, click-through mode,
+  startup, and exit.
 
 GPU and disk usage use Windows PDH counters. If a counter is unavailable on a
 machine or Windows language setup, the value is shown as `--`.
@@ -66,7 +67,7 @@ show_key_widget=1
 Width is calculated from the displayed content. Use `font_size` to tune text size. Use `column_gap` as the default spacing, or
 override it with `gap_after_network` and `gap_after_system`. Use
 `offset_right` to tune the distance from the tray area. After editing the file,
-use the tray menu's `Reposition` command or restart the program.
+use the tray menu's `Reload config` command or restart the program.
 
 `show_key_widget=1` adds a compact `CAP INS NUM` status column after the disk
 column. Active keys are white; inactive keys are dimmed.
@@ -77,6 +78,11 @@ Network arrow styles are `thin` (`↑`/`↓`), `triangle` (`▲`/`▼`), `heavy`
 Set `debug_log=1` to write event-oriented diagnostics to `debug.log` next to
 the executable. The log records placement changes, tray layout events,
 fullscreen or presentation suppression, and screenshot freeze transitions.
+
+`Start with Windows` writes the current executable path to
+`HKCU Run\SimpleMonitor`. The app applies a short startup warmup before using
+its fullscreen-window suppression heuristic, so Explorer and the taskbar have
+time to settle. Disabling startup removes that `HKCU Run` value.
 
 ## Design boundary
 

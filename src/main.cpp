@@ -50,6 +50,7 @@ constexpr UINT_PTR kStateTimer = 3;
 constexpr UINT kStateIntervalMs = 100;
 constexpr UINT kPlacementIntervalMs = 5000;
 constexpr DWORD kGpuGroupRefreshIntervalMs = 5000;
+constexpr DWORD kStartupWarmupMs = 15000;
 constexpr UINT kTrayIconId = 1;
 constexpr UINT WM_TRAYICON = WM_APP + 1;
 constexpr UINT WM_TRAY_LAYOUT_CHANGED = WM_APP + 2;
@@ -149,6 +150,7 @@ struct AppState {
     bool overlay_update_frozen = false;
     bool overlay_suppressed = false;
     bool placement_timer_fast = false;
+    DWORD startup_warmup_until = 0;
     LONG tray_layout_update_pending = 0;
     DWORD refresh_resume_tick = 0;
     RECT last_logged_taskbar_rect{};
@@ -410,6 +412,14 @@ bool WindowClassIs(HWND hwnd, const wchar_t* class_name) {
            std::wcscmp(current_class, class_name) == 0;
 }
 
+std::wstring WindowClassName(HWND hwnd) {
+    wchar_t class_name[128]{};
+    if (!hwnd || GetClassNameW(hwnd, class_name, ARRAYSIZE(class_name)) == 0) {
+        return L"";
+    }
+    return class_name;
+}
+
 bool IsShellPopupOrDesktopWindow(HWND hwnd) {
     if (!hwnd) {
         return false;
@@ -542,8 +552,9 @@ bool IsFullscreenForegroundWindow() {
            std::abs(window_rect.bottom - mi.rcMonitor.bottom) <= tolerance;
 }
 
-bool ShouldSuppressOverlay() {
-    return SuppressedNotificationStateReason() != nullptr || IsFullscreenForegroundWindow();
+bool StartupWarmupActive() {
+    return g_app.startup_warmup_until != 0 &&
+           static_cast<LONG>(GetTickCount() - g_app.startup_warmup_until) < 0;
 }
 
 const wchar_t* OverlaySuppressionReason() {
@@ -551,35 +562,103 @@ const wchar_t* OverlaySuppressionReason() {
         return state_reason;
     }
     if (IsFullscreenForegroundWindow()) {
+        if (StartupWarmupActive()) {
+            return nullptr;
+        }
         return L"fullscreen_window";
     }
     return nullptr;
+}
+
+void LogFullscreenSuppressionContext() {
+    if (!g_app.config.debug_log) {
+        return;
+    }
+
+    HWND foreground = GetForegroundWindow();
+    HWND root = foreground ? GetAncestor(foreground, GA_ROOT) : nullptr;
+
+    RECT foreground_rect{};
+    RECT root_rect{};
+    RECT monitor_rect{};
+    GetWindowRect(foreground, &foreground_rect);
+    GetWindowRect(root, &root_rect);
+
+    HMONITOR monitor = root ? MonitorFromWindow(root, MONITOR_DEFAULTTONEAREST) : nullptr;
+    if (monitor) {
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(monitor, &mi)) {
+            monitor_rect = mi.rcMonitor;
+        }
+    }
+
+    const std::wstring foreground_exe = WindowProcessBasename(foreground);
+    const std::wstring root_exe = WindowProcessBasename(root);
+    const std::wstring foreground_class = WindowClassName(foreground);
+    const std::wstring root_class = WindowClassName(root);
+
+    AppendDebugLog(
+        L"fullscreen_context foreground_hwnd=%p foreground_exe=%ls foreground_class=%ls foreground_rect=(%ld,%ld,%ld,%ld) "
+        L"root_hwnd=%p root_exe=%ls root_class=%ls root_rect=(%ld,%ld,%ld,%ld) monitor_rect=(%ld,%ld,%ld,%ld)",
+        foreground,
+        foreground_exe.c_str(),
+        foreground_class.c_str(),
+        foreground_rect.left,
+        foreground_rect.top,
+        foreground_rect.right,
+        foreground_rect.bottom,
+        root,
+        root_exe.c_str(),
+        root_class.c_str(),
+        root_rect.left,
+        root_rect.top,
+        root_rect.right,
+        root_rect.bottom,
+        monitor_rect.left,
+        monitor_rect.top,
+        monitor_rect.right,
+        monitor_rect.bottom);
 }
 
 bool TickPassed(DWORD now, DWORD deadline) {
     return static_cast<LONG>(now - deadline) >= 0;
 }
 
-void SetStartupEnabled(bool enabled) {
+void DeleteLegacyRunStartup() {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &key) == ERROR_SUCCESS) {
+        RegDeleteValueW(key, kRunValue);
+        RegCloseKey(key);
+    }
+}
+
+bool SetLegacyRunStartup() {
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &key) != ERROR_SUCCESS) {
-        return;
+        return false;
     }
 
-    if (enabled) {
-        std::wstring command = L"\"" + ModulePath() + L"\" --startup";
-        RegSetValueExW(
-            key,
-            kRunValue,
-            0,
-            REG_SZ,
-            reinterpret_cast<const BYTE*>(command.c_str()),
-            static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
-    } else {
-        RegDeleteValueW(key, kRunValue);
-    }
-
+    std::wstring command = L"\"" + ModulePath() + L"\" --startup";
+    LONG result = RegSetValueExW(
+        key,
+        kRunValue,
+        0,
+        REG_SZ,
+        reinterpret_cast<const BYTE*>(command.c_str()),
+        static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
     RegCloseKey(key);
+    return result == ERROR_SUCCESS;
+}
+
+void SetStartupEnabled(bool enabled) {
+    if (enabled) {
+        if (!SetLegacyRunStartup()) {
+            AppendDebugLog(L"startup_hkcu_run=set_failed");
+        }
+    } else {
+        DeleteLegacyRunStartup();
+    }
 }
 
 // Overlay visibility, suppression, and top-level window state.
@@ -1828,6 +1907,9 @@ bool UpdateOverlaySuppression(HWND hwnd) {
     if (should_suppress) {
         if (!g_app.overlay_suppressed) {
             AppendDebugLog(L"suppression=on reason=%ls", reason);
+            if (std::wcscmp(reason, L"fullscreen_window") == 0) {
+                LogFullscreenSuppressionContext();
+            }
         }
         g_app.overlay_suppressed = true;
         RestorePlacementTimer(hwnd);
@@ -2206,7 +2288,8 @@ int Run(HINSTANCE instance) {
     const HRESULT co_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     g_app.com_initialized = SUCCEEDED(co_result);
     LoadConfig();
-    AppendDebugLog(L"startup debug_log=1");
+    g_app.startup_warmup_until = GetTickCount() + kStartupWarmupMs;
+    AppendDebugLog(L"startup debug_log=1 command_line=%ls warmup_ms=%lu", GetCommandLineW(), kStartupWarmupMs);
 
     using DpiAwarenessContext = HANDLE;
     using SetProcessDpiAwarenessContextFn = BOOL(WINAPI*)(DpiAwarenessContext);
