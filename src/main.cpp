@@ -970,9 +970,39 @@ double SamplePdhGroup(PdhGroup& group, bool sum_values) {
     return group.value;
 }
 
+bool ForegroundKeyboardToggleState(int virtual_key, bool fallback) {
+    if (virtual_key < 0 || virtual_key >= 256) {
+        return fallback;
+    }
+
+    HWND foreground = GetForegroundWindow();
+    if (!foreground || foreground == g_app.window.hwnd) {
+        return fallback;
+    }
+
+    DWORD foreground_thread = GetWindowThreadProcessId(foreground, nullptr);
+    if (foreground_thread == 0) {
+        return fallback;
+    }
+
+    const DWORD current_thread = GetCurrentThreadId();
+    BYTE key_state[256]{};
+    if (foreground_thread == current_thread) {
+        return GetKeyboardState(key_state) ? (key_state[virtual_key] & 1) != 0 : fallback;
+    }
+
+    if (!AttachThreadInput(current_thread, foreground_thread, TRUE)) {
+        return fallback;
+    }
+
+    const bool ok = GetKeyboardState(key_state) != 0;
+    AttachThreadInput(current_thread, foreground_thread, FALSE);
+    return ok ? (key_state[virtual_key] & 1) != 0 : fallback;
+}
+
 void SampleKeys(Metrics& metrics) {
     metrics.caps = (GetKeyState(VK_CAPITAL) & 1) != 0;
-    metrics.insert = (GetKeyState(VK_INSERT) & 1) != 0;
+    metrics.insert = ForegroundKeyboardToggleState(VK_INSERT, (GetKeyState(VK_INSERT) & 1) != 0);
     metrics.num = (GetKeyState(VK_NUMLOCK) & 1) != 0;
 }
 
