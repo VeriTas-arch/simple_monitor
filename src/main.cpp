@@ -44,6 +44,11 @@ namespace {
 constexpr wchar_t kWindowClass[] = L"SimpleMonitorOverlayWindow";
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValue[] = L"SimpleMonitor";
+
+// Timer roles:
+// - refresh: sample metrics and repaint the overlay.
+// - placement: keep the overlay aligned to the taskbar tray anchor.
+// - state: react quickly to fullscreen/screenshot/key-state changes.
 constexpr UINT_PTR kRefreshTimer = 1;
 constexpr UINT_PTR kPlacementTimer = 2;
 constexpr UINT_PTR kStateTimer = 3;
@@ -122,6 +127,55 @@ struct RenderResources {
     int key_text_format_font_size_dip = 0;
 };
 
+struct WindowState {
+    HINSTANCE instance = nullptr;
+    HWND hwnd = nullptr;
+    UINT taskbar_created = 0;
+    UINT dpi = 96;
+    bool com_initialized = false;
+};
+
+struct TrayState {
+    bool click_through = false;
+    std::vector<HWINEVENTHOOK> event_hooks;
+};
+
+struct PlacementState {
+    HWND taskbar_owner = nullptr;
+    bool maintaining_z_order = false;
+    bool timer_fast = false;
+    LONG tray_layout_update_pending = 0;
+    RECT last_logged_taskbar_rect{};
+    RECT last_logged_anchor_rect{};
+    RECT last_logged_overlay_rect{};
+    bool has_last_logged_taskbar_rect = false;
+    bool has_last_logged_anchor_rect = false;
+    bool has_last_logged_overlay_rect = false;
+    int last_logged_anchor_mode = -1;
+};
+
+struct SuppressionState {
+    bool overlay_update_frozen = false;
+    bool overlay_suppressed = false;
+    DWORD startup_warmup_until = 0;
+    DWORD refresh_resume_tick = 0;
+};
+
+struct MetricsState {
+    CpuSampler cpu;
+    NetworkSampler network;
+    PdhGroup gpu;
+    PdhGroup disk;
+    Metrics current;
+};
+
+struct RenderState {
+    RenderResources resources;
+    std::vector<BYTE> last_frame;
+    int last_frame_width = 0;
+    int last_frame_height = 0;
+};
+
 struct Config {
     int content_padding_x_dip = 8;
     int column_gap_dip = 28;
@@ -139,37 +193,12 @@ struct Config {
 };
 
 struct AppState {
-    HINSTANCE instance = nullptr;
-    HWND hwnd = nullptr;
-    HWND taskbar_owner = nullptr;
-    UINT taskbar_created = 0;
-    UINT dpi = 96;
-    bool click_through = false;
-    bool maintaining_z_order = false;
-    bool com_initialized = false;
-    bool overlay_update_frozen = false;
-    bool overlay_suppressed = false;
-    bool placement_timer_fast = false;
-    DWORD startup_warmup_until = 0;
-    LONG tray_layout_update_pending = 0;
-    DWORD refresh_resume_tick = 0;
-    RECT last_logged_taskbar_rect{};
-    RECT last_logged_anchor_rect{};
-    RECT last_logged_overlay_rect{};
-    bool has_last_logged_taskbar_rect = false;
-    bool has_last_logged_anchor_rect = false;
-    bool has_last_logged_overlay_rect = false;
-    int last_logged_anchor_mode = -1;
-    std::vector<BYTE> last_frame;
-    int last_frame_width = 0;
-    int last_frame_height = 0;
-    std::vector<HWINEVENTHOOK> tray_event_hooks;
-    CpuSampler cpu;
-    NetworkSampler network;
-    PdhGroup gpu;
-    PdhGroup disk;
-    Metrics metrics;
-    RenderResources render;
+    WindowState window;
+    TrayState tray;
+    PlacementState placement;
+    SuppressionState suppression;
+    MetricsState metrics;
+    RenderState render;
     Config config;
 };
 
@@ -455,7 +484,7 @@ bool IsTaskbarWindowClass(HWND hwnd) {
 
 bool IsBuiltinScreenshotForeground() {
     HWND foreground = GetForegroundWindow();
-    if (!foreground || foreground == g_app.hwnd) {
+    if (!foreground || foreground == g_app.window.hwnd) {
         return false;
     }
 
@@ -523,7 +552,7 @@ const wchar_t* SuppressedNotificationStateReason() {
 
 bool IsIgnoredShellWindow(HWND hwnd) {
     return !hwnd ||
-           hwnd == g_app.hwnd ||
+           hwnd == g_app.window.hwnd ||
            IsTaskbarRelatedWindow(hwnd) ||
            IsShellPopupOrDesktopWindow(hwnd) ||
            WindowProcessBasename(hwnd) == L"explorer.exe";
@@ -563,7 +592,7 @@ bool IsFullscreenForegroundWindow() {
         return false;
     }
 
-    const int tolerance = Scale(2, WindowDpi(g_app.hwnd ? g_app.hwnd : root));
+    const int tolerance = Scale(2, WindowDpi(g_app.window.hwnd ? g_app.window.hwnd : root));
     return std::abs(window_rect.left - mi.rcMonitor.left) <= tolerance &&
            std::abs(window_rect.top - mi.rcMonitor.top) <= tolerance &&
            std::abs(window_rect.right - mi.rcMonitor.right) <= tolerance &&
@@ -571,8 +600,8 @@ bool IsFullscreenForegroundWindow() {
 }
 
 bool StartupWarmupActive() {
-    return g_app.startup_warmup_until != 0 &&
-           static_cast<LONG>(GetTickCount() - g_app.startup_warmup_until) < 0;
+    return g_app.suppression.startup_warmup_until != 0 &&
+           static_cast<LONG>(GetTickCount() - g_app.suppression.startup_warmup_until) < 0;
 }
 
 const wchar_t* OverlaySuppressionReason() {
@@ -682,7 +711,7 @@ void SetStartupEnabled(bool enabled) {
 // Overlay visibility, suppression, and top-level window state.
 void UpdateLayeredStyle(HWND hwnd) {
     LONG_PTR ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    if (g_app.click_through) {
+    if (g_app.tray.click_through) {
         ex_style |= WS_EX_TRANSPARENT;
     } else {
         ex_style &= ~WS_EX_TRANSPARENT;
@@ -691,31 +720,31 @@ void UpdateLayeredStyle(HWND hwnd) {
 }
 
 void KeepOverlayOnTop() {
-    if (!g_app.hwnd || !IsWindow(g_app.hwnd)) {
+    if (!g_app.window.hwnd || !IsWindow(g_app.window.hwnd)) {
         return;
     }
-    if (g_app.overlay_suppressed) {
+    if (g_app.suppression.overlay_suppressed) {
         return;
     }
-    if (g_app.maintaining_z_order) {
+    if (g_app.placement.maintaining_z_order) {
         return;
     }
 
-    g_app.maintaining_z_order = true;
+    g_app.placement.maintaining_z_order = true;
 
-    if (!IsWindowVisible(g_app.hwnd)) {
-        ShowWindow(g_app.hwnd, SW_SHOWNOACTIVATE);
+    if (!IsWindowVisible(g_app.window.hwnd)) {
+        ShowWindow(g_app.window.hwnd, SW_SHOWNOACTIVATE);
     }
 
     SetWindowPos(
-        g_app.hwnd,
+        g_app.window.hwnd,
         HWND_TOPMOST,
         0,
         0,
         0,
         0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    g_app.maintaining_z_order = false;
+    g_app.placement.maintaining_z_order = false;
 }
 
 void CALLBACK TrayEventProc(
@@ -726,7 +755,7 @@ void CALLBACK TrayEventProc(
     LONG,
     DWORD,
     DWORD) {
-    if (!g_app.hwnd || !IsWindow(g_app.hwnd) || !IsTaskbarRelatedWindow(hwnd)) {
+    if (!g_app.window.hwnd || !IsWindow(g_app.window.hwnd) || !IsTaskbarRelatedWindow(hwnd)) {
         return;
     }
 
@@ -734,8 +763,8 @@ void CALLBACK TrayEventProc(
         return;
     }
 
-    if (InterlockedCompareExchange(&g_app.tray_layout_update_pending, 1, 0) == 0) {
-        PostMessageW(g_app.hwnd, WM_TRAY_LAYOUT_CHANGED, 0, 0);
+    if (InterlockedCompareExchange(&g_app.placement.tray_layout_update_pending, 1, 0) == 0) {
+        PostMessageW(g_app.window.hwnd, WM_TRAY_LAYOUT_CHANGED, 0, 0);
     }
 }
 
@@ -750,35 +779,35 @@ void RegisterTrayEventHooks() {
 
     for (DWORD event : events) {
         if (HWINEVENTHOOK hook = SetWinEventHook(event, event, nullptr, TrayEventProc, 0, 0, flags)) {
-            g_app.tray_event_hooks.push_back(hook);
+            g_app.tray.event_hooks.push_back(hook);
         }
     }
 }
 
 void UnregisterTrayEventHooks() {
-    for (HWINEVENTHOOK hook : g_app.tray_event_hooks) {
+    for (HWINEVENTHOOK hook : g_app.tray.event_hooks) {
         UnhookWinEvent(hook);
     }
-    g_app.tray_event_hooks.clear();
+    g_app.tray.event_hooks.clear();
 }
 
 void AttachToTaskbarOwner(HWND hwnd) {
     HWND taskbar = TaskbarWindow();
-    if (!taskbar || taskbar == g_app.taskbar_owner) {
+    if (!taskbar || taskbar == g_app.placement.taskbar_owner) {
         return;
     }
 
     SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(taskbar));
-    g_app.taskbar_owner = taskbar;
+    g_app.placement.taskbar_owner = taskbar;
 }
 
 void SetPlacementTimer(HWND hwnd, UINT interval_ms, bool fast) {
     SetTimer(hwnd, kPlacementTimer, interval_ms, nullptr);
-    g_app.placement_timer_fast = fast;
+    g_app.placement.timer_fast = fast;
 }
 
 void RestorePlacementTimer(HWND hwnd) {
-    if (g_app.placement_timer_fast) {
+    if (g_app.placement.timer_fast) {
         SetPlacementTimer(hwnd, kPlacementIntervalMs, false);
     }
 }
@@ -1050,28 +1079,28 @@ void SampleKeys(Metrics& metrics) {
 }
 
 bool SampleKeysIfChanged() {
-    Metrics next = g_app.metrics;
+    Metrics next = g_app.metrics.current;
     SampleKeys(next);
     const bool changed =
-        next.caps != g_app.metrics.caps ||
-        next.insert != g_app.metrics.insert ||
-        next.num != g_app.metrics.num;
+        next.caps != g_app.metrics.current.caps ||
+        next.insert != g_app.metrics.current.insert ||
+        next.num != g_app.metrics.current.num;
     if (changed) {
-        g_app.metrics.caps = next.caps;
-        g_app.metrics.insert = next.insert;
-        g_app.metrics.num = next.num;
+        g_app.metrics.current.caps = next.caps;
+        g_app.metrics.current.insert = next.insert;
+        g_app.metrics.current.num = next.num;
     }
     return changed;
 }
 
 void SampleMetrics() {
-    SampleCpu(g_app.cpu, g_app.metrics);
-    SampleMemory(g_app.metrics);
-    SampleNetwork(g_app.network, g_app.metrics);
-    RefreshPdhGroupIfDue(g_app.gpu);
-    g_app.metrics.gpu = SamplePdhGroup(g_app.gpu, true);
-    g_app.metrics.disk = SamplePdhGroup(g_app.disk, false);
-    SampleKeys(g_app.metrics);
+    SampleCpu(g_app.metrics.cpu, g_app.metrics.current);
+    SampleMemory(g_app.metrics.current);
+    SampleNetwork(g_app.metrics.network, g_app.metrics.current);
+    RefreshPdhGroupIfDue(g_app.metrics.gpu);
+    g_app.metrics.current.gpu = SamplePdhGroup(g_app.metrics.gpu, true);
+    g_app.metrics.current.disk = SamplePdhGroup(g_app.metrics.disk, false);
+    SampleKeys(g_app.metrics.current);
 }
 
 // Taskbar anchoring and placement.
@@ -1301,18 +1330,18 @@ void RepositionWindow() {
     if (!GetTaskbarRect(taskbar)) {
         RECT work{};
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-        taskbar = {work.left, work.bottom - Scale(48, g_app.dpi), work.right, work.bottom};
+        taskbar = {work.left, work.bottom - Scale(48, g_app.window.dpi), work.right, work.bottom};
     }
 
     HMONITOR monitor = MonitorFromRect(&taskbar, MONITOR_DEFAULTTONEAREST);
-    g_app.dpi = WindowDpi(g_app.hwnd);
+    g_app.window.dpi = WindowDpi(g_app.window.hwnd);
 
-    const int width = Scale(CalculateOverlayWidthDip(), g_app.dpi);
-    const int min_height = Scale(36, g_app.dpi);
+    const int width = Scale(CalculateOverlayWidthDip(), g_app.window.dpi);
+    const int min_height = Scale(36, g_app.window.dpi);
     const int taskbar_width = taskbar.right - taskbar.left;
     const int taskbar_height = taskbar.bottom - taskbar.top;
     const bool horizontal = taskbar_width >= taskbar_height;
-    const int height = horizontal ? std::max(min_height, taskbar_height) : Scale(132, g_app.dpi);
+    const int height = horizontal ? std::max(min_height, taskbar_height) : Scale(132, g_app.window.dpi);
 
     int x = taskbar.left;
     int y = taskbar.top;
@@ -1320,7 +1349,7 @@ void RepositionWindow() {
     RECT anchor_rect{};
 
     if (horizontal) {
-        int tray_left = taskbar.right - Scale(360, g_app.dpi);
+        int tray_left = taskbar.right - Scale(360, g_app.window.dpi);
         if (TryGetTrayAnchorRect(anchor_rect)) {
             tray_left = anchor_rect.left;
             anchor_mode = 1;
@@ -1333,18 +1362,18 @@ void RepositionWindow() {
             }
         }
 
-        x = std::max(static_cast<int>(taskbar.left), tray_left - width - Scale(g_app.config.offset_right_dip, g_app.dpi));
+        x = std::max(static_cast<int>(taskbar.left), tray_left - width - Scale(g_app.config.offset_right_dip, g_app.window.dpi));
         y = taskbar.top + std::max(0, (taskbar_height - height) / 2);
     } else if (taskbar.left <= 0) {
         x = taskbar.left;
-        y = taskbar.bottom - height - Scale(8, g_app.dpi);
+        y = taskbar.bottom - height - Scale(8, g_app.window.dpi);
     } else {
         x = taskbar.right - width;
-        y = taskbar.bottom - height - Scale(8, g_app.dpi);
+        y = taskbar.bottom - height - Scale(8, g_app.window.dpi);
     }
 
     SetWindowPos(
-        g_app.hwnd,
+        g_app.window.hwnd,
         HWND_TOPMOST,
         x,
         y,
@@ -1354,12 +1383,12 @@ void RepositionWindow() {
     KeepOverlayOnTop();
 
     RECT overlay_rect{x, y, x + width, y + height};
-    const bool taskbar_changed = !g_app.has_last_logged_taskbar_rect || !RectEquals(taskbar, g_app.last_logged_taskbar_rect);
+    const bool taskbar_changed = !g_app.placement.has_last_logged_taskbar_rect || !RectEquals(taskbar, g_app.placement.last_logged_taskbar_rect);
     const bool anchor_changed =
-        anchor_mode != g_app.last_logged_anchor_mode ||
-        (anchor_mode == 0 ? g_app.has_last_logged_anchor_rect :
-                            !g_app.has_last_logged_anchor_rect || !RectEquals(anchor_rect, g_app.last_logged_anchor_rect));
-    const bool overlay_changed = !g_app.has_last_logged_overlay_rect || !RectEquals(overlay_rect, g_app.last_logged_overlay_rect);
+        anchor_mode != g_app.placement.last_logged_anchor_mode ||
+        (anchor_mode == 0 ? g_app.placement.has_last_logged_anchor_rect :
+                            !g_app.placement.has_last_logged_anchor_rect || !RectEquals(anchor_rect, g_app.placement.last_logged_anchor_rect));
+    const bool overlay_changed = !g_app.placement.has_last_logged_overlay_rect || !RectEquals(overlay_rect, g_app.placement.last_logged_overlay_rect);
     if (taskbar_changed || anchor_changed || overlay_changed) {
         AppendDebugLog(
             L"placement taskbar=(%ld,%ld,%ld,%ld) anchor_mode=%d anchor=(%ld,%ld,%ld,%ld) overlay=(%ld,%ld,%ld,%ld)",
@@ -1376,13 +1405,13 @@ void RepositionWindow() {
             overlay_rect.top,
             overlay_rect.right,
             overlay_rect.bottom);
-        g_app.last_logged_taskbar_rect = taskbar;
-        g_app.last_logged_anchor_rect = anchor_rect;
-        g_app.last_logged_overlay_rect = overlay_rect;
-        g_app.has_last_logged_taskbar_rect = true;
-        g_app.has_last_logged_anchor_rect = anchor_mode != 0;
-        g_app.has_last_logged_overlay_rect = true;
-        g_app.last_logged_anchor_mode = anchor_mode;
+        g_app.placement.last_logged_taskbar_rect = taskbar;
+        g_app.placement.last_logged_anchor_rect = anchor_rect;
+        g_app.placement.last_logged_overlay_rect = overlay_rect;
+        g_app.placement.has_last_logged_taskbar_rect = true;
+        g_app.placement.has_last_logged_anchor_rect = anchor_mode != 0;
+        g_app.placement.has_last_logged_overlay_rect = true;
+        g_app.placement.last_logged_anchor_mode = anchor_mode;
     }
 
     if (monitor) {
@@ -1417,7 +1446,7 @@ void AddTrayIcon(HWND hwnd) {
     nid.uID = kTrayIconId;
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon = LoadAppIcon(g_app.instance, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+    nid.hIcon = LoadAppIcon(g_app.window.instance, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
     std::wcsncpy(nid.szTip, L"Simple Monitor", ARRAYSIZE(nid.szTip) - 1);
     Shell_NotifyIconW(NIM_ADD, &nid);
 
@@ -1451,7 +1480,7 @@ bool HandleMenuCommand(HWND hwnd, UINT command) {
         ReloadConfigAndRefresh(hwnd);
         return true;
     case ID_CLICK_THROUGH:
-        g_app.click_through = !g_app.click_through;
+        g_app.tray.click_through = !g_app.tray.click_through;
         UpdateLayeredStyle(hwnd);
         return true;
     case ID_STARTUP:
@@ -1479,7 +1508,7 @@ void ShowTrayMenu(HWND hwnd) {
         AppendMenuW(menu, MF_STRING, ID_OPEN_CONFIG, L"Open config");
         AppendMenuW(menu, MF_STRING, ID_RELOAD_CONFIG, L"Reload config");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING | (g_app.click_through ? MF_CHECKED : MF_UNCHECKED), ID_CLICK_THROUGH, L"Click-through");
+        AppendMenuW(menu, MF_STRING | (g_app.tray.click_through ? MF_CHECKED : MF_UNCHECKED), ID_CLICK_THROUGH, L"Click-through");
         AppendMenuW(menu, MF_STRING | (IsStartupEnabled() ? MF_CHECKED : MF_UNCHECKED), ID_STARTUP, L"Start with Windows");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, ID_EXIT, L"Exit");
@@ -1503,7 +1532,7 @@ void ShowTrayMenu(HWND hwnd) {
 
 // DirectWrite/Direct2D text layout and rendering helpers.
 HRESULT EnsureRenderResources() {
-    RenderResources& render = g_app.render;
+    RenderResources& render = g_app.render.resources;
     HRESULT hr = S_OK;
 
     if (!render.d2d_factory) {
@@ -1535,7 +1564,7 @@ HRESULT EnsureRenderResources() {
     }
 
     if (!render.text_format ||
-        render.text_format_dpi != g_app.dpi ||
+        render.text_format_dpi != g_app.window.dpi ||
         render.text_format_font_size_dip != g_app.config.font_size_dip) {
         SafeRelease(render.text_format);
         hr = render.dwrite_factory->CreateTextFormat(
@@ -1544,7 +1573,7 @@ HRESULT EnsureRenderResources() {
             DWRITE_FONT_WEIGHT_NORMAL,
             DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL,
-            static_cast<FLOAT>(Scale(g_app.config.font_size_dip, g_app.dpi)),
+            static_cast<FLOAT>(Scale(g_app.config.font_size_dip, g_app.window.dpi)),
             L"",
             &render.text_format);
         if (FAILED(hr)) {
@@ -1553,12 +1582,12 @@ HRESULT EnsureRenderResources() {
 
         render.text_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         render.text_format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-        render.text_format_dpi = g_app.dpi;
+        render.text_format_dpi = g_app.window.dpi;
         render.text_format_font_size_dip = g_app.config.font_size_dip;
     }
 
     if (!render.arrow_text_format ||
-        render.text_format_dpi != g_app.dpi ||
+        render.text_format_dpi != g_app.window.dpi ||
         render.arrow_text_format_font_size_dip != g_app.config.network_arrow_font_size_dip) {
         SafeRelease(render.arrow_text_format);
         hr = render.dwrite_factory->CreateTextFormat(
@@ -1567,7 +1596,7 @@ HRESULT EnsureRenderResources() {
             DWRITE_FONT_WEIGHT_NORMAL,
             DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL,
-            static_cast<FLOAT>(Scale(g_app.config.network_arrow_font_size_dip, g_app.dpi)),
+            static_cast<FLOAT>(Scale(g_app.config.network_arrow_font_size_dip, g_app.window.dpi)),
             L"",
             &render.arrow_text_format);
         if (FAILED(hr)) {
@@ -1580,7 +1609,7 @@ HRESULT EnsureRenderResources() {
     }
 
     if (!render.key_text_format ||
-        render.text_format_dpi != g_app.dpi ||
+        render.text_format_dpi != g_app.window.dpi ||
         render.key_text_format_font_size_dip != g_app.config.key_font_size_dip) {
         SafeRelease(render.key_text_format);
         hr = render.dwrite_factory->CreateTextFormat(
@@ -1589,7 +1618,7 @@ HRESULT EnsureRenderResources() {
             DWRITE_FONT_WEIGHT_NORMAL,
             DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL,
-            static_cast<FLOAT>(Scale(g_app.config.key_font_size_dip, g_app.dpi)),
+            static_cast<FLOAT>(Scale(g_app.config.key_font_size_dip, g_app.window.dpi)),
             L"",
             &render.key_text_format);
         if (FAILED(hr)) {
@@ -1605,12 +1634,12 @@ HRESULT EnsureRenderResources() {
 }
 
 void ReleaseRenderResources() {
-    SafeRelease(g_app.render.key_text_format);
-    SafeRelease(g_app.render.arrow_text_format);
-    SafeRelease(g_app.render.text_format);
-    SafeRelease(g_app.render.wic_factory);
-    SafeRelease(g_app.render.dwrite_factory);
-    SafeRelease(g_app.render.d2d_factory);
+    SafeRelease(g_app.render.resources.key_text_format);
+    SafeRelease(g_app.render.resources.arrow_text_format);
+    SafeRelease(g_app.render.resources.text_format);
+    SafeRelease(g_app.render.resources.wic_factory);
+    SafeRelease(g_app.render.resources.dwrite_factory);
+    SafeRelease(g_app.render.resources.d2d_factory);
 }
 
 void DrawTextCellWithFormat(
@@ -1637,12 +1666,12 @@ void DrawTextCell(
     const D2D1_RECT_F& rect,
     const std::wstring& text,
     DWRITE_TEXT_ALIGNMENT alignment) {
-    DrawTextCellWithFormat(target, brush, g_app.render.text_format, rect, text, alignment);
+    DrawTextCellWithFormat(target, brush, g_app.render.resources.text_format, rect, text, alignment);
 }
 
 FLOAT MeasureTextWidthWithFormat(IDWriteTextFormat* format, const std::wstring& text) {
     IDWriteTextLayout* layout = nullptr;
-    HRESULT hr = g_app.render.dwrite_factory->CreateTextLayout(
+    HRESULT hr = g_app.render.resources.dwrite_factory->CreateTextLayout(
         text.c_str(),
         static_cast<UINT32>(text.size()),
         format,
@@ -1664,7 +1693,7 @@ FLOAT MeasureTextWidthWithFormat(IDWriteTextFormat* format, const std::wstring& 
 }
 
 FLOAT MeasureTextWidth(const std::wstring& text) {
-    return MeasureTextWidthWithFormat(g_app.render.text_format, text);
+    return MeasureTextWidthWithFormat(g_app.render.resources.text_format, text);
 }
 
 struct TextColumn {
@@ -1735,9 +1764,9 @@ TextColumn MakeNetworkColumn(const std::wstring& up_value, const std::wstring& d
 FLOAT MeasureSplitLineWidth(const TextColumn& column, bool top) {
     const std::wstring& prefix = top ? column.top_prefix : column.bottom_prefix;
     const std::wstring& value = top ? column.top_value : column.bottom_value;
-    return MeasureTextWidthWithFormat(g_app.render.arrow_text_format, prefix) +
+    return MeasureTextWidthWithFormat(g_app.render.resources.arrow_text_format, prefix) +
            MeasureTextWidth(L":") +
-           static_cast<FLOAT>(Scale(g_app.config.network_arrow_gap_dip, g_app.dpi)) +
+           static_cast<FLOAT>(Scale(g_app.config.network_arrow_gap_dip, g_app.window.dpi)) +
            MeasureTextWidth(value);
 }
 
@@ -1747,13 +1776,13 @@ void DrawSplitLine(
     const D2D1_RECT_F& rect,
     const std::wstring& prefix,
     const std::wstring& value) {
-    const FLOAT prefix_width = MeasureTextWidthWithFormat(g_app.render.arrow_text_format, prefix);
+    const FLOAT prefix_width = MeasureTextWidthWithFormat(g_app.render.resources.arrow_text_format, prefix);
     const FLOAT colon_width = MeasureTextWidth(L":");
-    const FLOAT gap = static_cast<FLOAT>(Scale(g_app.config.network_arrow_gap_dip, g_app.dpi));
+    const FLOAT gap = static_cast<FLOAT>(Scale(g_app.config.network_arrow_gap_dip, g_app.window.dpi));
     D2D1_RECT_F prefix_rect{rect.left, rect.top, rect.left + prefix_width, rect.bottom};
     D2D1_RECT_F colon_rect{prefix_rect.right, rect.top, prefix_rect.right + colon_width, rect.bottom};
     D2D1_RECT_F value_rect{colon_rect.right + gap, rect.top, rect.right, rect.bottom};
-    DrawTextCellWithFormat(target, brush, g_app.render.arrow_text_format, prefix_rect, prefix, DWRITE_TEXT_ALIGNMENT_LEADING);
+    DrawTextCellWithFormat(target, brush, g_app.render.resources.arrow_text_format, prefix_rect, prefix, DWRITE_TEXT_ALIGNMENT_LEADING);
     DrawTextCell(target, brush, colon_rect, L":", DWRITE_TEXT_ALIGNMENT_LEADING);
     DrawTextCell(target, brush, value_rect, value, DWRITE_TEXT_ALIGNMENT_LEADING);
 }
@@ -1765,7 +1794,7 @@ void DrawKeyToken(
     const std::wstring& text,
     bool active) {
     brush->SetColor(active ? D2D1_COLOR_F{1.0f, 1.0f, 1.0f, 1.0f} : D2D1_COLOR_F{0.45f, 0.45f, 0.45f, 1.0f});
-    DrawTextCellWithFormat(target, brush, g_app.render.key_text_format, rect, text, DWRITE_TEXT_ALIGNMENT_LEADING);
+    DrawTextCellWithFormat(target, brush, g_app.render.resources.key_text_format, rect, text, DWRITE_TEXT_ALIGNMENT_LEADING);
     brush->SetColor(D2D1_COLOR_F{1.0f, 1.0f, 1.0f, 1.0f});
 }
 
@@ -1774,18 +1803,18 @@ void DrawKeyWidget(
     ID2D1SolidColorBrush* brush,
     const D2D1_RECT_F& top_rect,
     const D2D1_RECT_F& bottom_rect) {
-    const FLOAT cap_width = MeasureTextWidthWithFormat(g_app.render.key_text_format, L"CAP");
-    const FLOAT ins_width = MeasureTextWidthWithFormat(g_app.render.key_text_format, L"INS");
-    const FLOAT num_width = MeasureTextWidthWithFormat(g_app.render.key_text_format, L"NUM");
-    const FLOAT token_gap = static_cast<FLOAT>(Scale(5, g_app.dpi));
+    const FLOAT cap_width = MeasureTextWidthWithFormat(g_app.render.resources.key_text_format, L"CAP");
+    const FLOAT ins_width = MeasureTextWidthWithFormat(g_app.render.resources.key_text_format, L"INS");
+    const FLOAT num_width = MeasureTextWidthWithFormat(g_app.render.resources.key_text_format, L"NUM");
+    const FLOAT token_gap = static_cast<FLOAT>(Scale(5, g_app.window.dpi));
     const FLOAT required_width = cap_width + ins_width + num_width + token_gap * 2.0f;
     D2D1_RECT_F row_rect{top_rect.left, top_rect.top, top_rect.left + required_width, bottom_rect.bottom};
     D2D1_RECT_F cap_rect{row_rect.left, row_rect.top, row_rect.left + cap_width, row_rect.bottom};
     D2D1_RECT_F ins_rect{cap_rect.right + token_gap, row_rect.top, cap_rect.right + token_gap + ins_width, row_rect.bottom};
     D2D1_RECT_F num_rect{ins_rect.right + token_gap, row_rect.top, ins_rect.right + token_gap + num_width, row_rect.bottom};
-    DrawKeyToken(target, brush, cap_rect, L"CAP", g_app.metrics.caps);
-    DrawKeyToken(target, brush, ins_rect, L"INS", g_app.metrics.insert);
-    DrawKeyToken(target, brush, num_rect, L"NUM", g_app.metrics.num);
+    DrawKeyToken(target, brush, cap_rect, L"CAP", g_app.metrics.current.caps);
+    DrawKeyToken(target, brush, ins_rect, L"INS", g_app.metrics.current.insert);
+    DrawKeyToken(target, brush, num_rect, L"NUM", g_app.metrics.current.num);
 }
 
 void DrawAdaptiveColumnsDwrite(
@@ -1801,10 +1830,10 @@ void DrawAdaptiveColumnsDwrite(
     for (TextColumn& column : columns) {
         if (column.key_widget) {
             column.width =
-                MeasureTextWidthWithFormat(g_app.render.key_text_format, L"CAP") +
-                MeasureTextWidthWithFormat(g_app.render.key_text_format, L"INS") +
-                MeasureTextWidthWithFormat(g_app.render.key_text_format, L"NUM") +
-                static_cast<FLOAT>(Scale(10, g_app.dpi));
+                MeasureTextWidthWithFormat(g_app.render.resources.key_text_format, L"CAP") +
+                MeasureTextWidthWithFormat(g_app.render.resources.key_text_format, L"INS") +
+                MeasureTextWidthWithFormat(g_app.render.resources.key_text_format, L"NUM") +
+                static_cast<FLOAT>(Scale(10, g_app.window.dpi));
         } else if (column.split_prefix) {
             column.width = std::max(MeasureSplitLineWidth(column, true), MeasureSplitLineWidth(column, false));
         } else {
@@ -1814,9 +1843,9 @@ void DrawAdaptiveColumnsDwrite(
             if (column.split_prefix) {
                 column.width = std::max(
                     column.width,
-                    MeasureTextWidthWithFormat(g_app.render.arrow_text_format, NetworkArrow(false)) +
+                    MeasureTextWidthWithFormat(g_app.render.resources.arrow_text_format, NetworkArrow(false)) +
                         MeasureTextWidth(L":") +
-                        static_cast<FLOAT>(Scale(g_app.config.network_arrow_gap_dip, g_app.dpi)) +
+                        static_cast<FLOAT>(Scale(g_app.config.network_arrow_gap_dip, g_app.window.dpi)) +
                         MeasureTextWidth(L"99.9MB/s"));
             } else {
                 column.width = std::max(column.width, MeasureTextWidth(column.width_sample));
@@ -1826,7 +1855,7 @@ void DrawAdaptiveColumnsDwrite(
     }
 
     const FLOAT available = std::max(1.0f, rect.right - rect.left);
-    const FLOAT default_gap = static_cast<FLOAT>(Scale(g_app.config.column_gap_dip, g_app.dpi));
+    const FLOAT default_gap = static_cast<FLOAT>(Scale(g_app.config.column_gap_dip, g_app.window.dpi));
     FLOAT total_gap = 0.0f;
     for (size_t i = 0; i + 1 < columns.size(); ++i) {
         total_gap += columns[i].gap_after >= 0.0f ? columns[i].gap_after : default_gap;
@@ -1913,23 +1942,23 @@ bool PresentPixels(HWND hwnd, const BYTE* source_pixels, int width, int height) 
 }
 
 bool ReapplyLastFrame(HWND hwnd) {
-    if (g_app.last_frame.empty()) {
+    if (g_app.render.last_frame.empty()) {
         return false;
     }
-    return PresentPixels(hwnd, g_app.last_frame.data(), g_app.last_frame_width, g_app.last_frame_height);
+    return PresentPixels(hwnd, g_app.render.last_frame.data(), g_app.render.last_frame_width, g_app.render.last_frame_height);
 }
 
 bool UpdateOverlaySuppression(HWND hwnd) {
     const wchar_t* reason = OverlaySuppressionReason();
     const bool should_suppress = reason != nullptr;
     if (should_suppress) {
-        if (!g_app.overlay_suppressed) {
+        if (!g_app.suppression.overlay_suppressed) {
             AppendDebugLog(L"suppression=on reason=%ls", reason);
             if (std::wcscmp(reason, L"fullscreen_window") == 0) {
                 LogFullscreenSuppressionContext();
             }
         }
-        g_app.overlay_suppressed = true;
+        g_app.suppression.overlay_suppressed = true;
         RestorePlacementTimer(hwnd);
         if (IsWindowVisible(hwnd)) {
             ShowWindow(hwnd, SW_HIDE);
@@ -1937,8 +1966,8 @@ bool UpdateOverlaySuppression(HWND hwnd) {
         return true;
     }
 
-    if (g_app.overlay_suppressed) {
-        g_app.overlay_suppressed = false;
+    if (g_app.suppression.overlay_suppressed) {
+        g_app.suppression.overlay_suppressed = false;
         AppendDebugLog(L"suppression=off");
         RestorePlacementTimer(hwnd);
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -1953,18 +1982,18 @@ bool UpdateOverlaySuppression(HWND hwnd) {
 
 bool UpdateFreezeState(HWND hwnd) {
     if (ShouldFreezeOverlayUpdate()) {
-        if (!g_app.overlay_update_frozen) {
+        if (!g_app.suppression.overlay_update_frozen) {
             AppendDebugLog(L"freeze=on reason=screenshot");
         }
-        g_app.overlay_update_frozen = true;
+        g_app.suppression.overlay_update_frozen = true;
         ReapplyLastFrame(hwnd);
         return true;
     }
 
-    if (g_app.overlay_update_frozen) {
-        g_app.overlay_update_frozen = false;
+    if (g_app.suppression.overlay_update_frozen) {
+        g_app.suppression.overlay_update_frozen = false;
         AppendDebugLog(L"freeze=off");
-        g_app.refresh_resume_tick = GetTickCount() + 800;
+        g_app.suppression.refresh_resume_tick = GetTickCount() + 800;
         ReapplyLastFrame(hwnd);
         KeepOverlayOnTop();
         return true;
@@ -1980,13 +2009,13 @@ bool HandleOverlayStateGuards(HWND hwnd) {
     if (UpdateFreezeState(hwnd)) {
         return true;
     }
-    if (g_app.refresh_resume_tick != 0 && !TickPassed(GetTickCount(), g_app.refresh_resume_tick)) {
+    if (g_app.suppression.refresh_resume_tick != 0 && !TickPassed(GetTickCount(), g_app.suppression.refresh_resume_tick)) {
         ReapplyLastFrame(hwnd);
         KeepOverlayOnTop();
         return true;
     }
 
-    g_app.refresh_resume_tick = 0;
+    g_app.suppression.refresh_resume_tick = 0;
     return false;
 }
 
@@ -2007,7 +2036,7 @@ void RenderOverlay(HWND hwnd) {
     ID2D1RenderTarget* target = nullptr;
     ID2D1SolidColorBrush* brush = nullptr;
 
-    HRESULT hr = g_app.render.wic_factory->CreateBitmap(
+    HRESULT hr = g_app.render.resources.wic_factory->CreateBitmap(
         width,
         height,
         GUID_WICPixelFormat32bppPBGRA,
@@ -2023,7 +2052,7 @@ void RenderOverlay(HWND hwnd) {
         props.usage = D2D1_RENDER_TARGET_USAGE_NONE;
         props.minLevel = D2D1_FEATURE_LEVEL_DEFAULT;
 
-        hr = g_app.render.d2d_factory->CreateWicBitmapRenderTarget(wic_bitmap, &props, &target);
+        hr = g_app.render.resources.d2d_factory->CreateWicBitmapRenderTarget(wic_bitmap, &props, &target);
     }
     if (SUCCEEDED(hr)) {
         target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
@@ -2031,29 +2060,29 @@ void RenderOverlay(HWND hwnd) {
         hr = target->CreateSolidColorBrush(color, &brush);
     }
 
-    const FLOAT pad_x = static_cast<FLOAT>(Scale(g_app.config.content_padding_x_dip, g_app.dpi));
-    const FLOAT pad_y = static_cast<FLOAT>(Scale(5, g_app.dpi));
+    const FLOAT pad_x = static_cast<FLOAT>(Scale(g_app.config.content_padding_x_dip, g_app.window.dpi));
+    const FLOAT pad_y = static_cast<FLOAT>(Scale(5, g_app.window.dpi));
     D2D1_RECT_F content{
         pad_x,
         pad_y,
         static_cast<FLOAT>(width) - pad_x,
         static_cast<FLOAT>(height) - pad_y};
-    const std::wstring disk_text = L"SSD: " + FormatPercent(g_app.metrics.disk);
+    const std::wstring disk_text = L"SSD: " + FormatPercent(g_app.metrics.current.disk);
     std::vector<TextColumn> columns{
         MakeNetworkColumn(
-            FormatRate(g_app.metrics.up_bps),
-            FormatRate(g_app.metrics.down_bps),
-            static_cast<FLOAT>(Scale(g_app.config.gap_after_network_dip >= 0 ? g_app.config.gap_after_network_dip : g_app.config.column_gap_dip, g_app.dpi))),
+            FormatRate(g_app.metrics.current.up_bps),
+            FormatRate(g_app.metrics.current.down_bps),
+            static_cast<FLOAT>(Scale(g_app.config.gap_after_network_dip >= 0 ? g_app.config.gap_after_network_dip : g_app.config.column_gap_dip, g_app.window.dpi))),
         MakeTextColumn(
-            L"CPU: " + FormatPercent(g_app.metrics.cpu),
-            L"RAM: " + std::to_wstring(g_app.metrics.memory_load) + L"%",
+            L"CPU: " + FormatPercent(g_app.metrics.current.cpu),
+            L"RAM: " + std::to_wstring(g_app.metrics.current.memory_load) + L"%",
             L"RAM: 100%",
-            static_cast<FLOAT>(Scale(g_app.config.gap_after_system_dip >= 0 ? g_app.config.gap_after_system_dip : g_app.config.column_gap_dip, g_app.dpi))),
+            static_cast<FLOAT>(Scale(g_app.config.gap_after_system_dip >= 0 ? g_app.config.gap_after_system_dip : g_app.config.column_gap_dip, g_app.window.dpi))),
         MakeTextColumn(
-            L"GPU: " + FormatPercent(g_app.metrics.gpu),
+            L"GPU: " + FormatPercent(g_app.metrics.current.gpu),
             disk_text,
             L"SSD: 100%",
-            g_app.config.show_key_widget ? static_cast<FLOAT>(Scale(g_app.config.gap_after_disk_dip, g_app.dpi)) : -1.0f),
+            g_app.config.show_key_widget ? static_cast<FLOAT>(Scale(g_app.config.gap_after_disk_dip, g_app.window.dpi)) : -1.0f),
     };
     if (g_app.config.show_key_widget) {
         columns.push_back(MakeKeyWidgetColumn());
@@ -2076,9 +2105,9 @@ void RenderOverlay(HWND hwnd) {
         std::vector<BYTE> frame(static_cast<size_t>(width) * height * 4);
         hr = wic_bitmap->CopyPixels(&rect, width * 4, static_cast<UINT>(frame.size()), frame.data());
         if (SUCCEEDED(hr) && PresentPixels(hwnd, frame.data(), width, height)) {
-            g_app.last_frame = std::move(frame);
-            g_app.last_frame_width = width;
-            g_app.last_frame_height = height;
+            g_app.render.last_frame = std::move(frame);
+            g_app.render.last_frame_width = width;
+            g_app.render.last_frame_height = height;
         }
     }
 
@@ -2106,14 +2135,14 @@ LRESULT HandleTaskbarCreated(HWND hwnd) {
 }
 
 LRESULT HandleCreate(HWND hwnd) {
-    g_app.hwnd = hwnd;
-    g_app.dpi = WindowDpi(hwnd);
+    g_app.window.hwnd = hwnd;
+    g_app.window.dpi = WindowDpi(hwnd);
     LoadConfig();
     AddTrayIcon(hwnd);
     AttachToTaskbarOwner(hwnd);
     RegisterTrayEventHooks();
-    InitPdhGroup(g_app.gpu, L"\\GPU Engine(*)\\Utilization Percentage");
-    InitPdhGroup(g_app.disk, L"\\PhysicalDisk(_Total)\\% Disk Time");
+    InitPdhGroup(g_app.metrics.gpu, L"\\GPU Engine(*)\\Utilization Percentage");
+    InitPdhGroup(g_app.metrics.disk, L"\\PhysicalDisk(_Total)\\% Disk Time");
     SampleMetrics();
     SetTimer(hwnd, kRefreshTimer, 1000, nullptr);
     SetPlacementTimer(hwnd, kPlacementIntervalMs, false);
@@ -2154,7 +2183,7 @@ LRESULT HandleTimer(HWND hwnd, UINT_PTR timer_id) {
 }
 
 LRESULT HandleDpiChanged(HWND hwnd, WPARAM wparam, LPARAM lparam) {
-    g_app.dpi = HIWORD(wparam);
+    g_app.window.dpi = HIWORD(wparam);
     if (lparam) {
         const RECT* suggested = reinterpret_cast<const RECT*>(lparam);
         SetWindowPos(
@@ -2186,7 +2215,7 @@ LRESULT HandleDisplayChange(HWND hwnd) {
 
 LRESULT HandleShowWindow(HWND hwnd, WPARAM wparam) {
     if (!wparam) {
-        if (!g_app.overlay_suppressed) {
+        if (!g_app.suppression.overlay_suppressed) {
             SetPlacementTimer(hwnd, 100, true);
         }
     } else {
@@ -2200,7 +2229,7 @@ LRESULT HandleShowWindow(HWND hwnd, WPARAM wparam) {
 }
 
 LRESULT HandleTrayLayoutChanged(HWND hwnd) {
-    InterlockedExchange(&g_app.tray_layout_update_pending, 0);
+    InterlockedExchange(&g_app.placement.tray_layout_update_pending, 0);
     AppendDebugLog(L"event=tray_layout_changed");
     AttachToTaskbarOwner(hwnd);
     if (UpdateOverlaySuppression(hwnd)) {
@@ -2227,11 +2256,11 @@ LRESULT HandleDestroy(HWND hwnd) {
     KillTimer(hwnd, kStateTimer);
     UnregisterTrayEventHooks();
     RemoveTrayIcon(hwnd);
-    if (g_app.gpu.query) {
-        PdhCloseQuery(g_app.gpu.query);
+    if (g_app.metrics.gpu.query) {
+        PdhCloseQuery(g_app.metrics.gpu.query);
     }
-    if (g_app.disk.query) {
-        PdhCloseQuery(g_app.disk.query);
+    if (g_app.metrics.disk.query) {
+        PdhCloseQuery(g_app.metrics.disk.query);
     }
     ReleaseRenderResources();
     PostQuitMessage(0);
@@ -2240,7 +2269,7 @@ LRESULT HandleDestroy(HWND hwnd) {
 
 // Window message handling and process startup.
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
-    if (msg == g_app.taskbar_created) {
+    if (msg == g_app.window.taskbar_created) {
         return HandleTaskbarCreated(hwnd);
     }
 
@@ -2301,13 +2330,13 @@ bool RegisterWindowClass(HINSTANCE instance) {
 }
 
 int Run(HINSTANCE instance) {
-    g_app.instance = instance;
-    g_app.taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
+    g_app.window.instance = instance;
+    g_app.window.taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
     const HRESULT co_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    g_app.com_initialized = SUCCEEDED(co_result);
+    g_app.window.com_initialized = SUCCEEDED(co_result);
     LoadConfig();
     ResetDebugLog();
-    g_app.startup_warmup_until = GetTickCount() + kStartupWarmupMs;
+    g_app.suppression.startup_warmup_until = GetTickCount() + kStartupWarmupMs;
     AppendDebugLog(L"startup debug_log=1 command_line=%ls warmup_ms=%lu", GetCommandLineW(), kStartupWarmupMs);
 
     using DpiAwarenessContext = HANDLE;
@@ -2320,7 +2349,7 @@ int Run(HINSTANCE instance) {
     }
 
     if (!RegisterWindowClass(instance)) {
-        if (g_app.com_initialized) {
+        if (g_app.window.com_initialized) {
             CoUninitialize();
         }
         return 1;
@@ -2347,7 +2376,7 @@ int Run(HINSTANCE instance) {
         nullptr);
 
     if (!hwnd) {
-        if (g_app.com_initialized) {
+        if (g_app.window.com_initialized) {
             CoUninitialize();
         }
         return 1;
@@ -2362,7 +2391,7 @@ int Run(HINSTANCE instance) {
         DispatchMessageW(&msg);
     }
 
-    if (g_app.com_initialized) {
+    if (g_app.window.com_initialized) {
         CoUninitialize();
     }
 
