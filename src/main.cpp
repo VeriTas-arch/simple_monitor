@@ -69,6 +69,14 @@ enum MenuId : UINT {
     ID_RELOAD_CONFIG = 1005,
 };
 
+enum class PreferredAppMode {
+    Default,
+    AllowDark,
+    ForceDark,
+    ForceLight,
+    Max,
+};
+
 struct CpuSampler {
     ULONGLONG idle = 0;
     ULONGLONG kernel = 0;
@@ -315,6 +323,28 @@ bool RectEquals(const RECT& a, const RECT& b) {
 
 bool TickPassed(DWORD now, DWORD deadline) {
     return static_cast<LONG>(now - deadline) >= 0;
+}
+
+void EnableSystemMenuTheme() {
+    HMODULE uxtheme = LoadLibraryW(L"uxtheme.dll");
+    if (!uxtheme) {
+        return;
+    }
+
+    using SetPreferredAppModeFn = PreferredAppMode(WINAPI*)(PreferredAppMode);
+    using FlushMenuThemesFn = void(WINAPI*)();
+
+    auto set_preferred_app_mode =
+        reinterpret_cast<SetPreferredAppModeFn>(GetProcAddress(uxtheme, MAKEINTRESOURCEA(135)));
+    auto flush_menu_themes =
+        reinterpret_cast<FlushMenuThemesFn>(GetProcAddress(uxtheme, MAKEINTRESOURCEA(136)));
+
+    if (set_preferred_app_mode) {
+        set_preferred_app_mode(PreferredAppMode::AllowDark);
+    }
+    if (flush_menu_themes) {
+        flush_menu_themes();
+    }
 }
 
 void ResetDebugLog() {
@@ -2215,6 +2245,13 @@ LRESULT HandleDisplayChange(HWND hwnd) {
     return 0;
 }
 
+LRESULT HandleSettingChange(HWND hwnd, LPARAM lparam) {
+    if (lparam && std::wcscmp(reinterpret_cast<const wchar_t*>(lparam), L"ImmersiveColorSet") == 0) {
+        EnableSystemMenuTheme();
+    }
+    return HandleDisplayChange(hwnd);
+}
+
 LRESULT HandleShowWindow(HWND hwnd, WPARAM wparam) {
     if (!wparam) {
         if (!g_app.suppression.overlay_suppressed) {
@@ -2290,9 +2327,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         return HandleDpiChanged(hwnd, wparam, lparam);
 
     case WM_DISPLAYCHANGE:
-    case WM_SETTINGCHANGE:
     case WM_DEVICECHANGE:
         return HandleDisplayChange(hwnd);
+
+    case WM_SETTINGCHANGE:
+        return HandleSettingChange(hwnd, lparam);
 
     case WM_WINDOWPOSCHANGED:
         KeepOverlayOnTop();
@@ -2334,6 +2373,7 @@ bool RegisterWindowClass(HINSTANCE instance) {
 int Run(HINSTANCE instance) {
     g_app.window.instance = instance;
     g_app.window.taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
+    EnableSystemMenuTheme();
     const HRESULT co_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     g_app.window.com_initialized = SUCCEEDED(co_result);
     LoadConfig();
