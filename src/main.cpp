@@ -49,17 +49,23 @@ constexpr wchar_t kRunValue[] = L"SimpleMonitor";
 // - refresh: sample metrics and repaint the overlay.
 // - placement: keep the overlay aligned to the taskbar tray anchor.
 // - state: react quickly to fullscreen/screenshot/key-state changes.
+// - z-order burst: briefly fight foreground and Shell z-order animations.
 constexpr UINT_PTR kRefreshTimer = 1;
 constexpr UINT_PTR kPlacementTimer = 2;
 constexpr UINT_PTR kStateTimer = 3;
+constexpr UINT_PTR kZOrderBurstTimer = 4;
 constexpr UINT kStateIntervalMs = 100;
 constexpr UINT kPlacementIntervalMs = 5000;
+constexpr UINT kZOrderBurstIntervalMs = 16;
 constexpr DWORD kGpuGroupRefreshIntervalMs = 5000;
 constexpr DWORD kStartupWarmupMs = 15000;
+constexpr DWORD kZOrderBurstDurationMs = 1500;
 constexpr UINT kTrayIconId = 1;
 constexpr UINT WM_TRAYICON = WM_APP + 1;
 constexpr UINT WM_TRAY_LAYOUT_CHANGED = WM_APP + 2;
+constexpr UINT WM_FOREGROUND_CHANGED = WM_APP + 3;
 constexpr int kAppIconResource = 101;
+constexpr bool kAttachOverlayToTaskbarOwner = false;
 
 enum MenuId : UINT {
     ID_CLICK_THROUGH = 1001,
@@ -160,6 +166,7 @@ struct PlacementState {
     bool has_last_logged_anchor_rect = false;
     bool has_last_logged_overlay_rect = false;
     int last_logged_anchor_mode = -1;
+    DWORD z_order_burst_until = 0;
 };
 
 struct SuppressionState {
@@ -1070,14 +1077,26 @@ void KeepOverlayOnTop() {
     g_app.placement.maintaining_z_order = false;
 }
 
+void StartZOrderBurst(HWND hwnd) {
+    g_app.placement.z_order_burst_until = GetTickCount() + kZOrderBurstDurationMs;
+    SetTimer(hwnd, kZOrderBurstTimer, kZOrderBurstIntervalMs, nullptr);
+}
+
 void CALLBACK TrayEventProc(
     HWINEVENTHOOK,
-    DWORD,
+    DWORD event,
     HWND hwnd,
     LONG id_object,
     LONG,
     DWORD,
     DWORD) {
+    if (event == EVENT_SYSTEM_FOREGROUND) {
+        if (g_app.window.hwnd && IsWindow(g_app.window.hwnd) && hwnd != g_app.window.hwnd) {
+            PostMessageW(g_app.window.hwnd, WM_FOREGROUND_CHANGED, 0, 0);
+        }
+        return;
+    }
+
     if (!g_app.window.hwnd || !IsWindow(g_app.window.hwnd) || !IsTaskbarRelatedWindow(hwnd)) {
         return;
     }
@@ -1098,6 +1117,7 @@ void RegisterTrayEventHooks() {
         EVENT_OBJECT_HIDE,
         EVENT_OBJECT_REORDER,
         EVENT_OBJECT_LOCATIONCHANGE,
+        EVENT_SYSTEM_FOREGROUND,
     };
 
     for (DWORD event : events) {
@@ -1115,6 +1135,14 @@ void UnregisterTrayEventHooks() {
 }
 
 void AttachToTaskbarOwner(HWND hwnd) {
+    if (!kAttachOverlayToTaskbarOwner) {
+        if (g_app.placement.taskbar_owner) {
+            SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
+            g_app.placement.taskbar_owner = nullptr;
+        }
+        return;
+    }
+
     HWND taskbar = TaskbarWindow();
     if (!taskbar || taskbar == g_app.placement.taskbar_owner) {
         return;
@@ -2188,6 +2216,21 @@ LRESULT HandleCreate(HWND hwnd) {
 }
 
 LRESULT HandleTimer(HWND hwnd, UINT_PTR timer_id) {
+    if (timer_id == kZOrderBurstTimer) {
+        if (g_app.suppression.overlay_suppressed ||
+            g_app.placement.z_order_burst_until == 0 ||
+            TickPassed(GetTickCount(), g_app.placement.z_order_burst_until)) {
+            KillTimer(hwnd, kZOrderBurstTimer);
+            g_app.placement.z_order_burst_until = 0;
+            return 0;
+        }
+
+        RepositionWindow();
+        KeepOverlayOnTop();
+        ReapplyLastFrame(hwnd);
+        return 0;
+    }
+
     if (timer_id == kStateTimer) {
         if (HandleOverlayStateGuards(hwnd)) {
             return 0;
@@ -2256,6 +2299,10 @@ LRESULT HandleShowWindow(HWND hwnd, WPARAM wparam) {
     if (!wparam) {
         if (!g_app.suppression.overlay_suppressed) {
             SetPlacementTimer(hwnd, 100, true);
+            StartZOrderBurst(hwnd);
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            ReapplyLastFrame(hwnd);
+            KeepOverlayOnTop();
         }
     } else {
         SetPlacementTimer(hwnd, kPlacementIntervalMs, false);
@@ -2270,6 +2317,7 @@ LRESULT HandleShowWindow(HWND hwnd, WPARAM wparam) {
 LRESULT HandleTrayLayoutChanged(HWND hwnd) {
     InterlockedExchange(&g_app.placement.tray_layout_update_pending, 0);
     AppendDebugLog(L"event=tray_layout_changed");
+    StartZOrderBurst(hwnd);
     AttachToTaskbarOwner(hwnd);
     if (UpdateOverlaySuppression(hwnd)) {
         return 0;
@@ -2277,6 +2325,14 @@ LRESULT HandleTrayLayoutChanged(HWND hwnd) {
     RepositionWindow();
     KeepOverlayOnTop();
     RenderOverlay(hwnd);
+    return 0;
+}
+
+LRESULT HandleForegroundChanged(HWND hwnd) {
+    StartZOrderBurst(hwnd);
+    RepositionWindow();
+    KeepOverlayOnTop();
+    ReapplyLastFrame(hwnd);
     return 0;
 }
 
@@ -2293,6 +2349,7 @@ LRESULT HandleDestroy(HWND hwnd) {
     KillTimer(hwnd, kRefreshTimer);
     KillTimer(hwnd, kPlacementTimer);
     KillTimer(hwnd, kStateTimer);
+    KillTimer(hwnd, kZOrderBurstTimer);
     UnregisterTrayEventHooks();
     RemoveTrayIcon(hwnd);
     if (g_app.metrics.gpu.query) {
@@ -2346,6 +2403,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
 
     case WM_TRAY_LAYOUT_CHANGED:
         return HandleTrayLayoutChanged(hwnd);
+
+    case WM_FOREGROUND_CHANGED:
+        return HandleForegroundChanged(hwnd);
 
     case WM_TRAYICON:
         return HandleTrayIcon(hwnd, lparam);
