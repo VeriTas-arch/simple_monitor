@@ -50,13 +50,16 @@ constexpr wchar_t kRunValue[] = L"SimpleMonitor";
 // - placement: keep the overlay aligned to the taskbar tray anchor.
 // - state: react quickly to fullscreen/screenshot/key-state changes.
 // - z-order burst: briefly fight foreground and Shell z-order animations.
+// - startup init: defer expensive monitor setup when launched at logon.
 constexpr UINT_PTR kRefreshTimer = 1;
 constexpr UINT_PTR kPlacementTimer = 2;
 constexpr UINT_PTR kStateTimer = 3;
 constexpr UINT_PTR kZOrderBurstTimer = 4;
+constexpr UINT_PTR kStartupInitTimer = 5;
 constexpr UINT kStateIntervalMs = 100;
 constexpr UINT kPlacementIntervalMs = 5000;
 constexpr UINT kZOrderBurstIntervalMs = 16;
+constexpr UINT kStartupInitDelayMs = 8000;
 constexpr DWORD kGpuGroupRefreshIntervalMs = 5000;
 constexpr DWORD kStartupWarmupMs = 15000;
 constexpr DWORD kZOrderBurstDurationMs = 1500;
@@ -147,6 +150,8 @@ struct WindowState {
     UINT taskbar_created = 0;
     UINT dpi = 96;
     bool com_initialized = false;
+    bool launched_at_startup = false;
+    bool monitor_initialized = false;
 };
 
 struct TrayState {
@@ -330,6 +335,10 @@ bool RectEquals(const RECT& a, const RECT& b) {
 
 bool TickPassed(DWORD now, DWORD deadline) {
     return static_cast<LONG>(now - deadline) >= 0;
+}
+
+bool CommandLineHasFlag(const wchar_t* flag) {
+    return flag && std::wcsstr(GetCommandLineW(), flag) != nullptr;
 }
 
 void EnableSystemMenuTheme() {
@@ -2184,6 +2193,10 @@ void ValidatePaint(HWND hwnd) {
 
 LRESULT HandleTaskbarCreated(HWND hwnd) {
     AppendDebugLog(L"event=taskbar_created");
+    if (!g_app.window.monitor_initialized) {
+        return 0;
+    }
+
     AttachToTaskbarOwner(hwnd);
     AddTrayIcon(hwnd);
     if (UpdateOverlaySuppression(hwnd)) {
@@ -2194,10 +2207,13 @@ LRESULT HandleTaskbarCreated(HWND hwnd) {
     return 0;
 }
 
-LRESULT HandleCreate(HWND hwnd) {
-    g_app.window.hwnd = hwnd;
-    g_app.window.dpi = WindowDpi(hwnd);
-    LoadConfig();
+void InitializeMonitor(HWND hwnd) {
+    if (g_app.window.monitor_initialized) {
+        return;
+    }
+
+    g_app.window.monitor_initialized = true;
+    AppendDebugLog(L"monitor_init delayed=%d", g_app.window.launched_at_startup ? 1 : 0);
     AddTrayIcon(hwnd);
     AttachToTaskbarOwner(hwnd);
     RegisterTrayEventHooks();
@@ -2208,14 +2224,33 @@ LRESULT HandleCreate(HWND hwnd) {
     SetPlacementTimer(hwnd, kPlacementIntervalMs, false);
     SetTimer(hwnd, kStateTimer, kStateIntervalMs, nullptr);
     if (UpdateOverlaySuppression(hwnd)) {
-        return 0;
+        return;
     }
     RepositionWindow();
     RenderOverlay(hwnd);
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    UpdateWindow(hwnd);
+}
+
+LRESULT HandleCreate(HWND hwnd) {
+    g_app.window.hwnd = hwnd;
+    g_app.window.dpi = WindowDpi(hwnd);
+    LoadConfig();
+    if (g_app.window.launched_at_startup) {
+        SetTimer(hwnd, kStartupInitTimer, kStartupInitDelayMs, nullptr);
+    } else {
+        InitializeMonitor(hwnd);
+    }
     return 0;
 }
 
 LRESULT HandleTimer(HWND hwnd, UINT_PTR timer_id) {
+    if (timer_id == kStartupInitTimer) {
+        KillTimer(hwnd, kStartupInitTimer);
+        InitializeMonitor(hwnd);
+        return 0;
+    }
+
     if (timer_id == kZOrderBurstTimer) {
         if (g_app.suppression.overlay_suppressed ||
             g_app.placement.z_order_burst_until == 0 ||
@@ -2279,6 +2314,10 @@ LRESULT HandleDpiChanged(HWND hwnd, WPARAM wparam, LPARAM lparam) {
 }
 
 LRESULT HandleDisplayChange(HWND hwnd) {
+    if (!g_app.window.monitor_initialized) {
+        return 0;
+    }
+
     AttachToTaskbarOwner(hwnd);
     if (UpdateOverlaySuppression(hwnd)) {
         return 0;
@@ -2296,6 +2335,10 @@ LRESULT HandleSettingChange(HWND hwnd, LPARAM lparam) {
 }
 
 LRESULT HandleShowWindow(HWND hwnd, WPARAM wparam) {
+    if (!g_app.window.monitor_initialized) {
+        return 0;
+    }
+
     if (!wparam) {
         if (!g_app.suppression.overlay_suppressed) {
             SetPlacementTimer(hwnd, 100, true);
@@ -2316,6 +2359,10 @@ LRESULT HandleShowWindow(HWND hwnd, WPARAM wparam) {
 
 LRESULT HandleTrayLayoutChanged(HWND hwnd) {
     InterlockedExchange(&g_app.placement.tray_layout_update_pending, 0);
+    if (!g_app.window.monitor_initialized) {
+        return 0;
+    }
+
     AppendDebugLog(L"event=tray_layout_changed");
     StartZOrderBurst(hwnd);
     AttachToTaskbarOwner(hwnd);
@@ -2329,6 +2376,10 @@ LRESULT HandleTrayLayoutChanged(HWND hwnd) {
 }
 
 LRESULT HandleForegroundChanged(HWND hwnd) {
+    if (!g_app.window.monitor_initialized) {
+        return 0;
+    }
+
     StartZOrderBurst(hwnd);
     RepositionWindow();
     KeepOverlayOnTop();
@@ -2350,6 +2401,7 @@ LRESULT HandleDestroy(HWND hwnd) {
     KillTimer(hwnd, kPlacementTimer);
     KillTimer(hwnd, kStateTimer);
     KillTimer(hwnd, kZOrderBurstTimer);
+    KillTimer(hwnd, kStartupInitTimer);
     UnregisterTrayEventHooks();
     RemoveTrayIcon(hwnd);
     if (g_app.metrics.gpu.query) {
@@ -2433,6 +2485,7 @@ bool RegisterWindowClass(HINSTANCE instance) {
 int Run(HINSTANCE instance) {
     g_app.window.instance = instance;
     g_app.window.taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
+    g_app.window.launched_at_startup = CommandLineHasFlag(L"--startup");
     EnableSystemMenuTheme();
     const HRESULT co_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     g_app.window.com_initialized = SUCCEEDED(co_result);
@@ -2484,8 +2537,10 @@ int Run(HINSTANCE instance) {
         return 1;
     }
 
-    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-    UpdateWindow(hwnd);
+    if (!g_app.window.launched_at_startup) {
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        UpdateWindow(hwnd);
+    }
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
