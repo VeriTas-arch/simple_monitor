@@ -16,6 +16,15 @@ The executable is generated at:
 build/simple_monitor.exe
 ```
 
+The taskbar-visibility beta is generated separately at
+`build/simple_monitor_dev.exe`. It uses the taskbar's visible state, rather
+than foreground-window fullscreen detection, to decide whether to show the
+overlay. Build only that target with:
+
+```pwsh
+cmake --build build --target simple_monitor_dev
+```
+
 For the usual edit-build-run loop during development, use:
 
 ```pwsh

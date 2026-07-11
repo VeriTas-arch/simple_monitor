@@ -3,23 +3,21 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$targetName = "simple_monitor_dev"
 
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $resolvedBuildDir = Resolve-Path -LiteralPath (Join-Path $repoRoot $BuildDir)
 $buildDirPath = $resolvedBuildDir.Path
-$running = Get-Process -Name "simple_monitor" -ErrorAction SilentlyContinue
+$running = Get-Process -Name $targetName -ErrorAction SilentlyContinue
 if ($running) {
     $running | Stop-Process -Force
-
-    for ($i = 0; $i -lt 20; $i++) {
-        Start-Sleep -Milliseconds 100
-        if (-not (Get-Process -Name "simple_monitor" -ErrorAction SilentlyContinue)) {
-            break
-        }
+    $pids = $running.Id
+    if ($pids) {
+        Wait-Process -Id $pids -Timeout 3 -ErrorAction SilentlyContinue
     }
 }
 
-cmake --build $buildDirPath
+cmake --build $buildDirPath --target simple_monitor_dev
 
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE

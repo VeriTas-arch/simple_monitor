@@ -43,7 +43,7 @@ namespace {
 // Core constants, message IDs, and long-lived application state.
 constexpr wchar_t kWindowClass[] = L"SimpleMonitorOverlayWindow";
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-constexpr wchar_t kRunValue[] = L"SimpleMonitor";
+constexpr wchar_t kRunValue[] = L"SimpleMonitorDev";
 
 // Timer roles:
 // - refresh: sample metrics and repaint the overlay.
@@ -591,6 +591,34 @@ HWND TaskbarWindow() {
     return FindWindowW(L"Shell_TrayWnd", nullptr);
 }
 
+bool IsTaskbarVisible() {
+    HWND taskbar = TaskbarWindow();
+    if (!taskbar || !IsWindowVisible(taskbar) || IsIconic(taskbar)) {
+        return false;
+    }
+
+    RECT rect{};
+    if (!GetWindowRect(taskbar, &rect)) {
+        return false;
+    }
+
+    HMONITOR monitor = MonitorFromWindow(taskbar, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitor_info{};
+    monitor_info.cbSize = sizeof(monitor_info);
+    if (!monitor || !GetMonitorInfoW(monitor, &monitor_info)) {
+        return false;
+    }
+
+    RECT visible_rect{};
+    if (!IntersectRect(&visible_rect, &rect, &monitor_info.rcMonitor)) {
+        return false;
+    }
+
+    const int minimum_visible_size = Scale(8, WindowDpi(taskbar));
+    return visible_rect.right - visible_rect.left >= minimum_visible_size &&
+           visible_rect.bottom - visible_rect.top >= minimum_visible_size;
+}
+
 bool IsTaskbarRelatedWindow(HWND hwnd) {
     if (!hwnd) {
         return false;
@@ -654,6 +682,42 @@ bool IsEligibleFullscreenAppWindow(HWND hwnd) {
            !IsIconic(hwnd);
 }
 
+bool IsTaskbarCoveredByForegroundWindow() {
+    HWND foreground = GetForegroundWindow();
+    HWND root = GetAncestor(foreground, GA_ROOT);
+    if (!root ||
+        root == g_app.window.hwnd ||
+        WindowClassIs(foreground, L"TaskListThumbnailWnd") ||
+        WindowClassIs(foreground, L"XamlExplorerHostIslandWindow") ||
+        WindowClassIs(root, L"TaskListThumbnailWnd") ||
+        WindowClassIs(root, L"XamlExplorerHostIslandWindow") ||
+        IsTaskbarRelatedWindow(root) ||
+        IsShellPopupOrDesktopWindow(root) ||
+        !IsWindowVisible(root) ||
+        IsIconic(root)) {
+        return false;
+    }
+
+    RECT taskbar_rect{};
+    RECT window_rect{};
+    if (!GetWindowRect(TaskbarWindow(), &taskbar_rect) || !GetWindowRect(root, &window_rect)) {
+        return false;
+    }
+
+    RECT overlap{};
+    if (!IntersectRect(&overlap, &taskbar_rect, &window_rect)) {
+        return false;
+    }
+
+    const int taskbar_width = taskbar_rect.right - taskbar_rect.left;
+    const int taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
+    const int overlap_width = overlap.right - overlap.left;
+    const int overlap_height = overlap.bottom - overlap.top;
+    const int tolerance = Scale(12, WindowDpi(TaskbarWindow()));
+    return overlap_width >= taskbar_width - tolerance &&
+           overlap_height >= taskbar_height - tolerance;
+}
+
 bool IsFullscreenForegroundWindow() {
     HWND foreground = GetForegroundWindow();
     if (IsIgnoredShellWindow(foreground)) {
@@ -694,14 +758,11 @@ bool StartupWarmupActive() {
 }
 
 const wchar_t* OverlaySuppressionReason() {
-    if (const wchar_t* state_reason = SuppressedNotificationStateReason()) {
-        return state_reason;
+    if (!IsTaskbarVisible()) {
+        return L"taskbar_hidden";
     }
-    if (IsFullscreenForegroundWindow()) {
-        if (StartupWarmupActive()) {
-            return nullptr;
-        }
-        return L"fullscreen_window";
+    if (IsTaskbarCoveredByForegroundWindow()) {
+        return L"taskbar_covered";
     }
     return nullptr;
 }
