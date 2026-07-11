@@ -76,6 +76,7 @@ enum MenuId : UINT {
     ID_EXIT = 1003,
     ID_OPEN_CONFIG = 1004,
     ID_RELOAD_CONFIG = 1005,
+    ID_RECOVER_TASKBAR = 1006,
 };
 
 enum class PreferredAppMode {
@@ -228,6 +229,7 @@ AppState g_app;
 // Forward declarations for cross-section entry points.
 void RenderOverlay(HWND hwnd);
 bool UpdateOverlaySuppression(HWND hwnd);
+void ResetLayeredSurface(HWND hwnd);
 
 // Shared utility helpers.
 ULONGLONG FileTimeToU64(const FILETIME& ft) {
@@ -1602,6 +1604,29 @@ void ReloadConfigAndRefresh(HWND hwnd) {
     RenderOverlay(hwnd);
 }
 
+void RecoverTaskbar(HWND hwnd) {
+    AppendDebugLog(L"event=manual_taskbar_recovery");
+    RemoveTrayIcon(hwnd);
+    SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
+    g_app.placement.taskbar_owner = nullptr;
+
+    if (HWND taskbar = TaskbarWindow()) {
+        SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(taskbar));
+        g_app.placement.taskbar_owner = taskbar;
+    }
+
+    AddTrayIcon(hwnd);
+    StartZOrderBurst(hwnd);
+    if (UpdateOverlaySuppression(hwnd)) {
+        return;
+    }
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    RepositionWindow();
+    KeepOverlayOnTop();
+    ResetLayeredSurface(hwnd);
+    RenderOverlay(hwnd);
+}
+
 bool HandleMenuCommand(HWND hwnd, UINT command) {
     switch (command) {
     case ID_OPEN_CONFIG:
@@ -1609,6 +1634,9 @@ bool HandleMenuCommand(HWND hwnd, UINT command) {
         return true;
     case ID_RELOAD_CONFIG:
         ReloadConfigAndRefresh(hwnd);
+        return true;
+    case ID_RECOVER_TASKBAR:
+        RecoverTaskbar(hwnd);
         return true;
     case ID_CLICK_THROUGH:
         g_app.tray.click_through = !g_app.tray.click_through;
@@ -1638,6 +1666,7 @@ void ShowTrayMenu(HWND hwnd) {
 
         AppendMenuW(menu, MF_STRING, ID_OPEN_CONFIG, L"Open config");
         AppendMenuW(menu, MF_STRING, ID_RELOAD_CONFIG, L"Reload config");
+        AppendMenuW(menu, MF_STRING, ID_RECOVER_TASKBAR, L"Recover taskbar");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING | (g_app.tray.click_through ? MF_CHECKED : MF_UNCHECKED), ID_CLICK_THROUGH, L"Click-through");
         AppendMenuW(menu, MF_STRING | (IsStartupEnabled() ? MF_CHECKED : MF_UNCHECKED), ID_STARTUP, L"Start with Windows");
