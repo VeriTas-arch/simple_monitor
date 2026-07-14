@@ -48,7 +48,7 @@ constexpr wchar_t kRunValue[] = L"SimpleMonitorDev";
 // Timer roles:
 // - refresh: sample metrics and repaint the overlay.
 // - placement: keep the overlay aligned to the taskbar tray anchor.
-// - state: react quickly to fullscreen/screenshot/key-state changes.
+// - state: react quickly to taskbar visibility, screenshot, and key-state changes.
 // - z-order burst: briefly fight foreground and Shell z-order animations.
 // - startup init: defer expensive monitor setup when launched at logon.
 constexpr UINT_PTR kRefreshTimer = 1;
@@ -61,8 +61,9 @@ constexpr UINT kPlacementIntervalMs = 5000;
 constexpr UINT kZOrderBurstIntervalMs = 16;
 constexpr UINT kStartupInitDelayMs = 8000;
 constexpr DWORD kGpuGroupRefreshIntervalMs = 5000;
-constexpr DWORD kStartupWarmupMs = 15000;
 constexpr DWORD kZOrderBurstDurationMs = 1500;
+constexpr int kMinimumTaskbarVisibleDip = 8;
+constexpr int kTaskbarCoverageToleranceDip = 12;
 constexpr UINT kTrayIconId = 1;
 constexpr UINT WM_TRAYICON = WM_APP + 1;
 constexpr UINT WM_TRAY_LAYOUT_CHANGED = WM_APP + 2;
@@ -77,6 +78,12 @@ enum MenuId : UINT {
     ID_OPEN_CONFIG = 1004,
     ID_RELOAD_CONFIG = 1005,
     ID_RECOVER_TASKBAR = 1006,
+};
+
+enum class SuppressionReason {
+    None,
+    TaskbarHidden,
+    TaskbarCovered,
 };
 
 enum class PreferredAppMode {
@@ -179,7 +186,6 @@ struct PlacementState {
 struct SuppressionState {
     bool overlay_update_frozen = false;
     bool overlay_suppressed = false;
-    DWORD startup_warmup_until = 0;
     DWORD refresh_resume_tick = 0;
 };
 
@@ -593,7 +599,7 @@ HWND TaskbarWindow() {
     return FindWindowW(L"Shell_TrayWnd", nullptr);
 }
 
-bool IsTaskbarVisible() {
+bool TaskbarHasVisibleArea() {
     HWND taskbar = TaskbarWindow();
     if (!taskbar || !IsWindowVisible(taskbar) || IsIconic(taskbar)) {
         return false;
@@ -616,7 +622,7 @@ bool IsTaskbarVisible() {
         return false;
     }
 
-    const int minimum_visible_size = Scale(8, WindowDpi(taskbar));
+    const int minimum_visible_size = Scale(kMinimumTaskbarVisibleDip, WindowDpi(taskbar));
     return visible_rect.right - visible_rect.left >= minimum_visible_size &&
            visible_rect.bottom - visible_rect.top >= minimum_visible_size;
 }
@@ -654,55 +660,36 @@ bool IsTaskbarRelatedWindow(HWND hwnd) {
     return false;
 }
 
-const wchar_t* SuppressedNotificationStateReason() {
-    QUERY_USER_NOTIFICATION_STATE state = QUNS_ACCEPTS_NOTIFICATIONS;
-    if (FAILED(SHQueryUserNotificationState(&state))) {
-        return nullptr;
-    }
-
-    if (state == QUNS_RUNNING_D3D_FULL_SCREEN) {
-        return L"d3d_fullscreen";
-    }
-    if (state == QUNS_PRESENTATION_MODE) {
-        return L"presentation";
-    }
-    return nullptr;
+bool IsTaskbarPreviewWindow(HWND hwnd) {
+    return WindowClassIs(hwnd, L"TaskListThumbnailWnd") ||
+           WindowClassIs(hwnd, L"XamlExplorerHostIslandWindow");
 }
 
-bool IsIgnoredShellWindow(HWND hwnd) {
-    return !hwnd ||
-           hwnd == g_app.window.hwnd ||
-           IsTaskbarRelatedWindow(hwnd) ||
-           IsShellPopupOrDesktopWindow(hwnd) ||
-           WindowProcessBasename(hwnd) == L"explorer.exe";
-}
-
-bool IsEligibleFullscreenAppWindow(HWND hwnd) {
+bool IsEligibleTaskbarCoveringWindow(HWND hwnd) {
     return hwnd &&
-           !IsIgnoredShellWindow(hwnd) &&
+           hwnd != g_app.window.hwnd &&
+           !IsTaskbarPreviewWindow(hwnd) &&
+           !IsTaskbarRelatedWindow(hwnd) &&
+           !IsShellPopupOrDesktopWindow(hwnd) &&
            IsWindowVisible(hwnd) &&
            !IsIconic(hwnd);
 }
 
-bool IsTaskbarCoveredByForegroundWindow() {
+bool ForegroundWindowCoversTaskbar() {
     HWND foreground = GetForegroundWindow();
-    HWND root = GetAncestor(foreground, GA_ROOT);
-    if (!root ||
-        root == g_app.window.hwnd ||
-        WindowClassIs(foreground, L"TaskListThumbnailWnd") ||
-        WindowClassIs(foreground, L"XamlExplorerHostIslandWindow") ||
-        WindowClassIs(root, L"TaskListThumbnailWnd") ||
-        WindowClassIs(root, L"XamlExplorerHostIslandWindow") ||
-        IsTaskbarRelatedWindow(root) ||
-        IsShellPopupOrDesktopWindow(root) ||
-        !IsWindowVisible(root) ||
-        IsIconic(root)) {
+    if (IsTaskbarPreviewWindow(foreground)) {
         return false;
     }
 
+    HWND root = GetAncestor(foreground, GA_ROOT);
+    if (!IsEligibleTaskbarCoveringWindow(root)) {
+        return false;
+    }
+
+    HWND taskbar = TaskbarWindow();
     RECT taskbar_rect{};
     RECT window_rect{};
-    if (!GetWindowRect(TaskbarWindow(), &taskbar_rect) || !GetWindowRect(root, &window_rect)) {
+    if (!taskbar || !GetWindowRect(taskbar, &taskbar_rect) || !GetWindowRect(root, &window_rect)) {
         return false;
     }
 
@@ -715,109 +702,31 @@ bool IsTaskbarCoveredByForegroundWindow() {
     const int taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
     const int overlap_width = overlap.right - overlap.left;
     const int overlap_height = overlap.bottom - overlap.top;
-    const int tolerance = Scale(12, WindowDpi(TaskbarWindow()));
+    const int tolerance = Scale(kTaskbarCoverageToleranceDip, WindowDpi(taskbar));
     return overlap_width >= taskbar_width - tolerance &&
            overlap_height >= taskbar_height - tolerance;
 }
 
-bool IsFullscreenForegroundWindow() {
-    HWND foreground = GetForegroundWindow();
-    if (IsIgnoredShellWindow(foreground)) {
-        return false;
+SuppressionReason GetSuppressionReason() {
+    if (!TaskbarHasVisibleArea()) {
+        return SuppressionReason::TaskbarHidden;
     }
-
-    HWND root = GetAncestor(foreground, GA_ROOT);
-    if (!IsEligibleFullscreenAppWindow(root)) {
-        return false;
+    if (ForegroundWindowCoversTaskbar()) {
+        return SuppressionReason::TaskbarCovered;
     }
-
-    RECT window_rect{};
-    if (!GetWindowRect(root, &window_rect)) {
-        return false;
-    }
-
-    HMONITOR monitor = MonitorFromWindow(root, MONITOR_DEFAULTTONEAREST);
-    if (!monitor) {
-        return false;
-    }
-
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    if (!GetMonitorInfoW(monitor, &mi)) {
-        return false;
-    }
-
-    const int tolerance = Scale(2, WindowDpi(g_app.window.hwnd ? g_app.window.hwnd : root));
-    return std::abs(window_rect.left - mi.rcMonitor.left) <= tolerance &&
-           std::abs(window_rect.top - mi.rcMonitor.top) <= tolerance &&
-           std::abs(window_rect.right - mi.rcMonitor.right) <= tolerance &&
-           std::abs(window_rect.bottom - mi.rcMonitor.bottom) <= tolerance;
+    return SuppressionReason::None;
 }
 
-bool StartupWarmupActive() {
-    return g_app.suppression.startup_warmup_until != 0 &&
-           static_cast<LONG>(GetTickCount() - g_app.suppression.startup_warmup_until) < 0;
-}
-
-const wchar_t* OverlaySuppressionReason() {
-    if (!IsTaskbarVisible()) {
+const wchar_t* SuppressionReasonName(SuppressionReason reason) {
+    switch (reason) {
+    case SuppressionReason::TaskbarHidden:
         return L"taskbar_hidden";
-    }
-    if (IsTaskbarCoveredByForegroundWindow()) {
+    case SuppressionReason::TaskbarCovered:
         return L"taskbar_covered";
+    case SuppressionReason::None:
+    default:
+        return L"none";
     }
-    return nullptr;
-}
-
-void LogFullscreenSuppressionContext() {
-    if (!g_app.config.debug_log) {
-        return;
-    }
-
-    HWND foreground = GetForegroundWindow();
-    HWND root = foreground ? GetAncestor(foreground, GA_ROOT) : nullptr;
-
-    RECT foreground_rect{};
-    RECT root_rect{};
-    RECT monitor_rect{};
-    GetWindowRect(foreground, &foreground_rect);
-    GetWindowRect(root, &root_rect);
-
-    HMONITOR monitor = root ? MonitorFromWindow(root, MONITOR_DEFAULTTONEAREST) : nullptr;
-    if (monitor) {
-        MONITORINFO mi{};
-        mi.cbSize = sizeof(mi);
-        if (GetMonitorInfoW(monitor, &mi)) {
-            monitor_rect = mi.rcMonitor;
-        }
-    }
-
-    const std::wstring foreground_exe = WindowProcessBasename(foreground);
-    const std::wstring root_exe = WindowProcessBasename(root);
-    const std::wstring foreground_class = WindowClassName(foreground);
-    const std::wstring root_class = WindowClassName(root);
-
-    AppendDebugLog(
-        L"fullscreen_context foreground_hwnd=%p foreground_exe=%ls foreground_class=%ls foreground_rect=(%ld,%ld,%ld,%ld) "
-        L"root_hwnd=%p root_exe=%ls root_class=%ls root_rect=(%ld,%ld,%ld,%ld) monitor_rect=(%ld,%ld,%ld,%ld)",
-        foreground,
-        foreground_exe.c_str(),
-        foreground_class.c_str(),
-        foreground_rect.left,
-        foreground_rect.top,
-        foreground_rect.right,
-        foreground_rect.bottom,
-        root,
-        root_exe.c_str(),
-        root_class.c_str(),
-        root_rect.left,
-        root_rect.top,
-        root_rect.right,
-        root_rect.bottom,
-        monitor_rect.left,
-        monitor_rect.top,
-        monitor_rect.right,
-        monitor_rect.bottom);
 }
 
 // Metric formatting and sampling.
@@ -2132,14 +2041,11 @@ void ResetLayeredSurface(HWND hwnd) {
 }
 
 bool UpdateOverlaySuppression(HWND hwnd) {
-    const wchar_t* reason = OverlaySuppressionReason();
-    const bool should_suppress = reason != nullptr;
+    const SuppressionReason reason = GetSuppressionReason();
+    const bool should_suppress = reason != SuppressionReason::None;
     if (should_suppress) {
         if (!g_app.suppression.overlay_suppressed) {
-            AppendDebugLog(L"suppression=on reason=%ls", reason);
-            if (std::wcscmp(reason, L"fullscreen_window") == 0) {
-                LogFullscreenSuppressionContext();
-            }
+            AppendDebugLog(L"suppression=on reason=%ls", SuppressionReasonName(reason));
         }
         g_app.suppression.overlay_suppressed = true;
         RestorePlacementTimer(hwnd);
@@ -2658,8 +2564,7 @@ int Run(HINSTANCE instance) {
     g_app.window.com_initialized = SUCCEEDED(co_result);
     LoadConfig();
     ResetDebugLog();
-    g_app.suppression.startup_warmup_until = GetTickCount() + kStartupWarmupMs;
-    AppendDebugLog(L"startup debug_log=1 command_line=%ls warmup_ms=%lu", GetCommandLineW(), kStartupWarmupMs);
+    AppendDebugLog(L"startup debug_log=1 command_line=%ls", GetCommandLineW());
 
     using DpiAwarenessContext = HANDLE;
     using SetProcessDpiAwarenessContextFn = BOOL(WINAPI*)(DpiAwarenessContext);
