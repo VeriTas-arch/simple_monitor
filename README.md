@@ -17,9 +17,12 @@ build/simple_monitor.exe
 ```
 
 The taskbar-visibility beta is generated separately at
-`build/simple_monitor_dev.exe`. It uses the taskbar's visible state, rather
-than foreground-window fullscreen detection, to decide whether to show the
-overlay. Build only that target with:
+`build/simple_monitor_dev.exe`. Its hidden controller survives Shell changes
+and recreates a disposable taskbar-owned overlay as needed. The overlay does
+not force global topmost state. It follows the taskbar owner, suppresses itself
+when the taskbar has no meaningful visible area, and uses the Windows
+notification state plus full-monitor coverage to identify presentation mode.
+Build only that target with:
 
 ```pwsh
 cmake --build build --target simple_monitor_dev
