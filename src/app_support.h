@@ -17,13 +17,14 @@ struct Config {
     int key_font_size_dip = 13;
     bool show_key_widget = true;
     bool debug_log = false;
+    std::wstring log_level = L"info";
     std::wstring network_arrow_style = L"thin";
 };
 
 std::wstring ModulePath();
 std::wstring ModuleDir();
 std::wstring ConfigPath();
-std::wstring DebugLogPath();
+std::wstring DebugLogPath(const wchar_t* filename = L"debug.log");
 
 Config LoadConfig();
 

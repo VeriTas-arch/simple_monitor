@@ -66,8 +66,8 @@ std::wstring ConfigPath() {
     return ModuleDir() + L"\\simple_monitor.ini";
 }
 
-std::wstring DebugLogPath() {
-    return ModuleDir() + L"\\debug.log";
+std::wstring DebugLogPath(const wchar_t* filename) {
+    return ModuleDir() + L"\\" + (filename && *filename ? filename : L"debug.log");
 }
 
 Config LoadConfig() {
@@ -85,7 +85,22 @@ Config LoadConfig() {
     config.key_font_size_dip = ReadConfigInt(path, L"key_font_size", config.font_size_dip, 8, 36);
     config.show_key_widget = ReadConfigBool(path, L"show_key_widget", true);
     config.debug_log = ReadConfigBool(path, L"debug_log", false);
+    config.log_level = LowerString(ReadConfigString(path, L"log_level", L"info"));
     config.network_arrow_style = LowerString(ReadConfigString(path, L"network_arrow_style", L"thin"));
+    if (config.log_level == L"warn") {
+        config.log_level = L"warning";
+    } else if (config.log_level != L"debug" &&
+               config.log_level != L"info" &&
+               config.log_level != L"warning" &&
+               config.log_level != L"error") {
+        config.log_level = L"info";
+    }
+    if (config.network_arrow_style != L"thin" &&
+        config.network_arrow_style != L"triangle" &&
+        config.network_arrow_style != L"heavy" &&
+        config.network_arrow_style != L"chevron") {
+        config.network_arrow_style = L"thin";
+    }
     return config;
 }
 

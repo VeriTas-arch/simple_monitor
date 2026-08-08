@@ -75,6 +75,7 @@ network_arrow_style=thin
 network_arrow_font_size=17
 network_arrow_gap=3
 debug_log=0
+log_level=info
 show_key_widget=1
 ```
 
@@ -89,13 +90,32 @@ column. Active keys are white; inactive keys are dimmed.
 Network arrow styles are `thin` (`↑`/`↓`), `triangle` (`▲`/`▼`), `heavy`
 (`⬆`/`⬇`), and `chevron` (`▴`/`▾`).
 
-Set `debug_log=1` to write event-oriented diagnostics to `debug.log` next to
-the executable. The log records placement changes, tray layout events,
-fullscreen or presentation suppression context, overlay restoration state,
-and screenshot freeze transitions. Each UTF-8 record contains a timestamp,
-severity, process ID, thread ID, and `event=...` fields. On startup, the
-previous session is retained as `debug.log.1`; the active log also rotates at
-2 MiB so logging cannot grow without bound.
+Set `debug_log=1` to write event-oriented diagnostics next to the executable.
+The stable build writes `debug.log`; the dev build writes `debug-dev.log`, so
+their files and rotations cannot interfere. Writes and rotations are serialized
+across processes; if several instances of the same build run together, their
+session-tagged records can share that build's active file. The log records
+placement changes, tray layout events, fullscreen or presentation suppression
+context, overlay restoration state, and screenshot freeze transitions. Each
+UTF-8 record contains a timestamp, severity, process ID, thread ID, session ID,
+sequence number, monotonic elapsed time, and `event=...` fields. Use
+`log_level=debug`, `info`, `warning`, or `error` to control detail.
+
+On startup, the previous active file is normally retained as the corresponding
+`.1` backup. The active log attempts rotation at 2 MiB; if rotation fails, the
+logger preserves the current file, reports the logger failure, and retries later.
+Repeated sustained failures are rate-limited with suppressed counts and duration.
+Rapid failure/recovery flapping is sampled using the same cooldown, with one
+recovery record for each reported failure period. At `info` or `debug` level,
+the dev build also writes a 60-second health record containing
+overlay visibility, ownership, z-order style, suppression state, frame state,
+and the ages of render, present, placement, and metrics activity. For an overlay
+disappearance, inspect `overlay_invariant_failed`, `overlay_repair`, `health`,
+`render_failed`, `present_failed`, and `timer_gap` in sequence.
+
+Raw performance samples, key states, window titles, and the full command line
+are not logged. Logs do include the configuration path plus relevant process
+basenames and window classes; review them before sharing outside your system.
 
 `Start with Windows` writes the current executable path under `HKCU Run`.
 The stable executable uses `SimpleMonitor`; the dev executable uses

@@ -45,6 +45,8 @@ foreach(target IN LISTS SIMPLE_MONITOR_TARGETS)
     )
 endforeach()
 
+target_link_libraries(simple_monitor_dev PRIVATE dwmapi)
+
 # Enable MinGW Unicode entry point handling so the app uses `wWinMain`
 # instead of the ANSI `WinMain` startup path.
 if(MINGW)

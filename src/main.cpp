@@ -64,6 +64,7 @@ constexpr UINT kStartupInitDelayMs = 8000;
 constexpr DWORD kGpuGroupRefreshIntervalMs = 5000;
 constexpr DWORD kStartupWarmupMs = 15000;
 constexpr DWORD kZOrderBurstDurationMs = 1500;
+constexpr unsigned kFailureLogIntervalMs = 30000;
 constexpr UINT kTrayIconId = 1;
 constexpr UINT WM_TRAYICON = WM_APP + 1;
 constexpr UINT WM_TRAY_LAYOUT_CHANGED = WM_APP + 2;
@@ -151,6 +152,7 @@ struct WindowState {
     HWND hwnd = nullptr;
     UINT taskbar_created = 0;
     UINT dpi = 96;
+    const wchar_t* shutdown_trigger = L"window_destroy";
     bool com_initialized = false;
     bool launched_at_startup = false;
     bool monitor_initialized = false;
@@ -212,9 +214,13 @@ struct AppState {
 AppState g_app;
 
 using simple_monitor::ConfigPath;
+using simple_monitor::LogDebug;
 using simple_monitor::LogError;
+using simple_monitor::LogErrorRateLimited;
+using simple_monitor::LogFailureRecovered;
 using simple_monitor::LogInfo;
 using simple_monitor::LogWarning;
+using simple_monitor::LogWarningRateLimited;
 using simple_monitor::ModuleDir;
 
 // Forward declarations for cross-section entry points.
@@ -307,9 +313,73 @@ void EnableSystemMenuTheme() {
 }
 
 // Configuration.
+void ApplyAppConfig(const simple_monitor::Config& config) {
+    g_app.config = config;
+    simple_monitor::ConfigureLogging(
+        g_app.config.debug_log,
+        simple_monitor::DebugLogPath(),
+        simple_monitor::ParseLogLevel(g_app.config.log_level));
+}
+
 void LoadAppConfig() {
-    g_app.config = simple_monitor::LoadConfig();
-    simple_monitor::ConfigureLogging(g_app.config.debug_log, simple_monitor::DebugLogPath());
+    ApplyAppConfig(simple_monitor::LoadConfig());
+}
+
+void LogLoggingConfigChange(
+    const simple_monitor::Config& previous,
+    const simple_monitor::Config& next) {
+    if (!previous.debug_log ||
+        (previous.debug_log == next.debug_log && previous.log_level == next.log_level)) {
+        return;
+    }
+
+    wchar_t message[512]{};
+    _snwprintf_s(
+        message,
+        _countof(message),
+        _TRUNCATE,
+        L"event=logging_config_changed trigger=config_reload old_enabled=%d new_enabled=%d "
+        L"old_level=%ls new_level=%ls",
+        previous.debug_log ? 1 : 0,
+        next.debug_log ? 1 : 0,
+        previous.log_level.c_str(),
+        next.log_level.c_str());
+
+    if (previous.log_level == L"error") {
+        LogError(L"%ls", message);
+    } else if (previous.log_level == L"warning") {
+        LogWarning(L"%ls", message);
+    } else {
+        LogInfo(L"%ls", message);
+    }
+}
+
+void LogConfigSnapshot(const wchar_t* event_name) {
+    const std::wstring path = ConfigPath();
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    LogInfo(
+        L"event=%ls path=\"%ls\" exists=%d debug_log=%d log_level=%ls "
+        L"content_padding_x=%d column_gap=%d "
+        L"gap_after_network=%d gap_after_system=%d gap_after_disk=%d offset_right=%d font_size=%d "
+        L"key_font_size=%d network_arrow_style=%ls network_arrow_font_size=%d network_arrow_gap=%d "
+        L"show_key_widget=%d",
+        event_name,
+        path.c_str(),
+        attributes != INVALID_FILE_ATTRIBUTES ? 1 : 0,
+        g_app.config.debug_log ? 1 : 0,
+        g_app.config.log_level.c_str(),
+        g_app.config.content_padding_x_dip,
+        g_app.config.column_gap_dip,
+        g_app.config.gap_after_network_dip,
+        g_app.config.gap_after_system_dip,
+        g_app.config.gap_after_disk_dip,
+        g_app.config.offset_right_dip,
+        g_app.config.font_size_dip,
+        g_app.config.key_font_size_dip,
+        g_app.config.network_arrow_style.c_str(),
+        g_app.config.network_arrow_font_size_dip,
+        g_app.config.network_arrow_gap_dip,
+        g_app.config.show_key_widget ? 1 : 0);
 }
 
 // Startup integration.
@@ -317,10 +387,14 @@ bool IsStartupEnabled() {
     return simple_monitor::IsStartupEnabled(kRunValue);
 }
 
-void SetStartupEnabled(bool enabled) {
-    if (!simple_monitor::SetStartupEnabled(kRunValue, enabled)) {
+bool SetStartupEnabled(bool enabled) {
+    const bool succeeded = simple_monitor::SetStartupEnabled(kRunValue, enabled);
+    if (!succeeded) {
         LogError(L"event=startup_setting_failed enabled=%d", enabled ? 1 : 0);
+        return false;
     }
+    LogInfo(L"event=startup_setting_changed enabled=%d result=ok", enabled ? 1 : 0);
+    return true;
 }
 
 // Foreground, fullscreen, and suppression detection.
@@ -472,23 +546,13 @@ bool IsEligibleFullscreenAppWindow(HWND hwnd) {
            !IsIconic(hwnd);
 }
 
-bool IsFullscreenForegroundWindow() {
-    HWND foreground = GetForegroundWindow();
-    if (IsIgnoredShellWindow(foreground)) {
-        return false;
-    }
-
-    HWND root = GetAncestor(foreground, GA_ROOT);
-    if (!IsEligibleFullscreenAppWindow(root)) {
-        return false;
-    }
-
+bool WindowCoversMonitor(HWND window) {
     RECT window_rect{};
-    if (!GetWindowRect(root, &window_rect)) {
+    if (!GetWindowRect(window, &window_rect)) {
         return false;
     }
 
-    HMONITOR monitor = MonitorFromWindow(root, MONITOR_DEFAULTTONEAREST);
+    HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
     if (!monitor) {
         return false;
     }
@@ -499,11 +563,39 @@ bool IsFullscreenForegroundWindow() {
         return false;
     }
 
-    const int tolerance = Scale(2, WindowDpi(g_app.window.hwnd ? g_app.window.hwnd : root));
+    const int tolerance = Scale(2, WindowDpi(g_app.window.hwnd ? g_app.window.hwnd : window));
     return std::abs(window_rect.left - mi.rcMonitor.left) <= tolerance &&
            std::abs(window_rect.top - mi.rcMonitor.top) <= tolerance &&
            std::abs(window_rect.right - mi.rcMonitor.right) <= tolerance &&
            std::abs(window_rect.bottom - mi.rcMonitor.bottom) <= tolerance;
+}
+
+bool IsFullscreenForegroundWindow() {
+    HWND foreground = GetForegroundWindow();
+    if (IsIgnoredShellWindow(foreground)) {
+        return false;
+    }
+
+    DWORD foreground_process_id = 0;
+    GetWindowThreadProcessId(foreground, &foreground_process_id);
+    HWND candidate = GetAncestor(foreground, GA_ROOT);
+    for (unsigned depth = 0; candidate && depth < 8; ++depth) {
+        DWORD candidate_process_id = 0;
+        GetWindowThreadProcessId(candidate, &candidate_process_id);
+        if (candidate_process_id == foreground_process_id &&
+            IsEligibleFullscreenAppWindow(candidate) &&
+            WindowCoversMonitor(candidate)) {
+            return true;
+        }
+
+        HWND owner = GetWindow(candidate, GW_OWNER);
+        HWND next = owner ? GetAncestor(owner, GA_ROOT) : nullptr;
+        if (next == candidate) {
+            break;
+        }
+        candidate = next;
+    }
+    return false;
 }
 
 bool StartupWarmupActive() {
@@ -524,8 +616,8 @@ const wchar_t* OverlaySuppressionReason() {
     return nullptr;
 }
 
-void LogFullscreenSuppressionContext() {
-    if (!g_app.config.debug_log) {
+void LogFullscreenSuppressionContext(const wchar_t* transition) {
+    if (!simple_monitor::IsLogEnabled(simple_monitor::LogLevel::Info)) {
         return;
     }
 
@@ -553,8 +645,9 @@ void LogFullscreenSuppressionContext() {
     const std::wstring root_class = WindowClassName(root);
 
     LogInfo(
-        L"event=fullscreen_context foreground_hwnd=%p foreground_exe=%ls foreground_class=%ls foreground_rect=(%ld,%ld,%ld,%ld) "
+        L"event=fullscreen_context transition=%ls foreground_hwnd=%p foreground_exe=%ls foreground_class=%ls foreground_rect=(%ld,%ld,%ld,%ld) "
         L"root_hwnd=%p root_exe=%ls root_class=%ls root_rect=(%ld,%ld,%ld,%ld) monitor_rect=(%ld,%ld,%ld,%ld)",
+        transition,
         foreground,
         foreground_exe.c_str(),
         foreground_class.c_str(),
@@ -874,7 +967,21 @@ void UpdateLayeredStyle(HWND hwnd) {
     } else {
         ex_style &= ~WS_EX_TRANSPARENT;
     }
-    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style);
+    SetLastError(ERROR_SUCCESS);
+    const LONG_PTR previous_style = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style);
+    const DWORD error = previous_style == 0 ? GetLastError() : ERROR_SUCCESS;
+    if (previous_style == 0 && error != ERROR_SUCCESS) {
+        LogErrorRateLimited(
+            L"overlay.update_style",
+            kFailureLogIntervalMs,
+            L"event=overlay_style_failed stage=click_through error=%lu requested=0x%llx",
+            error,
+            static_cast<unsigned long long>(ex_style));
+    } else {
+        LogFailureRecovered(
+            L"overlay.update_style",
+            L"event=component_recovered component=overlay_style stage=click_through");
+    }
 }
 
 void KeepOverlayOnTop() {
@@ -894,7 +1001,7 @@ void KeepOverlayOnTop() {
         ShowWindow(g_app.window.hwnd, SW_SHOWNOACTIVATE);
     }
 
-    SetWindowPos(
+    const BOOL positioned = SetWindowPos(
         g_app.window.hwnd,
         HWND_TOPMOST,
         0,
@@ -902,12 +1009,77 @@ void KeepOverlayOnTop() {
         0,
         0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    const DWORD position_error = positioned ? ERROR_SUCCESS : GetLastError();
     g_app.placement.maintaining_z_order = false;
+    if (!positioned) {
+        LogErrorRateLimited(
+            L"z_order.keep_topmost",
+            kFailureLogIntervalMs,
+            L"event=z_order_failed stage=set_window_pos error=%lu",
+            position_error);
+    } else {
+        LogFailureRecovered(
+            L"z_order.keep_topmost",
+            L"event=component_recovered component=z_order stage=set_window_pos");
+    }
+}
+
+const wchar_t* TimerFailureKey(UINT_PTR timer_id) {
+    switch (timer_id) {
+    case kRefreshTimer:
+        return L"timer_install_refresh";
+    case kPlacementTimer:
+        return L"timer_install_placement";
+    case kStateTimer:
+        return L"timer_install_state";
+    case kZOrderBurstTimer:
+        return L"timer_install_z_order_burst";
+    case kStartupInitTimer:
+        return L"timer_install_startup_init";
+    default:
+        return L"timer_install_other";
+    }
+}
+
+bool InstallTimer(
+    HWND hwnd,
+    UINT_PTR timer_id,
+    UINT interval_ms,
+    const wchar_t* timer_name) {
+    const wchar_t* failure_key = TimerFailureKey(timer_id);
+    DWORD error = ERROR_INVALID_WINDOW_HANDLE;
+    bool error_available = !hwnd;
+    if (hwnd) {
+        SetLastError(ERROR_SUCCESS);
+        if (SetTimer(hwnd, timer_id, interval_ms, nullptr) != 0) {
+            LogFailureRecovered(
+                failure_key,
+                L"event=timer_install_recovered timer=%ls id=%llu interval_ms=%u",
+                timer_name,
+                static_cast<unsigned long long>(timer_id),
+                interval_ms);
+            return true;
+        }
+        error = GetLastError();
+        error_available = error != ERROR_SUCCESS;
+    }
+
+    LogErrorRateLimited(
+        failure_key,
+        kFailureLogIntervalMs,
+        L"event=timer_install_failed timer=%ls id=%llu interval_ms=%u "
+        L"error=%lu error_available=%d",
+        timer_name,
+        static_cast<unsigned long long>(timer_id),
+        interval_ms,
+        error,
+        error_available ? 1 : 0);
+    return false;
 }
 
 void StartZOrderBurst(HWND hwnd) {
     g_app.placement.z_order_burst_until = GetTickCount() + kZOrderBurstDurationMs;
-    SetTimer(hwnd, kZOrderBurstTimer, kZOrderBurstIntervalMs, nullptr);
+    InstallTimer(hwnd, kZOrderBurstTimer, kZOrderBurstIntervalMs, L"z_order_burst");
 }
 
 void CALLBACK TrayEventProc(
@@ -920,7 +1092,17 @@ void CALLBACK TrayEventProc(
     DWORD) {
     if (event == EVENT_SYSTEM_FOREGROUND) {
         if (g_app.window.hwnd && IsWindow(g_app.window.hwnd) && hwnd != g_app.window.hwnd) {
-            PostMessageW(g_app.window.hwnd, WM_FOREGROUND_CHANGED, event, reinterpret_cast<LPARAM>(hwnd));
+            if (!PostMessageW(g_app.window.hwnd, WM_FOREGROUND_CHANGED, event, reinterpret_cast<LPARAM>(hwnd))) {
+                LogWarningRateLimited(
+                    L"shell.post_foreground",
+                    kFailureLogIntervalMs,
+                    L"event=shell_message_failed message=foreground error=%lu",
+                    GetLastError());
+            } else {
+                LogFailureRecovered(
+                    L"shell.post_foreground",
+                    L"event=component_recovered component=shell_message message=foreground");
+            }
         }
         return;
     }
@@ -934,7 +1116,19 @@ void CALLBACK TrayEventProc(
     }
 
     if (InterlockedCompareExchange(&g_app.placement.tray_layout_update_pending, 1, 0) == 0) {
-        PostMessageW(g_app.window.hwnd, WM_TRAY_LAYOUT_CHANGED, 0, 0);
+        if (!PostMessageW(g_app.window.hwnd, WM_TRAY_LAYOUT_CHANGED, 0, 0)) {
+            const DWORD error = GetLastError();
+            InterlockedExchange(&g_app.placement.tray_layout_update_pending, 0);
+            LogWarningRateLimited(
+                L"shell.post_tray_layout",
+                kFailureLogIntervalMs,
+                L"event=shell_message_failed message=tray_layout error=%lu",
+                error);
+        } else {
+            LogFailureRecovered(
+                L"shell.post_tray_layout",
+                L"event=component_recovered component=shell_message message=tray_layout");
+        }
     }
 }
 
@@ -948,16 +1142,33 @@ void RegisterTrayEventHooks() {
         EVENT_SYSTEM_FOREGROUND,
     };
 
+    size_t installed = 0;
     for (DWORD event : events) {
         if (HWINEVENTHOOK hook = SetWinEventHook(event, event, nullptr, TrayEventProc, 0, 0, flags)) {
             g_app.tray.event_hooks.push_back(hook);
+            ++installed;
+        } else {
+            LogWarning(L"event=win_event_hook_failed event_id=%lu", event);
         }
     }
+    LogInfo(
+        L"event=win_event_hooks_registered installed=%llu expected=%llu",
+        static_cast<unsigned long long>(installed),
+        static_cast<unsigned long long>(ARRAYSIZE(events)));
 }
 
 void UnregisterTrayEventHooks() {
+    size_t failed = 0;
     for (HWINEVENTHOOK hook : g_app.tray.event_hooks) {
-        UnhookWinEvent(hook);
+        if (!UnhookWinEvent(hook)) {
+            ++failed;
+        }
+    }
+    if (failed > 0) {
+        LogWarning(
+            L"event=win_event_hook_cleanup_failed failed=%llu total=%llu",
+            static_cast<unsigned long long>(failed),
+            static_cast<unsigned long long>(g_app.tray.event_hooks.size()));
     }
     g_app.tray.event_hooks.clear();
 }
@@ -980,9 +1191,12 @@ void AttachToTaskbarOwner(HWND hwnd) {
     g_app.placement.taskbar_owner = taskbar;
 }
 
-void SetPlacementTimer(HWND hwnd, UINT interval_ms, bool fast) {
-    SetTimer(hwnd, kPlacementTimer, interval_ms, nullptr);
-    g_app.placement.timer_fast = fast;
+bool SetPlacementTimer(HWND hwnd, UINT interval_ms, bool fast) {
+    if (InstallTimer(hwnd, kPlacementTimer, interval_ms, L"placement")) {
+        g_app.placement.timer_fast = fast;
+        return true;
+    }
+    return false;
 }
 
 void RestorePlacementTimer(HWND hwnd) {
@@ -1260,7 +1474,7 @@ void RepositionWindow() {
         y = taskbar.bottom - height - Scale(8, g_app.window.dpi);
     }
 
-    SetWindowPos(
+    const BOOL positioned = SetWindowPos(
         g_app.window.hwnd,
         HWND_TOPMOST,
         x,
@@ -1268,18 +1482,52 @@ void RepositionWindow() {
         width,
         height,
         SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    const DWORD position_error = positioned ? ERROR_SUCCESS : GetLastError();
+    if (positioned) {
+        LogFailureRecovered(
+            L"reposition.set_window_pos",
+            L"event=component_recovered component=reposition stage=set_window_pos");
+    } else {
+        LogErrorRateLimited(
+            L"reposition.set_window_pos",
+            kFailureLogIntervalMs,
+            L"event=placement_failed stage=set_window_pos error=%lu requested=(%d,%d,%d,%d)",
+            position_error,
+            x,
+            y,
+            x + width,
+            y + height);
+    }
     KeepOverlayOnTop();
 
-    RECT overlay_rect{x, y, x + width, y + height};
+    const RECT requested_rect{x, y, x + width, y + height};
+    RECT overlay_rect{};
+    const bool actual_known = GetWindowRect(g_app.window.hwnd, &overlay_rect) != FALSE;
+    if (!actual_known) {
+        LogWarningRateLimited(
+            L"reposition.get_window_rect",
+            kFailureLogIntervalMs,
+            L"event=placement_probe_failed stage=get_window_rect error=%lu",
+            GetLastError());
+    } else {
+        LogFailureRecovered(
+            L"reposition.get_window_rect",
+            L"event=component_recovered component=reposition stage=get_window_rect");
+    }
     const bool taskbar_changed = !g_app.placement.has_last_logged_taskbar_rect || !RectEquals(taskbar, g_app.placement.last_logged_taskbar_rect);
     const bool anchor_changed =
         anchor_mode != g_app.placement.last_logged_anchor_mode ||
         (anchor_mode == 0 ? g_app.placement.has_last_logged_anchor_rect :
                             !g_app.placement.has_last_logged_anchor_rect || !RectEquals(anchor_rect, g_app.placement.last_logged_anchor_rect));
-    const bool overlay_changed = !g_app.placement.has_last_logged_overlay_rect || !RectEquals(overlay_rect, g_app.placement.last_logged_overlay_rect);
-    if (taskbar_changed || anchor_changed || overlay_changed) {
+    const bool overlay_changed =
+        actual_known &&
+        (!g_app.placement.has_last_logged_overlay_rect ||
+         !RectEquals(overlay_rect, g_app.placement.last_logged_overlay_rect));
+    if (actual_known && (taskbar_changed || anchor_changed || overlay_changed)) {
         LogInfo(
-            L"event=placement taskbar=(%ld,%ld,%ld,%ld) anchor_mode=%d anchor=(%ld,%ld,%ld,%ld) overlay=(%ld,%ld,%ld,%ld)",
+            L"event=placement result=%ls actual_known=1 taskbar=(%ld,%ld,%ld,%ld) anchor_mode=%d "
+            L"anchor=(%ld,%ld,%ld,%ld) requested=(%ld,%ld,%ld,%ld) actual=(%ld,%ld,%ld,%ld)",
+            positioned ? L"ok" : L"failed",
             taskbar.left,
             taskbar.top,
             taskbar.right,
@@ -1289,6 +1537,10 @@ void RepositionWindow() {
             anchor_rect.top,
             anchor_rect.right,
             anchor_rect.bottom,
+            requested_rect.left,
+            requested_rect.top,
+            requested_rect.right,
+            requested_rect.bottom,
             overlay_rect.left,
             overlay_rect.top,
             overlay_rect.right,
@@ -1336,10 +1588,29 @@ void AddTrayIcon(HWND hwnd) {
     nid.uCallbackMessage = WM_TRAYICON;
     nid.hIcon = LoadAppIcon(g_app.window.instance, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
     std::wcsncpy(nid.szTip, L"Simple Monitor", ARRAYSIZE(nid.szTip) - 1);
-    Shell_NotifyIconW(NIM_ADD, &nid);
+    if (!Shell_NotifyIconW(NIM_ADD, &nid)) {
+        LogWarningRateLimited(
+            L"tray.add",
+            kFailureLogIntervalMs,
+            L"event=tray_icon_failed operation=add taskbar=%p",
+            TaskbarWindow());
+        return;
+    }
+    LogFailureRecovered(
+        L"tray.add",
+        L"event=component_recovered component=tray_icon operation=add");
 
     nid.uVersion = NOTIFYICON_VERSION;
-    Shell_NotifyIconW(NIM_SETVERSION, &nid);
+    if (!Shell_NotifyIconW(NIM_SETVERSION, &nid)) {
+        LogWarningRateLimited(
+            L"tray.set_version",
+            kFailureLogIntervalMs,
+            L"event=tray_icon_failed operation=set_version");
+    } else {
+        LogFailureRecovered(
+            L"tray.set_version",
+            L"event=component_recovered component=tray_icon operation=set_version");
+    }
 }
 
 void RemoveTrayIcon(HWND hwnd) {
@@ -1347,12 +1618,24 @@ void RemoveTrayIcon(HWND hwnd) {
     nid.cbSize = sizeof(nid);
     nid.hWnd = hwnd;
     nid.uID = kTrayIconId;
-    Shell_NotifyIconW(NIM_DELETE, &nid);
+    if (!Shell_NotifyIconW(NIM_DELETE, &nid)) {
+        LogDebug(L"event=tray_icon_remove_skipped result=not_found_or_shell_unavailable");
+    }
 }
 
 void ReloadConfigAndRefresh(HWND hwnd) {
-    LoadAppConfig();
-    LogInfo(L"event=config_reloaded debug_log=%d", g_app.config.debug_log ? 1 : 0);
+    LogInfo(L"event=config_reload_requested");
+    const simple_monitor::Config previous_config = g_app.config;
+    const simple_monitor::Config next_config = simple_monitor::LoadConfig();
+    LogLoggingConfigChange(previous_config, next_config);
+    if (previous_config.debug_log && !next_config.debug_log) {
+        simple_monitor::FlushLogSummaries();
+    }
+    ApplyAppConfig(next_config);
+    if (!previous_config.debug_log && next_config.debug_log) {
+        simple_monitor::ResetLog();
+    }
+    LogConfigSnapshot(L"config_reloaded");
     if (UpdateOverlaySuppression(hwnd)) {
         return;
     }
@@ -1385,9 +1668,25 @@ void RecoverTaskbar(HWND hwnd) {
 
 bool HandleMenuCommand(HWND hwnd, UINT command) {
     switch (command) {
-    case ID_OPEN_CONFIG:
-        ShellExecuteW(hwnd, L"open", ConfigPath().c_str(), nullptr, ModuleDir().c_str(), SW_SHOWNORMAL);
+    case ID_OPEN_CONFIG: {
+        const std::wstring config_path = ConfigPath();
+        const std::wstring module_dir = ModuleDir();
+        const INT_PTR shell_result = reinterpret_cast<INT_PTR>(ShellExecuteW(
+            hwnd,
+            L"open",
+            config_path.c_str(),
+            nullptr,
+            module_dir.c_str(),
+            SW_SHOWNORMAL));
+        if (shell_result > 32) {
+            LogInfo(L"event=user_action action=open_config result=ok");
+        } else {
+            LogError(
+                L"event=user_action action=open_config result=failed shell_result=%lld",
+                static_cast<long long>(shell_result));
+        }
         return true;
+    }
     case ID_RELOAD_CONFIG:
         ReloadConfigAndRefresh(hwnd);
         return true;
@@ -1397,12 +1696,36 @@ bool HandleMenuCommand(HWND hwnd, UINT command) {
     case ID_CLICK_THROUGH:
         g_app.tray.click_through = !g_app.tray.click_through;
         UpdateLayeredStyle(hwnd);
+        if (((GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TRANSPARENT) != 0) ==
+            g_app.tray.click_through) {
+            LogInfo(
+                L"event=user_action action=click_through result=ok enabled=%d",
+                g_app.tray.click_through ? 1 : 0);
+        } else {
+            LogError(
+                L"event=user_action action=click_through result=failed requested_enabled=%d",
+                g_app.tray.click_through ? 1 : 0);
+        }
         return true;
-    case ID_STARTUP:
-        SetStartupEnabled(!IsStartupEnabled());
+    case ID_STARTUP: {
+        const bool requested = !IsStartupEnabled();
+        const bool succeeded = SetStartupEnabled(requested);
+        LogInfo(
+            L"event=user_action action=startup requested=%d result=%ls effective=%d",
+            requested ? 1 : 0,
+            succeeded ? L"ok" : L"failed",
+            IsStartupEnabled() ? 1 : 0);
         return true;
+    }
     case ID_EXIT:
-        DestroyWindow(hwnd);
+        g_app.window.shutdown_trigger = L"user_menu";
+        LogInfo(L"event=user_action action=exit result=requested");
+        if (!DestroyWindow(hwnd)) {
+            g_app.window.shutdown_trigger = L"window_destroy";
+            LogError(
+                L"event=user_action action=exit result=failed error=%lu",
+                GetLastError());
+        }
         return true;
     }
     return false;
@@ -1447,6 +1770,26 @@ void ShowTrayMenu(HWND hwnd) {
 }
 
 // DirectWrite/Direct2D text layout and rendering helpers.
+void LogRenderHresultStage(
+    const wchar_t* failure_key,
+    const wchar_t* stage,
+    HRESULT result) {
+    if (FAILED(result)) {
+        LogErrorRateLimited(
+            failure_key,
+            kFailureLogIntervalMs,
+            L"event=render_failed stage=%ls hresult=0x%08lx",
+            stage,
+            static_cast<unsigned long>(result));
+        return;
+    }
+
+    LogFailureRecovered(
+        failure_key,
+        L"event=component_recovered component=render stage=%ls",
+        stage);
+}
+
 HRESULT EnsureRenderResources() {
     RenderResources& render = g_app.render.resources;
     HRESULT hr = S_OK;
@@ -1454,6 +1797,7 @@ HRESULT EnsureRenderResources() {
 
     if (!render.d2d_factory) {
         hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &render.d2d_factory);
+        LogRenderHresultStage(L"render.d2d_factory", L"create_d2d_factory", hr);
         if (FAILED(hr)) {
             return hr;
         }
@@ -1462,6 +1806,7 @@ HRESULT EnsureRenderResources() {
     if (!render.dwrite_factory) {
         IUnknown* factory = nullptr;
         hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), &factory);
+        LogRenderHresultStage(L"render.dwrite_factory", L"create_dwrite_factory", hr);
         if (FAILED(hr)) {
             return hr;
         }
@@ -1475,6 +1820,7 @@ HRESULT EnsureRenderResources() {
             CLSCTX_INPROC_SERVER,
             __uuidof(IWICImagingFactory),
             reinterpret_cast<void**>(&render.wic_factory));
+        LogRenderHresultStage(L"render.wic_factory", L"create_wic_factory", hr);
         if (FAILED(hr)) {
             return hr;
         }
@@ -1493,12 +1839,31 @@ HRESULT EnsureRenderResources() {
             static_cast<FLOAT>(Scale(g_app.config.font_size_dip, g_app.window.dpi)),
             L"",
             &render.text_format);
+        LogRenderHresultStage(L"render.text_format", L"create_text_format", hr);
         if (FAILED(hr)) {
             return hr;
         }
 
-        render.text_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        render.text_format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        const HRESULT alignment_result =
+            render.text_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        LogRenderHresultStage(
+            L"render.text_format_alignment",
+            L"configure_text_format_alignment",
+            alignment_result);
+        if (FAILED(alignment_result)) {
+            SafeRelease(render.text_format);
+            return alignment_result;
+        }
+        const HRESULT wrapping_result =
+            render.text_format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        LogRenderHresultStage(
+            L"render.text_format_wrapping",
+            L"configure_text_format_wrapping",
+            wrapping_result);
+        if (FAILED(wrapping_result)) {
+            SafeRelease(render.text_format);
+            return wrapping_result;
+        }
         render.text_format_font_size_dip = g_app.config.font_size_dip;
     }
 
@@ -1515,12 +1880,31 @@ HRESULT EnsureRenderResources() {
             static_cast<FLOAT>(Scale(g_app.config.network_arrow_font_size_dip, g_app.window.dpi)),
             L"",
             &render.arrow_text_format);
+        LogRenderHresultStage(L"render.arrow_text_format", L"create_arrow_text_format", hr);
         if (FAILED(hr)) {
             return hr;
         }
 
-        render.arrow_text_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        render.arrow_text_format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        const HRESULT alignment_result =
+            render.arrow_text_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        LogRenderHresultStage(
+            L"render.arrow_text_format_alignment",
+            L"configure_arrow_text_format_alignment",
+            alignment_result);
+        if (FAILED(alignment_result)) {
+            SafeRelease(render.arrow_text_format);
+            return alignment_result;
+        }
+        const HRESULT wrapping_result =
+            render.arrow_text_format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        LogRenderHresultStage(
+            L"render.arrow_text_format_wrapping",
+            L"configure_arrow_text_format_wrapping",
+            wrapping_result);
+        if (FAILED(wrapping_result)) {
+            SafeRelease(render.arrow_text_format);
+            return wrapping_result;
+        }
         render.arrow_text_format_font_size_dip = g_app.config.network_arrow_font_size_dip;
     }
 
@@ -1537,12 +1921,31 @@ HRESULT EnsureRenderResources() {
             static_cast<FLOAT>(Scale(g_app.config.key_font_size_dip, g_app.window.dpi)),
             L"",
             &render.key_text_format);
+        LogRenderHresultStage(L"render.key_text_format", L"create_key_text_format", hr);
         if (FAILED(hr)) {
             return hr;
         }
 
-        render.key_text_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        render.key_text_format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        const HRESULT alignment_result =
+            render.key_text_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        LogRenderHresultStage(
+            L"render.key_text_format_alignment",
+            L"configure_key_text_format_alignment",
+            alignment_result);
+        if (FAILED(alignment_result)) {
+            SafeRelease(render.key_text_format);
+            return alignment_result;
+        }
+        const HRESULT wrapping_result =
+            render.key_text_format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        LogRenderHresultStage(
+            L"render.key_text_format_wrapping",
+            L"configure_key_text_format_wrapping",
+            wrapping_result);
+        if (FAILED(wrapping_result)) {
+            SafeRelease(render.key_text_format);
+            return wrapping_result;
+        }
         render.key_text_format_font_size_dip = g_app.config.key_font_size_dip;
     }
 
@@ -1809,14 +2212,36 @@ void DrawAdaptiveColumnsDwrite(
 // Layered-window presentation and overlay frame lifecycle.
 bool PresentPixels(HWND hwnd, const BYTE* source_pixels, int width, int height) {
     RECT window_rect{};
-    if (!GetWindowRect(hwnd, &window_rect) || width <= 0 || height <= 0 || !source_pixels) {
-        LogError(L"event=present_failed stage=validate error=%lu width=%d height=%d", GetLastError(), width, height);
+    SetLastError(ERROR_SUCCESS);
+    if (!GetWindowRect(hwnd, &window_rect)) {
+        const DWORD error = GetLastError();
+        LogErrorRateLimited(
+            L"present.get_window_rect",
+            kFailureLogIntervalMs,
+            L"event=present_failed stage=get_window_rect error=%lu error_available=%d width=%d height=%d",
+            error,
+            error != ERROR_SUCCESS ? 1 : 0,
+            width,
+            height);
+        return false;
+    }
+    if (width <= 0 || height <= 0 || !source_pixels) {
+        LogErrorRateLimited(
+            L"present.invalid_input",
+            kFailureLogIntervalMs,
+            L"event=present_failed stage=validate error=%lu width=%d height=%d",
+            static_cast<unsigned long>(ERROR_INVALID_PARAMETER),
+            width,
+            height);
         return false;
     }
 
     HDC screen_dc = GetDC(nullptr);
     if (!screen_dc) {
-        LogError(L"event=present_failed stage=get_screen_dc error=%lu", GetLastError());
+        LogErrorRateLimited(
+            L"present.get_screen_dc",
+            kFailureLogIntervalMs,
+            L"event=present_failed stage=get_screen_dc");
         return false;
     }
 
@@ -1830,17 +2255,29 @@ bool PresentPixels(HWND hwnd, const BYTE* source_pixels, int width, int height) 
 
     void* pixels = nullptr;
     HDC mem_dc = CreateCompatibleDC(screen_dc);
+    if (!mem_dc) {
+        ReleaseDC(nullptr, screen_dc);
+        LogErrorRateLimited(
+            L"present.create_memory_dc",
+            kFailureLogIntervalMs,
+            L"event=present_failed stage=create_memory_dc");
+        return false;
+    }
+    SetLastError(ERROR_SUCCESS);
     HBITMAP bitmap = CreateDIBSection(screen_dc, &bmi, DIB_RGB_COLORS, &pixels, nullptr, 0);
-    if (!mem_dc || !bitmap || !pixels) {
+    if (!bitmap || !pixels) {
         const DWORD error = GetLastError();
         if (bitmap) {
             DeleteObject(bitmap);
         }
-        if (mem_dc) {
-            DeleteDC(mem_dc);
-        }
+        DeleteDC(mem_dc);
         ReleaseDC(nullptr, screen_dc);
-        LogError(L"event=present_failed stage=create_bitmap error=%lu", error);
+        LogErrorRateLimited(
+            L"present.create_bitmap",
+            kFailureLogIntervalMs,
+            L"event=present_failed stage=create_bitmap error=%lu error_available=%d",
+            error,
+            error != ERROR_SUCCESS ? 1 : 0);
         return false;
     }
 
@@ -1854,6 +2291,7 @@ bool PresentPixels(HWND hwnd, const BYTE* source_pixels, int width, int height) 
     blend.BlendOp = AC_SRC_OVER;
     blend.SourceConstantAlpha = 255;
     blend.AlphaFormat = AC_SRC_ALPHA;
+    SetLastError(ERROR_SUCCESS);
     const BOOL updated = UpdateLayeredWindow(hwnd, screen_dc, &dst, &size, mem_dc, &src, 0, &blend, ULW_ALPHA);
     const DWORD update_error = updated ? ERROR_SUCCESS : GetLastError();
 
@@ -1862,7 +2300,28 @@ bool PresentPixels(HWND hwnd, const BYTE* source_pixels, int width, int height) 
     DeleteDC(mem_dc);
     ReleaseDC(nullptr, screen_dc);
     if (!updated) {
-        LogError(L"event=present_failed stage=update_layered_window error=%lu width=%d height=%d", update_error, width, height);
+        LogErrorRateLimited(
+            L"present.update_layered_window",
+            kFailureLogIntervalMs,
+            L"event=present_failed stage=update_layered_window error=%lu error_available=%d width=%d height=%d",
+            update_error,
+            update_error != ERROR_SUCCESS ? 1 : 0,
+            width,
+            height);
+    } else {
+        const wchar_t* keys[] = {
+            L"present.get_window_rect",
+            L"present.invalid_input",
+            L"present.get_screen_dc",
+            L"present.create_memory_dc",
+            L"present.create_bitmap",
+            L"present.update_layered_window",
+        };
+        for (const wchar_t* key : keys) {
+            LogFailureRecovered(
+                key,
+                L"event=component_recovered component=present");
+        }
     }
     return updated != FALSE;
 }
@@ -1876,9 +2335,28 @@ bool ReapplyLastFrame(HWND hwnd) {
 
 void ResetLayeredSurface(HWND hwnd) {
     const LONG_PTR ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style & ~WS_EX_LAYERED);
-    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style);
-    SetWindowPos(
+    SetLastError(ERROR_SUCCESS);
+    const LONG_PTR clear_result =
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style & ~WS_EX_LAYERED);
+    DWORD style_error = clear_result == 0 ? GetLastError() : ERROR_SUCCESS;
+    SetLastError(ERROR_SUCCESS);
+    const LONG_PTR restore_result = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style);
+    if (restore_result == 0 && GetLastError() != ERROR_SUCCESS) {
+        style_error = GetLastError();
+    }
+    if (style_error != ERROR_SUCCESS) {
+        LogErrorRateLimited(
+            L"overlay.reset_layered_style",
+            kFailureLogIntervalMs,
+            L"event=overlay_surface_reset_failed stage=style error=%lu",
+            style_error);
+    } else {
+        LogFailureRecovered(
+            L"overlay.reset_layered_style",
+            L"event=component_recovered component=overlay_surface stage=style");
+    }
+
+    const BOOL positioned = SetWindowPos(
         hwnd,
         HWND_TOPMOST,
         0,
@@ -1886,6 +2364,18 @@ void ResetLayeredSurface(HWND hwnd) {
         0,
         0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    const DWORD position_error = positioned ? ERROR_SUCCESS : GetLastError();
+    if (!positioned) {
+        LogErrorRateLimited(
+            L"overlay.reset_layered_position",
+            kFailureLogIntervalMs,
+            L"event=overlay_surface_reset_failed stage=set_window_pos error=%lu",
+            position_error);
+    } else {
+        LogFailureRecovered(
+            L"overlay.reset_layered_position",
+            L"event=component_recovered component=overlay_surface stage=set_window_pos");
+    }
     ReapplyLastFrame(hwnd);
 }
 
@@ -1896,7 +2386,7 @@ bool UpdateOverlaySuppression(HWND hwnd) {
         if (!g_app.suppression.overlay_suppressed) {
             LogInfo(L"event=suppression_on reason=%ls", reason);
             if (std::wcscmp(reason, L"fullscreen_window") == 0) {
-                LogFullscreenSuppressionContext();
+                LogFullscreenSuppressionContext(L"enter");
             }
         }
         g_app.suppression.overlay_suppressed = true;
@@ -1910,6 +2400,7 @@ bool UpdateOverlaySuppression(HWND hwnd) {
     if (g_app.suppression.overlay_suppressed) {
         g_app.suppression.overlay_suppressed = false;
         LogInfo(L"event=suppression_off");
+        LogFullscreenSuppressionContext(L"exit");
         RestorePlacementTimer(hwnd);
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         RepositionWindow();
@@ -1962,12 +2453,37 @@ bool HandleOverlayStateGuards(HWND hwnd) {
 
 void RenderOverlay(HWND hwnd) {
     RECT client{};
-    GetClientRect(hwnd, &client);
+    SetLastError(ERROR_SUCCESS);
+    if (!GetClientRect(hwnd, &client)) {
+        const DWORD error = GetLastError();
+        LogErrorRateLimited(
+            L"render.get_client_rect",
+            kFailureLogIntervalMs,
+            L"event=render_failed stage=get_client_rect error=%lu error_available=%d",
+            error,
+            error != ERROR_SUCCESS ? 1 : 0);
+        return;
+    }
+    LogFailureRecovered(
+        L"render.get_client_rect",
+        L"event=render_recovered stage=get_client_rect");
+
     const int width = client.right - client.left;
     const int height = client.bottom - client.top;
     if (width <= 0 || height <= 0) {
+        LogWarningRateLimited(
+            L"render.invalid_client_size",
+            kFailureLogIntervalMs,
+            L"event=render_skipped stage=validate_client_size width=%d height=%d",
+            width,
+            height);
         return;
     }
+    LogFailureRecovered(
+        L"render.invalid_client_size",
+        L"event=render_recovered stage=validate_client_size width=%d height=%d",
+        width,
+        height);
 
     if (FAILED(EnsureRenderResources())) {
         return;
@@ -1983,6 +2499,7 @@ void RenderOverlay(HWND hwnd) {
         GUID_WICPixelFormat32bppPBGRA,
         WICBitmapCacheOnLoad,
         &wic_bitmap);
+    LogRenderHresultStage(L"render.create_bitmap", L"create_wic_bitmap", hr);
     if (SUCCEEDED(hr)) {
         D2D1_RENDER_TARGET_PROPERTIES props{};
         props.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
@@ -1994,11 +2511,16 @@ void RenderOverlay(HWND hwnd) {
         props.minLevel = D2D1_FEATURE_LEVEL_DEFAULT;
 
         hr = g_app.render.resources.d2d_factory->CreateWicBitmapRenderTarget(wic_bitmap, &props, &target);
+        LogRenderHresultStage(
+            L"render.create_target",
+            L"create_wic_bitmap_render_target",
+            hr);
     }
     if (SUCCEEDED(hr)) {
         target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         D2D1_COLOR_F color{1.0f, 1.0f, 1.0f, 1.0f};
         hr = target->CreateSolidColorBrush(color, &brush);
+        LogRenderHresultStage(L"render.create_brush", L"create_solid_color_brush", hr);
     }
 
     const FLOAT pad_x = static_cast<FLOAT>(Scale(g_app.config.content_padding_x_dip, g_app.window.dpi));
@@ -2039,12 +2561,14 @@ void RenderOverlay(HWND hwnd) {
             content,
             columns);
         hr = target->EndDraw();
+        LogRenderHresultStage(L"render.end_draw", L"end_draw", hr);
     }
 
     if (SUCCEEDED(hr)) {
         WICRect rect{0, 0, width, height};
         std::vector<BYTE> frame(static_cast<size_t>(width) * height * 4);
         hr = wic_bitmap->CopyPixels(&rect, width * 4, static_cast<UINT>(frame.size()), frame.data());
+        LogRenderHresultStage(L"render.copy_pixels", L"copy_pixels", hr);
         if (SUCCEEDED(hr)) {
             bool has_visible_pixels = false;
             for (size_t i = 3; i < frame.size(); i += 4) {
@@ -2054,7 +2578,19 @@ void RenderOverlay(HWND hwnd) {
                 }
             }
             if (!has_visible_pixels) {
-                LogWarning(L"event=render_empty_frame width=%d height=%d", width, height);
+                LogWarningRateLimited(
+                    L"render.empty_frame",
+                    kFailureLogIntervalMs,
+                    L"event=render_empty_frame width=%d height=%d dpi=%u",
+                    width,
+                    height,
+                    g_app.window.dpi);
+            } else {
+                LogFailureRecovered(
+                    L"render.empty_frame",
+                    L"event=render_pixels_recovered width=%d height=%d",
+                    width,
+                    height);
             }
         }
         if (SUCCEEDED(hr) && PresentPixels(hwnd, frame.data(), width, height)) {
@@ -2104,9 +2640,14 @@ void InitializeMonitor(HWND hwnd) {
     InitPdhGroup(g_app.metrics.gpu, L"\\GPU Engine(*)\\Utilization Percentage");
     InitPdhGroup(g_app.metrics.disk, L"\\PhysicalDisk(_Total)\\% Disk Time");
     SampleMetrics();
-    SetTimer(hwnd, kRefreshTimer, 1000, nullptr);
-    SetPlacementTimer(hwnd, kPlacementIntervalMs, false);
-    SetTimer(hwnd, kStateTimer, kStateIntervalMs, nullptr);
+    const bool refresh_timer = InstallTimer(hwnd, kRefreshTimer, 1000, L"refresh");
+    const bool placement_timer = SetPlacementTimer(hwnd, kPlacementIntervalMs, false);
+    const bool state_timer = InstallTimer(hwnd, kStateTimer, kStateIntervalMs, L"state");
+    LogInfo(
+        L"event=timers_initialized refresh=%d placement=%d state=%d",
+        refresh_timer ? 1 : 0,
+        placement_timer ? 1 : 0,
+        state_timer ? 1 : 0);
     if (UpdateOverlaySuppression(hwnd)) {
         return;
     }
@@ -2120,7 +2661,10 @@ LRESULT HandleCreate(HWND hwnd) {
     g_app.window.hwnd = hwnd;
     g_app.window.dpi = WindowDpi(hwnd);
     if (g_app.window.launched_at_startup) {
-        SetTimer(hwnd, kStartupInitTimer, kStartupInitDelayMs, nullptr);
+        if (!InstallTimer(hwnd, kStartupInitTimer, kStartupInitDelayMs, L"startup_init")) {
+            LogWarning(L"event=startup_delay_bypassed reason=timer_install_failed");
+            InitializeMonitor(hwnd);
+        }
     } else {
         InitializeMonitor(hwnd);
     }
@@ -2321,7 +2865,6 @@ LRESULT HandleTrayIcon(HWND hwnd, LPARAM lparam) {
 }
 
 LRESULT HandleDestroy(HWND hwnd) {
-    LogInfo(L"event=shutdown build=stable");
     KillTimer(hwnd, kRefreshTimer);
     KillTimer(hwnd, kPlacementTimer);
     KillTimer(hwnd, kStateTimer);
@@ -2336,6 +2879,10 @@ LRESULT HandleDestroy(HWND hwnd) {
         PdhCloseQuery(g_app.metrics.disk.query);
     }
     ReleaseRenderResources();
+    simple_monitor::FlushLogSummaries();
+    LogInfo(
+        L"event=shutdown build=stable trigger=%ls",
+        g_app.window.shutdown_trigger ? g_app.window.shutdown_trigger : L"unknown");
     PostQuitMessage(0);
     return 0;
 }
@@ -2404,12 +2951,20 @@ bool RegisterWindowClass(HINSTANCE instance) {
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = nullptr;
     wc.lpszClassName = kWindowClass;
-    return RegisterClassExW(&wc) != 0;
+    if (RegisterClassExW(&wc) == 0) {
+        LogError(
+            L"event=startup_component_failed component=window_class stage=overlay error=%lu",
+            GetLastError());
+        return false;
+    }
+    return true;
 }
 
 int Run(HINSTANCE instance) {
     g_app.window.instance = instance;
     g_app.window.taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
+    const DWORD taskbar_message_error =
+        g_app.window.taskbar_created == 0 ? GetLastError() : ERROR_SUCCESS;
     g_app.window.launched_at_startup = CommandLineHasFlag(L"--startup");
     EnableSystemMenuTheme();
     const HRESULT co_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -2417,7 +2972,24 @@ int Run(HINSTANCE instance) {
     LoadAppConfig();
     simple_monitor::ResetLog();
     g_app.suppression.startup_warmup_until = GetTickCount() + kStartupWarmupMs;
-    LogInfo(L"event=startup build=stable command_line=%ls warmup_ms=%lu", GetCommandLineW(), kStartupWarmupMs);
+    LogInfo(
+        L"event=startup schema=2 build=stable launch=%ls warmup_ms=%lu taskbar_message_id=%u "
+        L"com_hresult=0x%08lx",
+        g_app.window.launched_at_startup ? L"startup" : L"manual",
+        kStartupWarmupMs,
+        g_app.window.taskbar_created,
+        static_cast<unsigned long>(co_result));
+    LogConfigSnapshot(L"config_loaded");
+    if (taskbar_message_error != ERROR_SUCCESS) {
+        LogError(
+            L"event=startup_component_failed component=taskbar_message error=%lu",
+            taskbar_message_error);
+    }
+    if (FAILED(co_result)) {
+        LogWarning(
+            L"event=startup_component_failed component=com hresult=0x%08lx",
+            static_cast<unsigned long>(co_result));
+    }
 
     using DpiAwarenessContext = HANDLE;
     using SetProcessDpiAwarenessContextFn = BOOL(WINAPI*)(DpiAwarenessContext);
@@ -2425,10 +2997,25 @@ int Run(HINSTANCE instance) {
         reinterpret_cast<SetProcessDpiAwarenessContextFn>(
             GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext"));
     if (set_dpi_awareness) {
-        set_dpi_awareness(reinterpret_cast<DpiAwarenessContext>(-4));
+        if (!set_dpi_awareness(reinterpret_cast<DpiAwarenessContext>(-4))) {
+            const DWORD error = GetLastError();
+            if (error == ERROR_ACCESS_DENIED) {
+                LogDebug(
+                    L"event=startup_component_state component=dpi_awareness "
+                    L"state=already_configured error=%lu",
+                    static_cast<unsigned long>(error));
+            } else {
+                LogWarning(
+                    L"event=startup_component_failed component=dpi_awareness error=%lu",
+                    static_cast<unsigned long>(error));
+            }
+        }
+    } else {
+        LogDebug(L"event=startup_component_unavailable component=dpi_awareness_api");
     }
 
     if (!RegisterWindowClass(instance)) {
+        LogError(L"event=startup_failed stage=register_window_class");
         if (g_app.window.com_initialized) {
             CoUninitialize();
         }
@@ -2456,6 +3043,9 @@ int Run(HINSTANCE instance) {
         nullptr);
 
     if (!hwnd) {
+        LogError(
+            L"event=startup_failed stage=create_overlay error=%lu",
+            GetLastError());
         if (g_app.window.com_initialized) {
             CoUninitialize();
         }
@@ -2468,16 +3058,20 @@ int Run(HINSTANCE instance) {
     }
 
     MSG msg{};
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+    BOOL message_result = 0;
+    while ((message_result = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
+    }
+    if (message_result == -1) {
+        LogError(L"event=message_loop_failed error=%lu", GetLastError());
     }
 
     if (g_app.window.com_initialized) {
         CoUninitialize();
     }
 
-    return static_cast<int>(msg.wParam);
+    return message_result == -1 ? 1 : static_cast<int>(msg.wParam);
 }
 
 } // namespace

@@ -22,6 +22,7 @@
 #include <d2d1.h>
 #include <dwrite.h>
 #include <wincodec.h>
+#include <dwmapi.h>
 #include <objbase.h>
 #include <oleacc.h>
 
@@ -60,6 +61,10 @@ constexpr UINT kStateIntervalMs = 100;
 constexpr UINT kPlacementIntervalMs = 5000;
 constexpr UINT kStartupInitDelayMs = 8000;
 constexpr DWORD kGpuGroupRefreshIntervalMs = 5000;
+constexpr DWORD kHealthLogIntervalMs = 60000;
+constexpr DWORD kOverlayRepairIntervalMs = 5000;
+constexpr DWORD kPresentStaleThresholdMs = 5000;
+constexpr unsigned kFailureLogIntervalMs = 30000;
 constexpr int kMinimumTaskbarVisibleDip = 8;
 constexpr int kFullscreenCoverageToleranceDip = 2;
 constexpr UINT kTrayIconId = 1;
@@ -110,6 +115,8 @@ struct NetworkSampler {
     std::vector<InterfaceSample> interfaces;
     DWORD tick = 0;
     bool has_sample = false;
+    bool availability_known = false;
+    bool available = false;
     double down_bps = 0.0;
     double up_bps = 0.0;
 };
@@ -119,7 +126,10 @@ struct PdhGroup {
     std::vector<HCOUNTER> counters;
     bool ready = false;
     bool needs_second_sample = false;
+    bool availability_known = false;
+    bool provider_available = false;
     double value = -1.0;
+    std::wstring name;
     std::wstring wildcard_path;
     DWORD last_refresh_tick = 0;
 };
@@ -155,10 +165,23 @@ struct WindowState {
     HWND overlay_hwnd = nullptr;
     UINT taskbar_created = 0;
     UINT dpi = 96;
+    const wchar_t* shutdown_trigger = L"window_destroy";
     bool com_initialized = false;
     bool launched_at_startup = false;
     bool monitor_initialized = false;
     bool overlay_destroy_expected = false;
+};
+
+enum OverlayInvariantIssue : unsigned {
+    OverlayInvariantNone = 0,
+    OverlayInvariantMissing = 1U << 0,
+    OverlayInvariantHidden = 1U << 1,
+    OverlayInvariantNotTopmost = 1U << 2,
+    OverlayInvariantOwnerMismatch = 1U << 3,
+    OverlayInvariantMissingLayeredStyle = 1U << 4,
+    OverlayInvariantInvalidRect = 1U << 5,
+    OverlayInvariantPresentStale = 1U << 6,
+    OverlayInvariantCloaked = 1U << 7,
 };
 
 struct TrayState {
@@ -183,6 +206,7 @@ struct PlacementState {
 struct SuppressionState {
     bool overlay_update_frozen = false;
     SuppressionReason active_reason = SuppressionReason::None;
+    DWORD suppression_started_tick = 0;
     DWORD refresh_resume_tick = 0;
 };
 
@@ -201,6 +225,28 @@ struct RenderState {
     int last_frame_height = 0;
 };
 
+struct DiagnosticsState {
+    DWORD last_health_log_tick = 0;
+    DWORD last_state_timer_tick = 0;
+    DWORD last_state_timer_gap_ms = 0;
+    DWORD last_metrics_sample_tick = 0;
+    DWORD last_reposition_success_tick = 0;
+    DWORD last_render_attempt_tick = 0;
+    DWORD last_render_success_tick = 0;
+    DWORD last_present_attempt_tick = 0;
+    DWORD last_present_success_tick = 0;
+    std::uint64_t present_success_sequence = 0;
+    DWORD overlay_created_tick = 0;
+    DWORD last_overlay_repair_tick = 0;
+    DWORD last_overlay_detail_log_tick = 0;
+    std::uint64_t overlay_generation = 0;
+    unsigned present_failures = 0;
+    unsigned render_failures = 0;
+    unsigned overlay_repairs = 0;
+    unsigned overlay_repair_failures = 0;
+    bool last_frame_has_visible_pixels = false;
+};
+
 struct AppState {
     WindowState window;
     TrayState tray;
@@ -208,22 +254,28 @@ struct AppState {
     SuppressionState suppression;
     MetricsState metrics;
     RenderState render;
+    DiagnosticsState diagnostics;
     simple_monitor::Config config;
 };
 
 AppState g_app;
 
 using simple_monitor::ConfigPath;
+using simple_monitor::LogDebug;
 using simple_monitor::LogError;
+using simple_monitor::LogErrorRateLimited;
+using simple_monitor::LogFailureRecovered;
 using simple_monitor::LogInfo;
+using simple_monitor::LogLevel;
 using simple_monitor::LogWarning;
+using simple_monitor::LogWarningRateLimited;
 using simple_monitor::ModuleDir;
 
 // Forward declarations for cross-section entry points.
 void RenderOverlay(HWND hwnd);
-bool UpdateOverlaySuppression(HWND hwnd);
+bool UpdateOverlaySuppression(HWND hwnd, const wchar_t* trigger = L"unspecified");
 void ResetLayeredSurface(HWND hwnd);
-bool EnsureOverlayWindow();
+bool EnsureOverlayWindow(DWORD* error_out = nullptr);
 void DestroyOverlayWindow(const wchar_t* reason);
 
 // Shared utility helpers.
@@ -284,6 +336,10 @@ bool TickPassed(DWORD now, DWORD deadline) {
     return static_cast<LONG>(now - deadline) >= 0;
 }
 
+long long TickAgeMs(DWORD now, DWORD tick) {
+    return tick == 0 ? -1 : static_cast<long long>(now - tick);
+}
+
 bool CommandLineHasFlag(const wchar_t* flag) {
     return flag && std::wcsstr(GetCommandLineW(), flag) != nullptr;
 }
@@ -311,9 +367,72 @@ void EnableSystemMenuTheme() {
 }
 
 // Configuration.
+void ApplyAppConfig(const simple_monitor::Config& config) {
+    g_app.config = config;
+    simple_monitor::ConfigureLogging(
+        g_app.config.debug_log,
+        simple_monitor::DebugLogPath(L"debug-dev.log"),
+        simple_monitor::ParseLogLevel(g_app.config.log_level));
+}
+
 void LoadAppConfig() {
-    g_app.config = simple_monitor::LoadConfig();
-    simple_monitor::ConfigureLogging(g_app.config.debug_log, simple_monitor::DebugLogPath());
+    ApplyAppConfig(simple_monitor::LoadConfig());
+}
+
+void LogLoggingConfigChange(
+    const simple_monitor::Config& previous,
+    const simple_monitor::Config& next) {
+    if (!previous.debug_log ||
+        (previous.debug_log == next.debug_log && previous.log_level == next.log_level)) {
+        return;
+    }
+
+    wchar_t message[512]{};
+    _snwprintf_s(
+        message,
+        _countof(message),
+        _TRUNCATE,
+        L"event=logging_config_changed trigger=config_reload old_enabled=%d new_enabled=%d "
+        L"old_level=%ls new_level=%ls",
+        previous.debug_log ? 1 : 0,
+        next.debug_log ? 1 : 0,
+        previous.log_level.c_str(),
+        next.log_level.c_str());
+
+    if (previous.log_level == L"error") {
+        LogError(L"%ls", message);
+    } else if (previous.log_level == L"warning") {
+        LogWarning(L"%ls", message);
+    } else {
+        LogInfo(L"%ls", message);
+    }
+}
+
+void LogConfigSnapshot(const wchar_t* event_name) {
+    const std::wstring path = ConfigPath();
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    LogInfo(
+        L"event=%ls path=\"%ls\" exists=%d debug_log=%d log_level=%ls content_padding_x=%d column_gap=%d "
+        L"gap_after_network=%d gap_after_system=%d gap_after_disk=%d offset_right=%d font_size=%d "
+        L"key_font_size=%d network_arrow_style=%ls network_arrow_font_size=%d network_arrow_gap=%d "
+        L"show_key_widget=%d",
+        event_name,
+        path.c_str(),
+        attributes != INVALID_FILE_ATTRIBUTES ? 1 : 0,
+        g_app.config.debug_log ? 1 : 0,
+        g_app.config.log_level.c_str(),
+        g_app.config.content_padding_x_dip,
+        g_app.config.column_gap_dip,
+        g_app.config.gap_after_network_dip,
+        g_app.config.gap_after_system_dip,
+        g_app.config.gap_after_disk_dip,
+        g_app.config.offset_right_dip,
+        g_app.config.font_size_dip,
+        g_app.config.key_font_size_dip,
+        g_app.config.network_arrow_style.c_str(),
+        g_app.config.network_arrow_font_size_dip,
+        g_app.config.network_arrow_gap_dip,
+        g_app.config.show_key_widget ? 1 : 0);
 }
 
 // Startup integration.
@@ -321,10 +440,12 @@ bool IsStartupEnabled() {
     return simple_monitor::IsStartupEnabled(kRunValue);
 }
 
-void SetStartupEnabled(bool enabled) {
-    if (!simple_monitor::SetStartupEnabled(kRunValue, enabled)) {
+bool SetStartupEnabled(bool enabled) {
+    const bool succeeded = simple_monitor::SetStartupEnabled(kRunValue, enabled);
+    if (!succeeded) {
         LogError(L"event=startup_setting_failed enabled=%d", enabled ? 1 : 0);
     }
+    return succeeded;
 }
 
 // Foreground, fullscreen, and suppression detection.
@@ -479,6 +600,26 @@ bool IsTaskbarRelatedWindow(HWND hwnd) {
     return false;
 }
 
+bool WindowCoversMonitor(HWND window) {
+    RECT window_rect{};
+    if (!GetWindowRect(window, &window_rect)) {
+        return false;
+    }
+
+    HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitor_info{};
+    monitor_info.cbSize = sizeof(monitor_info);
+    if (!monitor || !GetMonitorInfoW(monitor, &monitor_info)) {
+        return false;
+    }
+
+    const int tolerance = Scale(kFullscreenCoverageToleranceDip, WindowDpi(window));
+    return window_rect.left <= monitor_info.rcMonitor.left + tolerance &&
+           window_rect.top <= monitor_info.rcMonitor.top + tolerance &&
+           window_rect.right >= monitor_info.rcMonitor.right - tolerance &&
+           window_rect.bottom >= monitor_info.rcMonitor.bottom - tolerance;
+}
+
 bool ForegroundWindowCoversMonitor() {
     HWND foreground = GetForegroundWindow();
     if (!foreground ||
@@ -490,28 +631,28 @@ bool ForegroundWindowCoversMonitor() {
         return false;
     }
 
-    HWND root = GetAncestor(foreground, GA_ROOT);
-    if (!root || IsTaskbarRelatedWindow(root) || IsTaskbarPreviewWindow(root)) {
-        return false;
-    }
+    const DWORD foreground_process_id = WindowProcessId(foreground);
+    HWND candidate = GetAncestor(foreground, GA_ROOT);
+    for (unsigned depth = 0; candidate && depth < 8; ++depth) {
+        if (candidate != g_app.window.overlay_hwnd &&
+            candidate != g_app.window.controller_hwnd &&
+            !IsTaskbarRelatedWindow(candidate) &&
+            !IsTaskbarPreviewWindow(candidate) &&
+            IsWindowVisible(candidate) &&
+            !IsIconic(candidate) &&
+            WindowProcessId(candidate) == foreground_process_id &&
+            WindowCoversMonitor(candidate)) {
+            return true;
+        }
 
-    RECT window_rect{};
-    if (!GetWindowRect(root, &window_rect)) {
-        return false;
+        HWND owner = GetWindow(candidate, GW_OWNER);
+        HWND next = owner ? GetAncestor(owner, GA_ROOT) : nullptr;
+        if (next == candidate) {
+            break;
+        }
+        candidate = next;
     }
-
-    HMONITOR monitor = MonitorFromWindow(root, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO monitor_info{};
-    monitor_info.cbSize = sizeof(monitor_info);
-    if (!monitor || !GetMonitorInfoW(monitor, &monitor_info)) {
-        return false;
-    }
-
-    const int tolerance = Scale(kFullscreenCoverageToleranceDip, WindowDpi(root));
-    return window_rect.left <= monitor_info.rcMonitor.left + tolerance &&
-           window_rect.top <= monitor_info.rcMonitor.top + tolerance &&
-           window_rect.right >= monitor_info.rcMonitor.right - tolerance &&
-           window_rect.bottom >= monitor_info.rcMonitor.bottom - tolerance;
+    return false;
 }
 
 bool IsHighConfidenceFullscreenPresentation() {
@@ -567,7 +708,7 @@ const wchar_t* SuppressionReasonName(SuppressionReason reason) {
 }
 
 void LogSuppressionContext(SuppressionReason reason) {
-    if (!g_app.config.debug_log) {
+    if (!simple_monitor::IsLogEnabled(LogLevel::Info)) {
         return;
     }
 
@@ -663,8 +804,16 @@ std::wstring FormatPercent(double value) {
 void SampleCpu(CpuSampler& sampler, Metrics& metrics) {
     FILETIME idle_ft{}, kernel_ft{}, user_ft{};
     if (!GetSystemTimes(&idle_ft, &kernel_ft, &user_ft)) {
+        LogWarningRateLimited(
+            L"metric.cpu.sample",
+            60000,
+            L"event=metric_provider_unavailable provider=cpu stage=get_system_times error=%lu",
+            GetLastError());
         return;
     }
+    LogFailureRecovered(
+        L"metric.cpu.sample",
+        L"event=component_recovered component=metric_provider provider=cpu");
 
     const ULONGLONG idle = FileTimeToU64(idle_ft);
     const ULONGLONG kernel = FileTimeToU64(kernel_ft);
@@ -692,6 +841,15 @@ void SampleMemory(Metrics& metrics) {
     status.dwLength = sizeof(status);
     if (GlobalMemoryStatusEx(&status)) {
         metrics.memory_load = status.dwMemoryLoad;
+        LogFailureRecovered(
+            L"metric.memory.sample",
+            L"event=component_recovered component=metric_provider provider=memory");
+    } else {
+        LogWarningRateLimited(
+            L"metric.memory.sample",
+            60000,
+            L"event=metric_provider_unavailable provider=memory stage=global_memory_status error=%lu",
+            GetLastError());
     }
 }
 
@@ -706,15 +864,28 @@ NetworkSampler::InterfaceSample* FindNetworkInterfaceSample(NetworkSampler& samp
 
 void SampleNetwork(NetworkSampler& sampler, Metrics& metrics) {
     PMIB_IF_TABLE2 table = nullptr;
-    if (GetIfTable2(&table) != NO_ERROR || table == nullptr) {
+    const DWORD status = GetIfTable2(&table);
+    if (status != NO_ERROR || table == nullptr) {
+        sampler.availability_known = true;
+        sampler.available = false;
+        LogWarningRateLimited(
+            L"metric.network.enumerate",
+            60000,
+            L"event=metric_provider_unavailable provider=network stage=get_if_table status=%lu table_null=%d",
+            status,
+            table == nullptr ? 1 : 0);
         return;
     }
+    const bool availability_changed = !sampler.availability_known || !sampler.available;
+    sampler.availability_known = true;
+    sampler.available = true;
 
     const DWORD now = GetTickCount();
     const DWORD elapsed_ms = sampler.has_sample ? now - sampler.tick : 0;
     const double seconds = elapsed_ms > 0 ? elapsed_ms / 1000.0 : 0.0;
     double down_bps = 0.0;
     double up_bps = 0.0;
+    ULONG active_interfaces = 0;
 
     for (NetworkSampler::InterfaceSample& sample : sampler.interfaces) {
         sample.seen = false;
@@ -725,6 +896,7 @@ void SampleNetwork(NetworkSampler& sampler, Metrics& metrics) {
         if (row.OperStatus != IfOperStatusUp || row.Type == IF_TYPE_SOFTWARE_LOOPBACK) {
             continue;
         }
+        ++active_interfaces;
 
         NetworkSampler::InterfaceSample* sample = FindNetworkInterfaceSample(sampler, row.InterfaceLuid.Value);
         if (!sample) {
@@ -760,6 +932,15 @@ void SampleNetwork(NetworkSampler& sampler, Metrics& metrics) {
     sampler.up_bps = up_bps;
     metrics.down_bps = down_bps;
     metrics.up_bps = up_bps;
+    if (availability_changed) {
+        LogInfo(
+            L"event=metric_provider_available provider=network active_interfaces=%lu",
+            active_interfaces);
+    }
+    LogFailureRecovered(
+        L"metric.network.enumerate",
+        L"event=component_recovered component=metric_provider provider=network active_interfaces=%lu",
+        active_interfaces);
 }
 
 void ResetPdhGroup(PdhGroup& group) {
@@ -773,12 +954,56 @@ void ResetPdhGroup(PdhGroup& group) {
     group.last_refresh_tick = 0;
 }
 
-void InitPdhGroup(PdhGroup& group, const wchar_t* wildcard_path) {
+std::wstring PdhFailureKey(const PdhGroup& group, const wchar_t* stage) {
+    return L"metric.pdh." + group.name + L"." + stage;
+}
+
+void ReportPdhFailure(PdhGroup& group, const wchar_t* stage, PDH_STATUS status) {
+    group.availability_known = true;
+    group.provider_available = false;
+    const std::wstring key = PdhFailureKey(group, stage);
+    LogWarningRateLimited(
+        key.c_str(),
+        60000,
+        L"event=metric_provider_unavailable provider=%ls stage=%ls status=0x%08lx",
+        group.name.c_str(),
+        stage,
+        static_cast<unsigned long>(status));
+}
+
+void ReportPdhStageRecovered(PdhGroup& group, const wchar_t* stage) {
+    const std::wstring key = PdhFailureKey(group, stage);
+    LogFailureRecovered(
+        key.c_str(),
+        L"event=component_recovered component=metric_provider provider=%ls stage=%ls",
+        group.name.c_str(),
+        stage);
+}
+
+void ReportPdhAvailable(PdhGroup& group) {
+    const bool availability_changed = !group.availability_known || !group.provider_available;
+    group.availability_known = true;
+    group.provider_available = true;
+    if (availability_changed) {
+        LogInfo(
+            L"event=metric_provider_available provider=%ls counters=%llu",
+            group.name.c_str(),
+            static_cast<unsigned long long>(group.counters.size()));
+    }
+}
+
+void InitPdhGroup(PdhGroup& group, const wchar_t* name, const wchar_t* wildcard_path) {
+    group.name = name;
     group.wildcard_path = wildcard_path;
     ResetPdhGroup(group);
-    if (PdhOpenQueryW(nullptr, 0, &group.query) != ERROR_SUCCESS) {
+    const DWORD init_tick = GetTickCount();
+    group.last_refresh_tick = init_tick == 0 ? 1 : init_tick;
+    const PDH_STATUS open_result = PdhOpenQueryW(nullptr, 0, &group.query);
+    if (open_result != ERROR_SUCCESS) {
+        ReportPdhFailure(group, L"open_query", open_result);
         return;
     }
+    ReportPdhStageRecovered(group, L"open_query");
 
     DWORD buffer_size = 0;
     PDH_STATUS expand_result = PdhExpandWildCardPathW(
@@ -789,6 +1014,7 @@ void InitPdhGroup(PdhGroup& group, const wchar_t* wildcard_path) {
         0);
 
     if (expand_result != static_cast<PDH_STATUS>(PDH_MORE_DATA) || buffer_size == 0) {
+        ReportPdhFailure(group, L"expand_size", expand_result);
         PdhCloseQuery(group.query);
         group.query = nullptr;
         return;
@@ -803,30 +1029,72 @@ void InitPdhGroup(PdhGroup& group, const wchar_t* wildcard_path) {
         0);
 
     if (expand_result != ERROR_SUCCESS) {
+        ReportPdhFailure(group, L"expand_path", expand_result);
         PdhCloseQuery(group.query);
         group.query = nullptr;
         return;
     }
+    ReportPdhStageRecovered(group, L"expand_size");
+    ReportPdhStageRecovered(group, L"expand_path");
 
     const wchar_t* cursor = buffer.data();
+    size_t total_counters = 0;
+    size_t failed_counters = 0;
+    PDH_STATUS first_add_failure = ERROR_SUCCESS;
     while (*cursor != L'\0') {
+        ++total_counters;
         HCOUNTER counter = nullptr;
-        if (PdhAddCounterW(group.query, cursor, 0, &counter) == ERROR_SUCCESS) {
+        const PDH_STATUS add_result = PdhAddCounterW(group.query, cursor, 0, &counter);
+        if (add_result == ERROR_SUCCESS) {
             group.counters.push_back(counter);
+        } else {
+            ++failed_counters;
+            if (first_add_failure == ERROR_SUCCESS) {
+                first_add_failure = add_result;
+            }
         }
         cursor += std::wcslen(cursor) + 1;
     }
 
     if (group.counters.empty()) {
+        ReportPdhFailure(
+            group,
+            L"add_counter",
+            first_add_failure == ERROR_SUCCESS ? PDH_CSTATUS_NO_COUNTER : first_add_failure);
         PdhCloseQuery(group.query);
         group.query = nullptr;
         return;
     }
+    if (failed_counters > 0) {
+        const std::wstring key = PdhFailureKey(group, L"add_counter_partial");
+        LogWarningRateLimited(
+            key.c_str(),
+            60000,
+            L"event=metric_provider_degraded provider=%ls stage=add_counter added=%llu failed=%llu total=%llu "
+            L"first_status=0x%08lx",
+            group.name.c_str(),
+            static_cast<unsigned long long>(group.counters.size()),
+            static_cast<unsigned long long>(failed_counters),
+            static_cast<unsigned long long>(total_counters),
+            static_cast<unsigned long>(first_add_failure));
+    } else {
+        ReportPdhStageRecovered(group, L"add_counter_partial");
+    }
+    ReportPdhStageRecovered(group, L"add_counter");
 
-    PdhCollectQueryData(group.query);
+    const PDH_STATUS collect_result = PdhCollectQueryData(group.query);
+    if (collect_result != ERROR_SUCCESS) {
+        ReportPdhFailure(group, L"initial_collect", collect_result);
+        PdhCloseQuery(group.query);
+        group.query = nullptr;
+        group.counters.clear();
+        return;
+    }
+    ReportPdhStageRecovered(group, L"initial_collect");
     group.ready = true;
     group.needs_second_sample = true;
     group.last_refresh_tick = GetTickCount();
+    ReportPdhAvailable(group);
 }
 
 void RebuildPdhGroup(PdhGroup& group) {
@@ -834,8 +1102,9 @@ void RebuildPdhGroup(PdhGroup& group) {
         return;
     }
 
+    const std::wstring name = group.name;
     const std::wstring wildcard_path = group.wildcard_path;
-    InitPdhGroup(group, wildcard_path.c_str());
+    InitPdhGroup(group, name.c_str(), wildcard_path.c_str());
 }
 
 void RefreshPdhGroupIfDue(PdhGroup& group) {
@@ -843,12 +1112,15 @@ void RefreshPdhGroupIfDue(PdhGroup& group) {
         return;
     }
 
+    const DWORD now = GetTickCount();
     if (!group.ready || group.query == nullptr) {
-        RebuildPdhGroup(group);
+        if (group.last_refresh_tick == 0 ||
+            TickPassed(now, group.last_refresh_tick + kGpuGroupRefreshIntervalMs)) {
+            RebuildPdhGroup(group);
+        }
         return;
     }
 
-    const DWORD now = GetTickCount();
     if (TickPassed(now, group.last_refresh_tick + kGpuGroupRefreshIntervalMs)) {
         RebuildPdhGroup(group);
     }
@@ -859,9 +1131,12 @@ double SamplePdhGroup(PdhGroup& group, bool sum_values) {
         return -1.0;
     }
 
-    if (PdhCollectQueryData(group.query) != ERROR_SUCCESS) {
+    const PDH_STATUS collect_result = PdhCollectQueryData(group.query);
+    if (collect_result != ERROR_SUCCESS) {
+        ReportPdhFailure(group, L"collect", collect_result);
         return -1.0;
     }
+    ReportPdhStageRecovered(group, L"collect");
 
     if (group.needs_second_sample) {
         group.needs_second_sample = false;
@@ -871,11 +1146,15 @@ double SamplePdhGroup(PdhGroup& group, bool sum_values) {
     double total = 0.0;
     double max_value = -1.0;
     bool any = false;
+    PDH_STATUS first_format_failure = ERROR_SUCCESS;
 
     for (HCOUNTER counter : group.counters) {
         PDH_FMT_COUNTERVALUE value{};
-        if (PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE, nullptr, &value) != ERROR_SUCCESS ||
-            value.CStatus != ERROR_SUCCESS) {
+        const PDH_STATUS format_result = PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE, nullptr, &value);
+        if (format_result != ERROR_SUCCESS || value.CStatus != ERROR_SUCCESS) {
+            if (first_format_failure == ERROR_SUCCESS) {
+                first_format_failure = format_result != ERROR_SUCCESS ? format_result : value.CStatus;
+            }
             continue;
         }
 
@@ -885,8 +1164,11 @@ double SamplePdhGroup(PdhGroup& group, bool sum_values) {
     }
 
     if (!any) {
+        ReportPdhFailure(group, L"format_value", first_format_failure);
         return -1.0;
     }
+    ReportPdhStageRecovered(group, L"format_value");
+    ReportPdhAvailable(group);
 
     group.value = ClampPercent(sum_values ? total : max_value);
     return group.value;
@@ -918,9 +1200,13 @@ void SampleMetrics() {
     SampleMemory(g_app.metrics.current);
     SampleNetwork(g_app.metrics.network, g_app.metrics.current);
     RefreshPdhGroupIfDue(g_app.metrics.gpu);
+    if (!g_app.metrics.disk.ready || g_app.metrics.disk.query == nullptr) {
+        RefreshPdhGroupIfDue(g_app.metrics.disk);
+    }
     g_app.metrics.current.gpu = SamplePdhGroup(g_app.metrics.gpu, true);
     g_app.metrics.current.disk = SamplePdhGroup(g_app.metrics.disk, false);
     SampleKeys(g_app.metrics.current);
+    g_app.diagnostics.last_metrics_sample_tick = GetTickCount();
 }
 
 // Overlay style and taskbar layout events.
@@ -931,7 +1217,21 @@ void UpdateLayeredStyle(HWND hwnd) {
     } else {
         ex_style &= ~WS_EX_TRANSPARENT;
     }
-    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style);
+    SetLastError(ERROR_SUCCESS);
+    const LONG_PTR previous_style = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style);
+    const DWORD style_error = previous_style == 0 ? GetLastError() : ERROR_SUCCESS;
+    if (style_error != ERROR_SUCCESS) {
+        LogErrorRateLimited(
+            L"overlay.update_style",
+            kFailureLogIntervalMs,
+            L"event=overlay_style_failed stage=click_through error=%lu requested=0x%llx",
+            style_error,
+            static_cast<unsigned long long>(ex_style));
+    } else {
+        LogFailureRecovered(
+            L"overlay.update_style",
+            L"event=component_recovered component=overlay_style stage=click_through");
+    }
 }
 
 void CALLBACK TrayEventProc(
@@ -953,7 +1253,19 @@ void CALLBACK TrayEventProc(
     }
 
     if (InterlockedCompareExchange(&g_app.placement.tray_layout_update_pending, 1, 0) == 0) {
-        PostMessageW(g_app.window.controller_hwnd, WM_TRAY_LAYOUT_CHANGED, 0, 0);
+        if (!PostMessageW(g_app.window.controller_hwnd, WM_TRAY_LAYOUT_CHANGED, 0, 0)) {
+            const DWORD error = GetLastError();
+            InterlockedExchange(&g_app.placement.tray_layout_update_pending, 0);
+            LogWarningRateLimited(
+                L"shell.post_tray_layout",
+                kFailureLogIntervalMs,
+                L"event=shell_message_failed message=tray_layout error=%lu",
+                error);
+        } else {
+            LogFailureRecovered(
+                L"shell.post_tray_layout",
+                L"event=component_recovered component=shell_message message=tray_layout");
+        }
     }
 }
 
@@ -966,24 +1278,100 @@ void RegisterTrayEventHooks() {
         EVENT_OBJECT_LOCATIONCHANGE,
     };
 
+    size_t installed = 0;
     for (DWORD event : events) {
         if (HWINEVENTHOOK hook = SetWinEventHook(event, event, nullptr, TrayEventProc, 0, 0, flags)) {
             g_app.tray.event_hooks.push_back(hook);
+            ++installed;
+        } else {
+            LogWarning(L"event=win_event_hook_failed event_id=%lu", event);
         }
     }
+    LogInfo(
+        L"event=win_event_hooks_registered installed=%llu expected=%llu",
+        static_cast<unsigned long long>(installed),
+        static_cast<unsigned long long>(ARRAYSIZE(events)));
 }
 
 void UnregisterTrayEventHooks() {
+    size_t failed = 0;
     for (HWINEVENTHOOK hook : g_app.tray.event_hooks) {
-        UnhookWinEvent(hook);
+        if (!UnhookWinEvent(hook)) {
+            ++failed;
+        }
+    }
+    if (failed > 0) {
+        LogWarning(
+            L"event=win_event_hook_cleanup_failed failed=%llu total=%llu",
+            static_cast<unsigned long long>(failed),
+            static_cast<unsigned long long>(g_app.tray.event_hooks.size()));
     }
     g_app.tray.event_hooks.clear();
 }
 
-void SetPlacementTimer(UINT interval_ms) {
-    if (g_app.window.controller_hwnd) {
-        SetTimer(g_app.window.controller_hwnd, kPlacementTimer, interval_ms, nullptr);
+const wchar_t* TimerFailureKey(UINT_PTR timer_id) {
+    switch (timer_id) {
+    case kRefreshTimer:
+        return L"timer_install_refresh";
+    case kPlacementTimer:
+        return L"timer_install_placement";
+    case kStateTimer:
+        return L"timer_install_state";
+    case kStartupInitTimer:
+        return L"timer_install_startup_init";
+    default:
+        return L"timer_install_other";
     }
+}
+
+bool InstallTimer(
+    HWND hwnd,
+    UINT_PTR timer_id,
+    UINT interval_ms,
+    const wchar_t* timer_name) {
+    const wchar_t* failure_key = TimerFailureKey(timer_id);
+    if (!hwnd) {
+        LogErrorRateLimited(
+            failure_key,
+            kFailureLogIntervalMs,
+            L"event=timer_install_failed timer=%ls id=%llu interval_ms=%u error_available=1 error=%lu",
+            timer_name,
+            static_cast<unsigned long long>(timer_id),
+            interval_ms,
+            static_cast<unsigned long>(ERROR_INVALID_WINDOW_HANDLE));
+        return false;
+    }
+
+    SetLastError(ERROR_SUCCESS);
+    if (SetTimer(hwnd, timer_id, interval_ms, nullptr) == 0) {
+        const DWORD error = GetLastError();
+        LogErrorRateLimited(
+            failure_key,
+            kFailureLogIntervalMs,
+            L"event=timer_install_failed timer=%ls id=%llu interval_ms=%u error_available=%d error=%lu",
+            timer_name,
+            static_cast<unsigned long long>(timer_id),
+            interval_ms,
+            error != ERROR_SUCCESS ? 1 : 0,
+            error);
+        return false;
+    }
+    LogFailureRecovered(
+        failure_key,
+        L"event=timer_install_recovered timer=%ls id=%llu interval_ms=%u",
+        timer_name,
+        static_cast<unsigned long long>(timer_id),
+        interval_ms);
+    return true;
+}
+
+bool SetPlacementTimer(UINT interval_ms) {
+    return g_app.window.controller_hwnd &&
+           InstallTimer(
+               g_app.window.controller_hwnd,
+               kPlacementTimer,
+               interval_ms,
+               L"placement");
 }
 
 // Taskbar anchoring and placement.
@@ -1260,7 +1648,7 @@ void RepositionWindow() {
         y = taskbar.bottom - height - Scale(8, g_app.window.dpi);
     }
 
-    SetWindowPos(
+    const BOOL positioned = SetWindowPos(
         overlay,
         HWND_TOPMOST,
         x,
@@ -1268,17 +1656,54 @@ void RepositionWindow() {
         width,
         height,
         SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    const DWORD position_error = positioned ? ERROR_SUCCESS : GetLastError();
+    if (positioned) {
+        g_app.diagnostics.last_reposition_success_tick = GetTickCount();
+        LogFailureRecovered(
+            L"reposition.set_window_pos",
+            L"event=component_recovered component=reposition stage=set_window_pos");
+    } else {
+        LogErrorRateLimited(
+            L"reposition.set_window_pos",
+            kFailureLogIntervalMs,
+            L"event=placement_failed stage=set_window_pos error=%lu requested=(%d,%d,%d,%d)",
+            position_error,
+            x,
+            y,
+            x + width,
+            y + height);
+    }
 
-    RECT overlay_rect{x, y, x + width, y + height};
+    const RECT requested_rect{x, y, x + width, y + height};
+    RECT overlay_rect{};
+    bool actual_known = false;
+    if (positioned) {
+        actual_known = GetWindowRect(overlay, &overlay_rect) != FALSE;
+        if (!actual_known) {
+            LogWarningRateLimited(
+                L"reposition.get_window_rect",
+                kFailureLogIntervalMs,
+                L"event=placement_probe_failed stage=get_window_rect error=%lu",
+                GetLastError());
+        } else {
+            LogFailureRecovered(
+                L"reposition.get_window_rect",
+                L"event=component_recovered component=reposition stage=get_window_rect");
+        }
+    }
     const bool taskbar_changed = !g_app.placement.has_last_logged_taskbar_rect || !RectEquals(taskbar, g_app.placement.last_logged_taskbar_rect);
     const bool anchor_changed =
         anchor_mode != g_app.placement.last_logged_anchor_mode ||
         (anchor_mode == 0 ? g_app.placement.has_last_logged_anchor_rect :
                             !g_app.placement.has_last_logged_anchor_rect || !RectEquals(anchor_rect, g_app.placement.last_logged_anchor_rect));
-    const bool overlay_changed = !g_app.placement.has_last_logged_overlay_rect || !RectEquals(overlay_rect, g_app.placement.last_logged_overlay_rect);
-    if (taskbar_changed || anchor_changed || overlay_changed) {
+    const bool overlay_changed =
+        actual_known &&
+        (!g_app.placement.has_last_logged_overlay_rect ||
+         !RectEquals(overlay_rect, g_app.placement.last_logged_overlay_rect));
+    if (actual_known && (taskbar_changed || anchor_changed || overlay_changed)) {
         LogInfo(
-            L"event=placement taskbar=(%ld,%ld,%ld,%ld) anchor_mode=%d anchor=(%ld,%ld,%ld,%ld) overlay=(%ld,%ld,%ld,%ld)",
+            L"event=placement result=ok actual_known=1 taskbar=(%ld,%ld,%ld,%ld) anchor_mode=%d "
+            L"anchor=(%ld,%ld,%ld,%ld) requested=(%ld,%ld,%ld,%ld) actual=(%ld,%ld,%ld,%ld)",
             taskbar.left,
             taskbar.top,
             taskbar.right,
@@ -1288,6 +1713,10 @@ void RepositionWindow() {
             anchor_rect.top,
             anchor_rect.right,
             anchor_rect.bottom,
+            requested_rect.left,
+            requested_rect.top,
+            requested_rect.right,
+            requested_rect.bottom,
             overlay_rect.left,
             overlay_rect.top,
             overlay_rect.right,
@@ -1335,10 +1764,31 @@ void AddTrayIcon(HWND hwnd) {
     nid.uCallbackMessage = WM_TRAYICON;
     nid.hIcon = LoadAppIcon(g_app.window.instance, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
     std::wcsncpy(nid.szTip, L"Simple Monitor", ARRAYSIZE(nid.szTip) - 1);
-    Shell_NotifyIconW(NIM_ADD, &nid);
+    const BOOL added = Shell_NotifyIconW(NIM_ADD, &nid);
+    if (!added) {
+        LogWarningRateLimited(
+            L"tray.add",
+            kFailureLogIntervalMs,
+            L"event=tray_icon_failed operation=add taskbar=%p taskbar_pid=%lu",
+            TaskbarWindow(),
+            WindowProcessId(TaskbarWindow()));
+        return;
+    }
+    LogFailureRecovered(
+        L"tray.add",
+        L"event=component_recovered component=tray_icon operation=add");
 
     nid.uVersion = NOTIFYICON_VERSION;
-    Shell_NotifyIconW(NIM_SETVERSION, &nid);
+    if (!Shell_NotifyIconW(NIM_SETVERSION, &nid)) {
+        LogWarningRateLimited(
+            L"tray.set_version",
+            kFailureLogIntervalMs,
+            L"event=tray_icon_failed operation=set_version");
+    } else {
+        LogFailureRecovered(
+            L"tray.set_version",
+            L"event=component_recovered component=tray_icon operation=set_version");
+    }
 }
 
 void RemoveTrayIcon(HWND hwnd) {
@@ -1346,11 +1796,13 @@ void RemoveTrayIcon(HWND hwnd) {
     nid.cbSize = sizeof(nid);
     nid.hWnd = hwnd;
     nid.uID = kTrayIconId;
-    Shell_NotifyIconW(NIM_DELETE, &nid);
+    if (!Shell_NotifyIconW(NIM_DELETE, &nid)) {
+        LogDebug(L"event=tray_icon_remove_skipped result=not_found_or_shell_unavailable");
+    }
 }
 
 void LogOverlayWindowState(const wchar_t* event_name, HWND overlay) {
-    if (!g_app.config.debug_log || !overlay || !IsWindow(overlay)) {
+    if (!simple_monitor::IsLogEnabled(LogLevel::Info) || !overlay || !IsWindow(overlay)) {
         return;
     }
 
@@ -1370,11 +1822,177 @@ void LogOverlayWindowState(const wchar_t* event_name, HWND overlay) {
         above_class.c_str());
 }
 
+struct OverlayStateSnapshot {
+    HWND hwnd = nullptr;
+    HWND owner = nullptr;
+    HWND expected_owner = nullptr;
+    HWND above = nullptr;
+    RECT rect{};
+    LONG_PTR ex_style = 0;
+    unsigned issues = OverlayInvariantNone;
+    bool valid = false;
+    bool visible = false;
+    bool cloak_known = false;
+    HRESULT cloak_hresult = E_FAIL;
+    DWORD cloak_flags = 0;
+};
+
+OverlayStateSnapshot CaptureOverlayState(bool expected_visible) {
+    OverlayStateSnapshot state;
+    state.hwnd = g_app.window.overlay_hwnd;
+    state.expected_owner = TaskbarWindow();
+    state.valid = state.hwnd && IsWindow(state.hwnd);
+    if (!state.valid) {
+        state.issues |= OverlayInvariantMissing;
+        return state;
+    }
+
+    state.visible = IsWindowVisible(state.hwnd) != FALSE;
+    state.ex_style = GetWindowLongPtrW(state.hwnd, GWL_EXSTYLE);
+    state.owner = GetWindow(state.hwnd, GW_OWNER);
+    state.above = GetWindow(state.hwnd, GW_HWNDPREV);
+    state.cloak_hresult = DwmGetWindowAttribute(
+        state.hwnd,
+        DWMWA_CLOAKED,
+        &state.cloak_flags,
+        sizeof(state.cloak_flags));
+    state.cloak_known = SUCCEEDED(state.cloak_hresult);
+    if (!state.cloak_known) {
+        state.cloak_flags = 0;
+        LogWarningRateLimited(
+            L"overlay.dwm_cloak_probe",
+            kFailureLogIntervalMs,
+            L"event=overlay_probe_failed stage=dwm_cloaked hresult=0x%08lx",
+            static_cast<unsigned long>(state.cloak_hresult));
+    } else {
+        LogFailureRecovered(
+            L"overlay.dwm_cloak_probe",
+            L"event=component_recovered component=overlay_probe stage=dwm_cloaked");
+    }
+
+    if (expected_visible && !state.visible) {
+        state.issues |= OverlayInvariantHidden;
+    }
+    if ((state.ex_style & WS_EX_TOPMOST) == 0) {
+        state.issues |= OverlayInvariantNotTopmost;
+    }
+    // Windows Shell can temporarily clear GW_OWNER while Start or Search is
+    // open. Keep the actual and expected owners in diagnostics, but do not
+    // treat that transient Shell state as overlay damage. Taskbar generation
+    // changes are detected separately by HWND and process ID.
+    if ((state.ex_style & WS_EX_LAYERED) == 0) {
+        state.issues |= OverlayInvariantMissingLayeredStyle;
+    }
+    if (expected_visible && state.cloak_known && state.cloak_flags != 0) {
+        state.issues |= OverlayInvariantCloaked;
+    }
+
+    if (!GetWindowRect(state.hwnd, &state.rect) ||
+        state.rect.right <= state.rect.left ||
+        state.rect.bottom <= state.rect.top) {
+        if (expected_visible) {
+            state.issues |= OverlayInvariantInvalidRect;
+        }
+    }
+
+    const DWORD now = GetTickCount();
+    if (expected_visible && !g_app.suppression.overlay_update_frozen) {
+        const bool successful_present_stale =
+            g_app.diagnostics.last_present_success_tick != 0 &&
+            now - g_app.diagnostics.last_present_success_tick > kPresentStaleThresholdMs;
+        const bool no_successful_present =
+            g_app.diagnostics.last_present_success_tick == 0 &&
+            g_app.diagnostics.overlay_created_tick != 0 &&
+            TickPassed(
+                now,
+                g_app.diagnostics.overlay_created_tick + kPresentStaleThresholdMs);
+        if (successful_present_stale || no_successful_present) {
+            state.issues |= OverlayInvariantPresentStale;
+        }
+    }
+    return state;
+}
+
+void LogOverlayInvariantFailure(const wchar_t* trigger, const OverlayStateSnapshot& state) {
+    HWND taskbar = state.expected_owner;
+    RECT taskbar_rect{};
+    GetWindowRect(taskbar, &taskbar_rect);
+    const DWORD now = GetTickCount();
+    const std::wstring above_exe = WindowProcessBasename(state.above);
+    const std::wstring above_class = WindowClassName(state.above);
+    HWND foreground = GetForegroundWindow();
+    const std::wstring foreground_exe = WindowProcessBasename(foreground);
+    const std::wstring foreground_class = WindowClassName(foreground);
+
+    LogWarningRateLimited(
+        L"overlay.invariant",
+        kFailureLogIntervalMs,
+        L"event=overlay_invariant_failed trigger=%ls issues=0x%02x hwnd=%p valid=%d visible=%d "
+        L"cloak_known=%d cloak_hresult=0x%08lx cloak_flags=0x%08lx "
+        L"topmost=%d layered=%d owner=%p expected_owner=%p rect=(%ld,%ld,%ld,%ld) "
+        L"taskbar=%p taskbar_pid=%lu taskbar_rect=(%ld,%ld,%ld,%ld) above=%p above_exe=%ls "
+        L"above_class=%ls foreground=%p foreground_exe=%ls foreground_class=%ls suppression=%ls "
+        L"frozen=%d last_present_age_ms=%lld last_reposition_age_ms=%lld",
+        trigger,
+        state.issues,
+        state.hwnd,
+        state.valid ? 1 : 0,
+        state.visible ? 1 : 0,
+        state.cloak_known ? 1 : 0,
+        static_cast<unsigned long>(state.cloak_hresult),
+        static_cast<unsigned long>(state.cloak_flags),
+        (state.ex_style & WS_EX_TOPMOST) != 0 ? 1 : 0,
+        (state.ex_style & WS_EX_LAYERED) != 0 ? 1 : 0,
+        state.owner,
+        state.expected_owner,
+        state.rect.left,
+        state.rect.top,
+        state.rect.right,
+        state.rect.bottom,
+        taskbar,
+        WindowProcessId(taskbar),
+        taskbar_rect.left,
+        taskbar_rect.top,
+        taskbar_rect.right,
+        taskbar_rect.bottom,
+        state.above,
+        above_exe.c_str(),
+        above_class.c_str(),
+        foreground,
+        foreground_exe.c_str(),
+        foreground_class.c_str(),
+        SuppressionReasonName(g_app.suppression.active_reason),
+        g_app.suppression.overlay_update_frozen ? 1 : 0,
+        TickAgeMs(now, g_app.diagnostics.last_present_success_tick),
+        TickAgeMs(now, g_app.diagnostics.last_reposition_success_tick));
+}
+
+bool ShouldLogOverlayInvariantDetail(DWORD now) {
+    if (!simple_monitor::IsLogEnabled(LogLevel::Warning)) {
+        return false;
+    }
+    if (g_app.diagnostics.last_overlay_detail_log_tick != 0 &&
+        !TickPassed(
+            now,
+            g_app.diagnostics.last_overlay_detail_log_tick + kFailureLogIntervalMs)) {
+        return false;
+    }
+    g_app.diagnostics.last_overlay_detail_log_tick = now == 0 ? 1 : now;
+    return true;
+}
+
+void ResetOverlayPresentDiagnostics() {
+    g_app.diagnostics.last_present_attempt_tick = 0;
+    g_app.diagnostics.last_present_success_tick = 0;
+    g_app.diagnostics.overlay_created_tick = 0;
+}
+
 void DestroyOverlayWindow(const wchar_t* reason) {
     HWND overlay = g_app.window.overlay_hwnd;
     if (!overlay || !IsWindow(overlay)) {
         g_app.window.overlay_hwnd = nullptr;
         g_app.placement.taskbar_owner = nullptr;
+        ResetOverlayPresentDiagnostics();
         return;
     }
 
@@ -1388,9 +2006,13 @@ void DestroyOverlayWindow(const wchar_t* reason) {
     }
     g_app.window.overlay_hwnd = nullptr;
     g_app.placement.taskbar_owner = nullptr;
+    ResetOverlayPresentDiagnostics();
 }
 
-bool EnsureOverlayWindow() {
+bool EnsureOverlayWindow(DWORD* error_out) {
+    if (error_out) {
+        *error_out = ERROR_SUCCESS;
+    }
     HWND taskbar = TaskbarWindow();
     HWND overlay = g_app.window.overlay_hwnd;
     if (overlay && IsWindow(overlay) && g_app.placement.taskbar_owner == taskbar) {
@@ -1402,10 +2024,21 @@ bool EnsureOverlayWindow() {
     }
     g_app.window.overlay_hwnd = nullptr;
     g_app.placement.taskbar_owner = nullptr;
+    ResetOverlayPresentDiagnostics();
 
     if (!taskbar) {
+        if (error_out) {
+            *error_out = ERROR_NOT_FOUND;
+        }
+        LogWarningRateLimited(
+            L"overlay.taskbar_missing",
+            kFailureLogIntervalMs,
+            L"event=overlay_unavailable reason=taskbar_missing");
         return false;
     }
+    LogFailureRecovered(
+        L"overlay.taskbar_missing",
+        L"event=component_recovered component=overlay reason=taskbar_available");
 
     const DWORD ex_style =
         WS_EX_TOOLWINDOW |
@@ -1426,11 +2059,26 @@ bool EnsureOverlayWindow() {
         g_app.window.instance,
         nullptr);
     if (!overlay) {
-        LogError(L"event=overlay_create_failed error=%lu", GetLastError());
+        const DWORD create_error = GetLastError();
+        if (error_out) {
+            *error_out = create_error;
+        }
+        LogErrorRateLimited(
+            L"overlay.create_window",
+            kFailureLogIntervalMs,
+            L"event=overlay_create_failed error=%lu",
+            create_error);
         return false;
     }
+    LogFailureRecovered(
+        L"overlay.create_window",
+        L"event=component_recovered component=overlay stage=create_window");
 
     g_app.window.overlay_hwnd = overlay;
+    ResetOverlayPresentDiagnostics();
+    ++g_app.diagnostics.overlay_generation;
+    const DWORD created_tick = GetTickCount();
+    g_app.diagnostics.overlay_created_tick = created_tick == 0 ? 1 : created_tick;
     g_app.window.dpi = WindowDpi(overlay);
     g_app.placement.taskbar_owner = taskbar;
     UpdateLayeredStyle(overlay);
@@ -1473,14 +2121,250 @@ bool ReconnectTaskbarIfNeeded(bool force) {
     return true;
 }
 
+void RepairOverlayInvariant(const wchar_t* trigger, const OverlayStateSnapshot& before) {
+    if (before.issues == OverlayInvariantNone) {
+        LogFailureRecovered(
+            L"overlay.invariant",
+            L"event=overlay_invariant_recovered trigger=%ls",
+            trigger);
+        if (g_app.diagnostics.last_present_success_tick != 0) {
+            LogFailureRecovered(
+                L"overlay.repair",
+                L"event=component_recovered component=overlay_repair trigger=%ls",
+                trigger);
+        }
+        return;
+    }
+
+    const DWORD now = GetTickCount();
+    if (ShouldLogOverlayInvariantDetail(now)) {
+        LogOverlayInvariantFailure(trigger, before);
+    }
+
+    constexpr unsigned kRecreateIssues = OverlayInvariantMissing;
+    constexpr unsigned kCheapRepairIssues =
+        OverlayInvariantHidden |
+        OverlayInvariantNotTopmost |
+        OverlayInvariantMissingLayeredStyle |
+        OverlayInvariantInvalidRect |
+        OverlayInvariantPresentStale;
+    constexpr unsigned kActionableIssues = kRecreateIssues | kCheapRepairIssues;
+    if ((before.issues & kActionableIssues) == 0) {
+        // Cloaking is controlled by DWM and can be transient. Keep recording it,
+        // but do not churn the HWND while the shell owns that state.
+        return;
+    }
+
+    if (g_app.diagnostics.last_overlay_repair_tick != 0 &&
+        !TickPassed(
+            now,
+            g_app.diagnostics.last_overlay_repair_tick + kOverlayRepairIntervalMs)) {
+        // Detection stays frequent, while repair work is bounded. The normal
+        // refresh/metrics path continues after this function returns.
+        return;
+    }
+    g_app.diagnostics.last_overlay_repair_tick = now == 0 ? 1 : now;
+    const std::uint64_t present_sequence_before_repair =
+        g_app.diagnostics.present_success_sequence;
+
+    unsigned actions = 0;
+    DWORD repair_error = ERROR_SUCCESS;
+    HWND old_overlay = before.hwnd;
+    bool recreated = false;
+
+    if ((before.issues & kRecreateIssues) != 0) {
+        actions |= 1U;
+        const std::uint64_t generation_before_ensure =
+            g_app.diagnostics.overlay_generation;
+        DWORD ensure_error = ERROR_SUCCESS;
+        if (!EnsureOverlayWindow(&ensure_error)) {
+            repair_error = ensure_error;
+        }
+        recreated =
+            g_app.diagnostics.overlay_generation != generation_before_ensure;
+    }
+
+    HWND overlay = g_app.window.overlay_hwnd;
+    if (overlay && IsWindow(overlay)) {
+        LONG_PTR ex_style = GetWindowLongPtrW(overlay, GWL_EXSTYLE);
+        if ((ex_style & (WS_EX_TOPMOST | WS_EX_LAYERED)) != (WS_EX_TOPMOST | WS_EX_LAYERED)) {
+            actions |= 2U;
+            ex_style |= WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE;
+            if (g_app.tray.click_through) {
+                ex_style |= WS_EX_TRANSPARENT;
+            }
+            SetLastError(ERROR_SUCCESS);
+            const LONG_PTR previous_style = SetWindowLongPtrW(overlay, GWL_EXSTYLE, ex_style);
+            const DWORD style_error = previous_style == 0 ? GetLastError() : ERROR_SUCCESS;
+            if (style_error != ERROR_SUCCESS) {
+                repair_error = style_error;
+            }
+        }
+
+        if (recreated || (before.issues & kCheapRepairIssues) != 0) {
+            actions |= 4U;
+            ShowWindow(overlay, SW_SHOWNOACTIVATE);
+            RepositionWindow();
+        }
+
+        if (recreated ||
+            (before.issues &
+             (OverlayInvariantHidden |
+              OverlayInvariantMissingLayeredStyle |
+              OverlayInvariantInvalidRect |
+              OverlayInvariantPresentStale)) != 0) {
+            actions |= 8U;
+            ResetLayeredSurface(overlay);
+            RenderOverlay(overlay);
+        }
+    }
+
+    if (actions == 0) {
+        return;
+    }
+
+    OverlayStateSnapshot after = CaptureOverlayState(true);
+    const bool presentation_required = recreated || (actions & 8U) != 0;
+    const bool presented_after_repair =
+        !presentation_required ||
+        g_app.diagnostics.present_success_sequence > present_sequence_before_repair;
+    if (!presented_after_repair) {
+        after.issues |= OverlayInvariantPresentStale;
+    }
+    const bool repaired = (after.issues & kActionableIssues) == OverlayInvariantNone;
+    if (repaired) {
+        ++g_app.diagnostics.overlay_repairs;
+        if (after.issues == OverlayInvariantNone) {
+            LogFailureRecovered(
+                L"overlay.invariant",
+                L"event=overlay_invariant_recovered trigger=%ls",
+                trigger);
+        }
+        LogFailureRecovered(
+            L"overlay.repair",
+            L"event=component_recovered component=overlay_repair trigger=%ls",
+            trigger);
+        LogInfo(
+            L"event=overlay_repair trigger=%ls result=ok issues=0x%02x remaining=0x%02x actions=0x%02x "
+            L"presented=%d old_hwnd=%p new_hwnd=%p duration_ms=%lu",
+            trigger,
+            before.issues,
+            after.issues,
+            actions,
+            presented_after_repair ? 1 : 0,
+            old_overlay,
+            after.hwnd,
+            GetTickCount() - now);
+    } else {
+        ++g_app.diagnostics.overlay_repair_failures;
+        const DWORD reported_error =
+            repair_error == ERROR_SUCCESS ? ERROR_GEN_FAILURE : repair_error;
+        LogErrorRateLimited(
+            L"overlay.repair",
+            kFailureLogIntervalMs,
+            L"event=overlay_repair trigger=%ls result=failed issues=0x%02x remaining=0x%02x "
+            L"actions=0x%02x presented=%d old_hwnd=%p new_hwnd=%p error=%lu",
+            trigger,
+            before.issues,
+            after.issues,
+            actions,
+            presented_after_repair ? 1 : 0,
+            old_overlay,
+            after.hwnd,
+            reported_error);
+    }
+}
+
+void MaybeLogHealth(const wchar_t* trigger, bool force = false) {
+    if (!simple_monitor::IsLogEnabled(LogLevel::Info)) {
+        return;
+    }
+
+    const DWORD now = GetTickCount();
+    if (!force &&
+        g_app.diagnostics.last_health_log_tick != 0 &&
+        !TickPassed(now, g_app.diagnostics.last_health_log_tick + kHealthLogIntervalMs)) {
+        return;
+    }
+    g_app.diagnostics.last_health_log_tick = now;
+
+    const bool expected_visible =
+        g_app.window.monitor_initialized &&
+        g_app.suppression.active_reason == SuppressionReason::None;
+    const OverlayStateSnapshot state = CaptureOverlayState(expected_visible);
+    const std::wstring above_exe = WindowProcessBasename(state.above);
+    const std::wstring above_class = WindowClassName(state.above);
+
+    LogInfo(
+        L"event=health trigger=%ls controller=%p monitor_initialized=%d taskbar=%p taskbar_pid=%lu "
+        L"overlay=%p generation=%llu valid=%d visible=%d cloak_known=%d cloak_hresult=0x%08lx "
+        L"cloak_flags=0x%08lx topmost=%d layered=%d owner=%p expected_owner=%p "
+        L"rect=(%ld,%ld,%ld,%ld) above=%p above_exe=%ls above_class=%ls issues=0x%02x "
+        L"suppression=%ls frozen=%d frame_size=(%d,%d) frame_visible=%d "
+        L"last_present_attempt_age_ms=%lld last_present_age_ms=%lld "
+        L"last_render_attempt_age_ms=%lld last_render_age_ms=%lld last_reposition_age_ms=%lld "
+        L"last_metrics_age_ms=%lld state_gap_ms=%lu present_failures=%u render_failures=%u "
+        L"repairs=%u repair_failures=%u",
+        trigger,
+        g_app.window.controller_hwnd,
+        g_app.window.monitor_initialized ? 1 : 0,
+        state.expected_owner,
+        WindowProcessId(state.expected_owner),
+        state.hwnd,
+        static_cast<unsigned long long>(g_app.diagnostics.overlay_generation),
+        state.valid ? 1 : 0,
+        state.visible ? 1 : 0,
+        state.cloak_known ? 1 : 0,
+        static_cast<unsigned long>(state.cloak_hresult),
+        static_cast<unsigned long>(state.cloak_flags),
+        (state.ex_style & WS_EX_TOPMOST) != 0 ? 1 : 0,
+        (state.ex_style & WS_EX_LAYERED) != 0 ? 1 : 0,
+        state.owner,
+        state.expected_owner,
+        state.rect.left,
+        state.rect.top,
+        state.rect.right,
+        state.rect.bottom,
+        state.above,
+        above_exe.c_str(),
+        above_class.c_str(),
+        state.issues,
+        SuppressionReasonName(g_app.suppression.active_reason),
+        g_app.suppression.overlay_update_frozen ? 1 : 0,
+        g_app.render.last_frame_width,
+        g_app.render.last_frame_height,
+        g_app.diagnostics.last_frame_has_visible_pixels ? 1 : 0,
+        TickAgeMs(now, g_app.diagnostics.last_present_attempt_tick),
+        TickAgeMs(now, g_app.diagnostics.last_present_success_tick),
+        TickAgeMs(now, g_app.diagnostics.last_render_attempt_tick),
+        TickAgeMs(now, g_app.diagnostics.last_render_success_tick),
+        TickAgeMs(now, g_app.diagnostics.last_reposition_success_tick),
+        TickAgeMs(now, g_app.diagnostics.last_metrics_sample_tick),
+        g_app.diagnostics.last_state_timer_gap_ms,
+        g_app.diagnostics.present_failures,
+        g_app.diagnostics.render_failures,
+        g_app.diagnostics.overlay_repairs,
+        g_app.diagnostics.overlay_repair_failures);
+}
+
 void ReloadConfigAndRefresh() {
-    LoadAppConfig();
-    LogInfo(L"event=config_reloaded debug_log=%d", g_app.config.debug_log ? 1 : 0);
+    LogInfo(L"event=config_reload_requested");
+    const simple_monitor::Config previous_config = g_app.config;
+    const simple_monitor::Config next_config = simple_monitor::LoadConfig();
+    LogLoggingConfigChange(previous_config, next_config);
+    if (previous_config.debug_log && !next_config.debug_log) {
+        simple_monitor::FlushLogSummaries();
+    }
+    ApplyAppConfig(next_config);
+    if (!previous_config.debug_log && next_config.debug_log) {
+        simple_monitor::ResetLog();
+    }
+    LogConfigSnapshot(L"config_reloaded");
     if (!EnsureOverlayWindow()) {
         return;
     }
     HWND overlay = g_app.window.overlay_hwnd;
-    if (UpdateOverlaySuppression(overlay)) {
+    if (UpdateOverlaySuppression(overlay, L"config_reload")) {
         return;
     }
     RepositionWindow();
@@ -1494,7 +2378,7 @@ void RecoverTaskbar() {
         return;
     }
     HWND overlay = g_app.window.overlay_hwnd;
-    if (UpdateOverlaySuppression(overlay)) {
+    if (UpdateOverlaySuppression(overlay, L"manual_recovery")) {
         return;
     }
     ShowWindow(overlay, SW_SHOWNOACTIVATE);
@@ -1502,13 +2386,27 @@ void RecoverTaskbar() {
     ResetLayeredSurface(overlay);
     RenderOverlay(overlay);
     LogOverlayWindowState(L"manual_recovery_complete", overlay);
+    MaybeLogHealth(L"manual_recovery", true);
 }
 
 bool HandleMenuCommand(HWND hwnd, UINT command) {
     switch (command) {
-    case ID_OPEN_CONFIG:
-        ShellExecuteW(hwnd, L"open", ConfigPath().c_str(), nullptr, ModuleDir().c_str(), SW_SHOWNORMAL);
+    case ID_OPEN_CONFIG: {
+        const HINSTANCE result = ShellExecuteW(
+            hwnd,
+            L"open",
+            ConfigPath().c_str(),
+            nullptr,
+            ModuleDir().c_str(),
+            SW_SHOWNORMAL);
+        const INT_PTR code = reinterpret_cast<INT_PTR>(result);
+        if (code <= 32) {
+            LogWarning(L"event=user_action action=open_config result=failed code=%lld", static_cast<long long>(code));
+        } else {
+            LogInfo(L"event=user_action action=open_config result=ok");
+        }
         return true;
+    }
     case ID_RELOAD_CONFIG:
         ReloadConfigAndRefresh();
         return true;
@@ -1520,12 +2418,35 @@ bool HandleMenuCommand(HWND hwnd, UINT command) {
         if (g_app.window.overlay_hwnd) {
             UpdateLayeredStyle(g_app.window.overlay_hwnd);
         }
+        if (g_app.window.overlay_hwnd &&
+            (((GetWindowLongPtrW(g_app.window.overlay_hwnd, GWL_EXSTYLE) & WS_EX_TRANSPARENT) != 0) ==
+             g_app.tray.click_through)) {
+            LogInfo(
+                L"event=user_action action=click_through result=ok enabled=%d",
+                g_app.tray.click_through ? 1 : 0);
+        } else {
+            LogError(
+                L"event=user_action action=click_through result=failed requested_enabled=%d",
+                g_app.tray.click_through ? 1 : 0);
+        }
         return true;
-    case ID_STARTUP:
-        SetStartupEnabled(!IsStartupEnabled());
+    case ID_STARTUP: {
+        const bool requested = !IsStartupEnabled();
+        const bool succeeded = SetStartupEnabled(requested);
+        LogInfo(
+            L"event=user_action action=startup requested=%d result=%ls effective=%d",
+            requested ? 1 : 0,
+            succeeded ? L"ok" : L"failed",
+            IsStartupEnabled() ? 1 : 0);
         return true;
+    }
     case ID_EXIT:
-        DestroyWindow(g_app.window.controller_hwnd);
+        g_app.window.shutdown_trigger = L"user_menu";
+        LogInfo(L"event=user_action action=exit result=requested");
+        if (!DestroyWindow(g_app.window.controller_hwnd)) {
+            g_app.window.shutdown_trigger = L"window_destroy";
+            LogError(L"event=user_action action=exit result=failed error=%lu", GetLastError());
+        }
         return true;
     }
     return false;
@@ -1570,6 +2491,32 @@ void ShowTrayMenu(HWND hwnd) {
 }
 
 // DirectWrite/Direct2D text layout and rendering helpers.
+void ReportRenderFailure(
+    const wchar_t* key,
+    const wchar_t* stage,
+    HRESULT hr,
+    int width = 0,
+    int height = 0) {
+    ++g_app.diagnostics.render_failures;
+    LogErrorRateLimited(
+        key,
+        kFailureLogIntervalMs,
+        L"event=render_failed stage=%ls hresult=0x%08lx width=%d height=%d dpi=%u failures=%u",
+        stage,
+        static_cast<unsigned long>(hr),
+        width,
+        height,
+        g_app.window.dpi,
+        g_app.diagnostics.render_failures);
+}
+
+void ReportRenderRecovered(const wchar_t* key, const wchar_t* stage) {
+    LogFailureRecovered(
+        key,
+        L"event=component_recovered component=render stage=%ls",
+        stage);
+}
+
 HRESULT EnsureRenderResources() {
     RenderResources& render = g_app.render.resources;
     HRESULT hr = S_OK;
@@ -1578,17 +2525,21 @@ HRESULT EnsureRenderResources() {
     if (!render.d2d_factory) {
         hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &render.d2d_factory);
         if (FAILED(hr)) {
+            ReportRenderFailure(L"render.d2d_factory", L"d2d_factory", hr);
             return hr;
         }
+        ReportRenderRecovered(L"render.d2d_factory", L"d2d_factory");
     }
 
     if (!render.dwrite_factory) {
         IUnknown* factory = nullptr;
         hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), &factory);
         if (FAILED(hr)) {
+            ReportRenderFailure(L"render.dwrite_factory", L"dwrite_factory", hr);
             return hr;
         }
         render.dwrite_factory = static_cast<IDWriteFactory*>(factory);
+        ReportRenderRecovered(L"render.dwrite_factory", L"dwrite_factory");
     }
 
     if (!render.wic_factory) {
@@ -1599,8 +2550,10 @@ HRESULT EnsureRenderResources() {
             __uuidof(IWICImagingFactory),
             reinterpret_cast<void**>(&render.wic_factory));
         if (FAILED(hr)) {
+            ReportRenderFailure(L"render.wic_factory", L"wic_factory", hr);
             return hr;
         }
+        ReportRenderRecovered(L"render.wic_factory", L"wic_factory");
     }
 
     if (!render.text_format ||
@@ -1617,8 +2570,10 @@ HRESULT EnsureRenderResources() {
             L"",
             &render.text_format);
         if (FAILED(hr)) {
+            ReportRenderFailure(L"render.text_format_main", L"text_format_main", hr);
             return hr;
         }
+        ReportRenderRecovered(L"render.text_format_main", L"text_format_main");
 
         render.text_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         render.text_format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
@@ -1639,8 +2594,10 @@ HRESULT EnsureRenderResources() {
             L"",
             &render.arrow_text_format);
         if (FAILED(hr)) {
+            ReportRenderFailure(L"render.text_format_arrow", L"text_format_arrow", hr);
             return hr;
         }
+        ReportRenderRecovered(L"render.text_format_arrow", L"text_format_arrow");
 
         render.arrow_text_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         render.arrow_text_format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
@@ -1661,8 +2618,10 @@ HRESULT EnsureRenderResources() {
             L"",
             &render.key_text_format);
         if (FAILED(hr)) {
+            ReportRenderFailure(L"render.text_format_key", L"text_format_key", hr);
             return hr;
         }
+        ReportRenderRecovered(L"render.text_format_key", L"text_format_key");
 
         render.key_text_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         render.key_text_format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
@@ -1930,16 +2889,92 @@ void DrawAdaptiveColumnsDwrite(
 }
 
 // Layered-window presentation and overlay frame lifecycle.
-bool PresentPixels(HWND hwnd, const BYTE* source_pixels, int width, int height) {
+void ReportPresentFailure(
+    const wchar_t* key,
+    const wchar_t* source,
+    const wchar_t* stage,
+    DWORD error,
+    int width,
+    int height,
+    bool error_available = true) {
+    ++g_app.diagnostics.present_failures;
+    LogErrorRateLimited(
+        key,
+        kFailureLogIntervalMs,
+        L"event=present_failed source=%ls stage=%ls error_available=%d error=%lu width=%d height=%d failures=%u",
+        source,
+        stage,
+        error_available ? 1 : 0,
+        error,
+        width,
+        height,
+        g_app.diagnostics.present_failures);
+}
+
+void MarkPresentSuccess(const wchar_t* source) {
+    const DWORD success_tick = GetTickCount();
+    g_app.diagnostics.last_present_success_tick = success_tick == 0 ? 1 : success_tick;
+    ++g_app.diagnostics.present_success_sequence;
+    const wchar_t* keys[] = {
+        L"present.get_window_rect",
+        L"present.invalid_input",
+        L"present.get_screen_dc",
+        L"present.create_memory_dc",
+        L"present.create_bitmap",
+        L"present.update_layered_window",
+    };
+    for (const wchar_t* key : keys) {
+        LogFailureRecovered(
+            key,
+            L"event=component_recovered component=present source=%ls",
+            source);
+    }
+}
+
+bool PresentPixels(
+    HWND hwnd,
+    const BYTE* source_pixels,
+    int width,
+    int height,
+    const wchar_t* source) {
+    g_app.diagnostics.last_present_attempt_tick = GetTickCount();
     RECT window_rect{};
-    if (!GetWindowRect(hwnd, &window_rect) || width <= 0 || height <= 0 || !source_pixels) {
-        LogError(L"event=present_failed stage=validate error=%lu width=%d height=%d", GetLastError(), width, height);
+    SetLastError(ERROR_SUCCESS);
+    if (!GetWindowRect(hwnd, &window_rect)) {
+        const DWORD error = GetLastError();
+        ReportPresentFailure(
+            L"present.get_window_rect",
+            source,
+            L"get_window_rect",
+            error,
+            width,
+            height,
+            error != ERROR_SUCCESS);
+        return false;
+    }
+    if (width <= 0 || height <= 0 || !source_pixels) {
+        ReportPresentFailure(
+            L"present.invalid_input",
+            source,
+            L"validate",
+            ERROR_INVALID_PARAMETER,
+            width,
+            height);
         return false;
     }
 
+    SetLastError(ERROR_SUCCESS);
     HDC screen_dc = GetDC(nullptr);
     if (!screen_dc) {
-        LogError(L"event=present_failed stage=get_screen_dc error=%lu", GetLastError());
+        const DWORD error = GetLastError();
+        ReportPresentFailure(
+            L"present.get_screen_dc",
+            source,
+            L"get_screen_dc",
+            error,
+            width,
+            height,
+            error != ERROR_SUCCESS);
         return false;
     }
 
@@ -1952,18 +2987,39 @@ bool PresentPixels(HWND hwnd, const BYTE* source_pixels, int width, int height) 
     bmi.bmiHeader.biCompression = BI_RGB;
 
     void* pixels = nullptr;
+    SetLastError(ERROR_SUCCESS);
     HDC mem_dc = CreateCompatibleDC(screen_dc);
+    if (!mem_dc) {
+        const DWORD error = GetLastError();
+        ReleaseDC(nullptr, screen_dc);
+        ReportPresentFailure(
+            L"present.create_memory_dc",
+            source,
+            L"create_memory_dc",
+            error,
+            width,
+            height,
+            error != ERROR_SUCCESS);
+        return false;
+    }
+
+    SetLastError(ERROR_SUCCESS);
     HBITMAP bitmap = CreateDIBSection(screen_dc, &bmi, DIB_RGB_COLORS, &pixels, nullptr, 0);
-    if (!mem_dc || !bitmap || !pixels) {
+    if (!bitmap || !pixels) {
         const DWORD error = GetLastError();
         if (bitmap) {
             DeleteObject(bitmap);
         }
-        if (mem_dc) {
-            DeleteDC(mem_dc);
-        }
+        DeleteDC(mem_dc);
         ReleaseDC(nullptr, screen_dc);
-        LogError(L"event=present_failed stage=create_bitmap error=%lu", error);
+        ReportPresentFailure(
+            L"present.create_bitmap",
+            source,
+            L"create_bitmap",
+            error,
+            width,
+            height,
+            error != ERROR_SUCCESS);
         return false;
     }
 
@@ -1977,6 +3033,7 @@ bool PresentPixels(HWND hwnd, const BYTE* source_pixels, int width, int height) 
     blend.BlendOp = AC_SRC_OVER;
     blend.SourceConstantAlpha = 255;
     blend.AlphaFormat = AC_SRC_ALPHA;
+    SetLastError(ERROR_SUCCESS);
     const BOOL updated = UpdateLayeredWindow(hwnd, screen_dc, &dst, &size, mem_dc, &src, 0, &blend, ULW_ALPHA);
     const DWORD update_error = updated ? ERROR_SUCCESS : GetLastError();
 
@@ -1985,23 +3042,55 @@ bool PresentPixels(HWND hwnd, const BYTE* source_pixels, int width, int height) 
     DeleteDC(mem_dc);
     ReleaseDC(nullptr, screen_dc);
     if (!updated) {
-        LogError(L"event=present_failed stage=update_layered_window error=%lu width=%d height=%d", update_error, width, height);
+        ReportPresentFailure(
+            L"present.update_layered_window",
+            source,
+            L"update_layered_window",
+            update_error,
+            width,
+            height,
+            update_error != ERROR_SUCCESS);
+    } else {
+        MarkPresentSuccess(source);
     }
     return updated != FALSE;
 }
 
-bool ReapplyLastFrame(HWND hwnd) {
+bool ReapplyLastFrame(HWND hwnd, const wchar_t* source = L"reapply") {
     if (g_app.render.last_frame.empty()) {
         return false;
     }
-    return PresentPixels(hwnd, g_app.render.last_frame.data(), g_app.render.last_frame_width, g_app.render.last_frame_height);
+    return PresentPixels(
+        hwnd,
+        g_app.render.last_frame.data(),
+        g_app.render.last_frame_width,
+        g_app.render.last_frame_height,
+        source);
 }
 
 void ResetLayeredSurface(HWND hwnd) {
     const LONG_PTR ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style & ~WS_EX_LAYERED);
-    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style);
-    SetWindowPos(
+    SetLastError(ERROR_SUCCESS);
+    const LONG_PTR clear_result = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style & ~WS_EX_LAYERED);
+    DWORD style_error = clear_result == 0 ? GetLastError() : ERROR_SUCCESS;
+    SetLastError(ERROR_SUCCESS);
+    const LONG_PTR restore_result = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style);
+    if (restore_result == 0 && GetLastError() != ERROR_SUCCESS) {
+        style_error = GetLastError();
+    }
+    if (style_error != ERROR_SUCCESS) {
+        LogErrorRateLimited(
+            L"overlay.reset_layered_style",
+            kFailureLogIntervalMs,
+            L"event=overlay_surface_reset_failed stage=style error=%lu",
+            style_error);
+    } else {
+        LogFailureRecovered(
+            L"overlay.reset_layered_style",
+            L"event=component_recovered component=overlay_surface stage=style");
+    }
+
+    const BOOL positioned = SetWindowPos(
         hwnd,
         HWND_TOPMOST,
         0,
@@ -2009,16 +3098,31 @@ void ResetLayeredSurface(HWND hwnd) {
         0,
         0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-    ReapplyLastFrame(hwnd);
+    if (!positioned) {
+        LogErrorRateLimited(
+            L"overlay.reset_layered_position",
+            kFailureLogIntervalMs,
+            L"event=overlay_surface_reset_failed stage=set_window_pos error=%lu",
+            GetLastError());
+    } else {
+        LogFailureRecovered(
+            L"overlay.reset_layered_position",
+            L"event=component_recovered component=overlay_surface stage=set_window_pos");
+    }
+    ReapplyLastFrame(hwnd, L"reset_layered_surface");
 }
 
-bool UpdateOverlaySuppression(HWND hwnd) {
+bool UpdateOverlaySuppression(HWND hwnd, const wchar_t* trigger) {
     const SuppressionReason reason = GetSuppressionReason();
     const bool should_suppress = reason != SuppressionReason::None;
     const bool is_visible = IsWindowVisible(hwnd) != FALSE;
     if (should_suppress) {
         if (g_app.suppression.active_reason != reason) {
-            LogInfo(L"event=suppression_on reason=%ls", SuppressionReasonName(reason));
+            g_app.suppression.suppression_started_tick = GetTickCount();
+            LogInfo(
+                L"event=suppression_on trigger=%ls reason=%ls",
+                trigger,
+                SuppressionReasonName(reason));
             LogSuppressionContext(reason);
         }
         g_app.suppression.active_reason = reason;
@@ -2031,7 +3135,16 @@ bool UpdateOverlaySuppression(HWND hwnd) {
     if (g_app.suppression.active_reason != SuppressionReason::None) {
         const SuppressionReason previous_reason = g_app.suppression.active_reason;
         g_app.suppression.active_reason = SuppressionReason::None;
-        LogInfo(L"event=suppression_off previous_reason=%ls", SuppressionReasonName(previous_reason));
+        const DWORD duration_ms = g_app.suppression.suppression_started_tick == 0
+            ? 0
+            : GetTickCount() - g_app.suppression.suppression_started_tick;
+        g_app.suppression.suppression_started_tick = 0;
+        LogInfo(
+            L"event=suppression_off trigger=%ls previous_reason=%ls duration_ms=%lu",
+            trigger,
+            SuppressionReasonName(previous_reason),
+            duration_ms);
+        LogSuppressionContext(SuppressionReason::None);
 
         if (previous_reason == SuppressionReason::FullscreenPresentation) {
             DestroyOverlayWindow(L"presentation_exit");
@@ -2073,15 +3186,16 @@ bool UpdateFreezeState(HWND hwnd) {
     return false;
 }
 
-bool HandleOverlayStateGuards() {
-    HWND previous_overlay = g_app.window.overlay_hwnd;
+bool HandleOverlayStateGuards(const wchar_t* trigger) {
+    const std::uint64_t previous_generation = g_app.diagnostics.overlay_generation;
     const bool taskbar_reconnected = ReconnectTaskbarIfNeeded(false);
     if (!EnsureOverlayWindow()) {
         return true;
     }
     HWND overlay = g_app.window.overlay_hwnd;
-    const bool overlay_created = overlay != previous_overlay;
-    if (UpdateOverlaySuppression(overlay)) {
+    const bool overlay_created =
+        g_app.diagnostics.overlay_generation != previous_generation;
+    if (UpdateOverlaySuppression(overlay, trigger)) {
         return true;
     }
     if (taskbar_reconnected || overlay_created) {
@@ -2089,8 +3203,10 @@ bool HandleOverlayStateGuards() {
         RepositionWindow();
         ResetLayeredSurface(overlay);
         RenderOverlay(overlay);
+        RepairOverlayInvariant(trigger, CaptureOverlayState(true));
         return true;
     }
+    RepairOverlayInvariant(trigger, CaptureOverlayState(true));
     if (UpdateFreezeState(overlay)) {
         return true;
     }
@@ -2104,15 +3220,37 @@ bool HandleOverlayStateGuards() {
 }
 
 void RenderOverlay(HWND hwnd) {
+    g_app.diagnostics.last_render_attempt_tick = GetTickCount();
     RECT client{};
-    GetClientRect(hwnd, &client);
+    SetLastError(ERROR_SUCCESS);
+    if (!GetClientRect(hwnd, &client)) {
+        const DWORD error = GetLastError();
+        ReportRenderFailure(
+            L"render.get_client_rect",
+            L"get_client_rect",
+            error == ERROR_SUCCESS ? E_FAIL : HRESULT_FROM_WIN32(error));
+        return;
+    }
+    ReportRenderRecovered(L"render.get_client_rect", L"get_client_rect");
+
     const int width = client.right - client.left;
     const int height = client.bottom - client.top;
     if (width <= 0 || height <= 0) {
+        LogWarningRateLimited(
+            L"render.invalid_client_size",
+            kFailureLogIntervalMs,
+            L"event=render_skipped reason=invalid_client_size width=%d height=%d dpi=%u",
+            width,
+            height,
+            g_app.window.dpi);
         return;
     }
+    LogFailureRecovered(
+        L"render.invalid_client_size",
+        L"event=component_recovered component=render stage=client_size");
 
-    if (FAILED(EnsureRenderResources())) {
+    const HRESULT resources_result = EnsureRenderResources();
+    if (FAILED(resources_result)) {
         return;
     }
 
@@ -2126,6 +3264,11 @@ void RenderOverlay(HWND hwnd) {
         GUID_WICPixelFormat32bppPBGRA,
         WICBitmapCacheOnLoad,
         &wic_bitmap);
+    if (FAILED(hr)) {
+        ReportRenderFailure(L"render.create_bitmap", L"create_bitmap", hr, width, height);
+    } else {
+        ReportRenderRecovered(L"render.create_bitmap", L"create_bitmap");
+    }
     if (SUCCEEDED(hr)) {
         D2D1_RENDER_TARGET_PROPERTIES props{};
         props.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
@@ -2137,11 +3280,21 @@ void RenderOverlay(HWND hwnd) {
         props.minLevel = D2D1_FEATURE_LEVEL_DEFAULT;
 
         hr = g_app.render.resources.d2d_factory->CreateWicBitmapRenderTarget(wic_bitmap, &props, &target);
+        if (FAILED(hr)) {
+            ReportRenderFailure(L"render.create_target", L"create_target", hr, width, height);
+        } else {
+            ReportRenderRecovered(L"render.create_target", L"create_target");
+        }
     }
     if (SUCCEEDED(hr)) {
         target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         D2D1_COLOR_F color{1.0f, 1.0f, 1.0f, 1.0f};
         hr = target->CreateSolidColorBrush(color, &brush);
+        if (FAILED(hr)) {
+            ReportRenderFailure(L"render.create_brush", L"create_brush", hr, width, height);
+        } else {
+            ReportRenderRecovered(L"render.create_brush", L"create_brush");
+        }
     }
 
     const FLOAT pad_x = static_cast<FLOAT>(Scale(g_app.config.content_padding_x_dip, g_app.window.dpi));
@@ -2182,12 +3335,22 @@ void RenderOverlay(HWND hwnd) {
             content,
             columns);
         hr = target->EndDraw();
+        if (FAILED(hr)) {
+            ReportRenderFailure(L"render.end_draw", L"end_draw", hr, width, height);
+        } else {
+            ReportRenderRecovered(L"render.end_draw", L"end_draw");
+        }
     }
 
     if (SUCCEEDED(hr)) {
         WICRect rect{0, 0, width, height};
         std::vector<BYTE> frame(static_cast<size_t>(width) * height * 4);
         hr = wic_bitmap->CopyPixels(&rect, width * 4, static_cast<UINT>(frame.size()), frame.data());
+        if (FAILED(hr)) {
+            ReportRenderFailure(L"render.copy_pixels", L"copy_pixels", hr, width, height);
+        } else {
+            ReportRenderRecovered(L"render.copy_pixels", L"copy_pixels");
+        }
         if (SUCCEEDED(hr)) {
             bool has_visible_pixels = false;
             for (size_t i = 3; i < frame.size(); i += 4) {
@@ -2196,11 +3359,25 @@ void RenderOverlay(HWND hwnd) {
                     break;
                 }
             }
+            g_app.diagnostics.last_frame_has_visible_pixels = has_visible_pixels;
             if (!has_visible_pixels) {
-                LogWarning(L"event=render_empty_frame width=%d height=%d", width, height);
+                LogWarningRateLimited(
+                    L"render.empty_frame",
+                    kFailureLogIntervalMs,
+                    L"event=render_empty_frame width=%d height=%d dpi=%u",
+                    width,
+                    height,
+                    g_app.window.dpi);
+            } else {
+                LogFailureRecovered(
+                    L"render.empty_frame",
+                    L"event=render_pixels_recovered width=%d height=%d",
+                    width,
+                    height);
             }
+            g_app.diagnostics.last_render_success_tick = GetTickCount();
         }
-        if (SUCCEEDED(hr) && PresentPixels(hwnd, frame.data(), width, height)) {
+        if (SUCCEEDED(hr) && PresentPixels(hwnd, frame.data(), width, height, L"render")) {
             g_app.render.last_frame = std::move(frame);
             g_app.render.last_frame_width = width;
             g_app.render.last_frame_height = height;
@@ -2229,7 +3406,7 @@ LRESULT HandleTaskbarCreated() {
         return 0;
     }
     HWND overlay = g_app.window.overlay_hwnd;
-    if (UpdateOverlaySuppression(overlay)) {
+    if (UpdateOverlaySuppression(overlay, L"taskbar_created")) {
         return 0;
     }
     ShowWindow(overlay, SW_SHOWNOACTIVATE);
@@ -2250,17 +3427,22 @@ void InitializeMonitor(HWND controller) {
     g_app.placement.observed_taskbar_process_id = WindowProcessId(g_app.placement.observed_taskbar);
     AddTrayIcon(controller);
     RegisterTrayEventHooks();
-    InitPdhGroup(g_app.metrics.gpu, L"\\GPU Engine(*)\\Utilization Percentage");
-    InitPdhGroup(g_app.metrics.disk, L"\\PhysicalDisk(_Total)\\% Disk Time");
+    InitPdhGroup(g_app.metrics.gpu, L"gpu", L"\\GPU Engine(*)\\Utilization Percentage");
+    InitPdhGroup(g_app.metrics.disk, L"disk", L"\\PhysicalDisk(_Total)\\% Disk Time");
     SampleMetrics();
-    SetTimer(controller, kRefreshTimer, 1000, nullptr);
-    SetPlacementTimer(kPlacementIntervalMs);
-    SetTimer(controller, kStateTimer, kStateIntervalMs, nullptr);
+    const bool refresh_timer = InstallTimer(controller, kRefreshTimer, 1000, L"refresh");
+    const bool placement_timer = SetPlacementTimer(kPlacementIntervalMs);
+    const bool state_timer = InstallTimer(controller, kStateTimer, kStateIntervalMs, L"state");
+    LogInfo(
+        L"event=timers_initialized refresh=%d placement=%d state=%d",
+        refresh_timer ? 1 : 0,
+        placement_timer ? 1 : 0,
+        state_timer ? 1 : 0);
     if (!EnsureOverlayWindow()) {
         return;
     }
     HWND overlay = g_app.window.overlay_hwnd;
-    if (UpdateOverlaySuppression(overlay)) {
+    if (UpdateOverlaySuppression(overlay, L"monitor_init")) {
         return;
     }
     RepositionWindow();
@@ -2272,7 +3454,10 @@ void InitializeMonitor(HWND controller) {
 LRESULT HandleControllerCreate(HWND hwnd) {
     g_app.window.controller_hwnd = hwnd;
     if (g_app.window.launched_at_startup) {
-        SetTimer(hwnd, kStartupInitTimer, kStartupInitDelayMs, nullptr);
+        if (!InstallTimer(hwnd, kStartupInitTimer, kStartupInitDelayMs, L"startup_init")) {
+            LogWarning(L"event=startup_delay_bypassed reason=timer_install_failed");
+            InitializeMonitor(hwnd);
+        }
     } else {
         InitializeMonitor(hwnd);
     }
@@ -2287,7 +3472,25 @@ LRESULT HandleTimer(HWND hwnd, UINT_PTR timer_id) {
     }
 
     if (timer_id == kStateTimer) {
-        if (HandleOverlayStateGuards()) {
+        const DWORD now = GetTickCount();
+        if (g_app.diagnostics.last_state_timer_tick != 0) {
+            g_app.diagnostics.last_state_timer_gap_ms = now - g_app.diagnostics.last_state_timer_tick;
+            if (g_app.diagnostics.last_state_timer_gap_ms > 2000) {
+                LogWarningRateLimited(
+                    L"timer.state_gap",
+                    kFailureLogIntervalMs,
+                    L"event=timer_gap timer=state gap_ms=%lu",
+                    g_app.diagnostics.last_state_timer_gap_ms);
+            } else {
+                LogFailureRecovered(
+                    L"timer.state_gap",
+                    L"event=component_recovered component=timer timer=state");
+            }
+        }
+        g_app.diagnostics.last_state_timer_tick = now;
+        const bool handled = HandleOverlayStateGuards(L"state_timer");
+        MaybeLogHealth(L"state_timer");
+        if (handled) {
             return 0;
         }
         if (g_app.config.show_key_widget && SampleKeysIfChanged()) {
@@ -2296,7 +3499,10 @@ LRESULT HandleTimer(HWND hwnd, UINT_PTR timer_id) {
         return 0;
     }
 
-    if (HandleOverlayStateGuards()) {
+    const wchar_t* trigger = timer_id == kRefreshTimer ? L"refresh_timer" : L"placement_timer";
+    const bool handled = HandleOverlayStateGuards(trigger);
+    MaybeLogHealth(trigger);
+    if (handled) {
         return 0;
     }
 
@@ -2311,7 +3517,13 @@ LRESULT HandleTimer(HWND hwnd, UINT_PTR timer_id) {
 }
 
 LRESULT HandleDpiChanged(HWND hwnd, WPARAM wparam, LPARAM lparam) {
+    const UINT previous_dpi = g_app.window.dpi;
     g_app.window.dpi = HIWORD(wparam);
+    LogInfo(
+        L"event=dpi_changed old_dpi=%u new_dpi=%u has_suggested_rect=%d",
+        previous_dpi,
+        g_app.window.dpi,
+        lparam ? 1 : 0);
     if (lparam) {
         const RECT* suggested = reinterpret_cast<const RECT*>(lparam);
         SetWindowPos(
@@ -2323,7 +3535,7 @@ LRESULT HandleDpiChanged(HWND hwnd, WPARAM wparam, LPARAM lparam) {
             suggested->bottom - suggested->top,
             SWP_NOACTIVATE);
     }
-    if (UpdateOverlaySuppression(hwnd)) {
+    if (UpdateOverlaySuppression(hwnd, L"dpi_change")) {
         return 0;
     }
     RepositionWindow();
@@ -2341,7 +3553,7 @@ LRESULT HandleDisplayChange() {
         return 0;
     }
     HWND overlay = g_app.window.overlay_hwnd;
-    if (UpdateOverlaySuppression(overlay)) {
+    if (UpdateOverlaySuppression(overlay, L"display_or_device_change")) {
         return 0;
     }
     RepositionWindow();
@@ -2368,7 +3580,7 @@ LRESULT HandleTrayLayoutChanged() {
         return 0;
     }
     HWND overlay = g_app.window.overlay_hwnd;
-    if (UpdateOverlaySuppression(overlay)) {
+    if (UpdateOverlaySuppression(overlay, L"tray_layout_change")) {
         return 0;
     }
     RepositionWindow();
@@ -2386,7 +3598,7 @@ LRESULT HandleTrayIcon(HWND hwnd, LPARAM lparam) {
 }
 
 LRESULT HandleControllerDestroy(HWND hwnd) {
-    LogInfo(L"event=shutdown build=dev");
+    MaybeLogHealth(L"shutdown", true);
     g_app.window.monitor_initialized = false;
     KillTimer(hwnd, kRefreshTimer);
     KillTimer(hwnd, kPlacementTimer);
@@ -2405,6 +3617,10 @@ LRESULT HandleControllerDestroy(HWND hwnd) {
         g_app.metrics.disk.query = nullptr;
     }
     ReleaseRenderResources();
+    simple_monitor::FlushLogSummaries();
+    LogInfo(
+        L"event=shutdown build=dev trigger=%ls",
+        g_app.window.shutdown_trigger ? g_app.window.shutdown_trigger : L"unknown");
     PostQuitMessage(0);
     return 0;
 }
@@ -2421,11 +3637,19 @@ LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
     case WM_DESTROY:
         if (g_app.window.overlay_hwnd == hwnd) {
             const bool expected = g_app.window.overlay_destroy_expected;
+            if (!expected) {
+                LogOverlayWindowState(L"overlay_destroy_unexpected_context", hwnd);
+            }
             LogInfo(L"event=overlay_destroyed hwnd=%p expected=%d", hwnd, expected ? 1 : 0);
             g_app.window.overlay_hwnd = nullptr;
             g_app.placement.taskbar_owner = nullptr;
+            ResetOverlayPresentDiagnostics();
             if (!expected && g_app.window.monitor_initialized && g_app.window.controller_hwnd) {
-                PostMessageW(g_app.window.controller_hwnd, WM_RECONCILE, 0, 0);
+                if (!PostMessageW(g_app.window.controller_hwnd, WM_RECONCILE, 0, 0)) {
+                    LogError(
+                        L"event=shell_message_failed message=reconcile error=%lu",
+                        GetLastError());
+                }
             }
         }
         return 0;
@@ -2448,7 +3672,11 @@ LRESULT CALLBACK ControllerWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
         return HandleTimer(hwnd, static_cast<UINT_PTR>(wparam));
 
     case WM_DISPLAYCHANGE:
+        LogInfo(L"event=environment_changed type=display");
+        return HandleDisplayChange();
+
     case WM_DEVICECHANGE:
+        LogInfo(L"event=environment_changed type=device");
         return HandleDisplayChange();
 
     case WM_SETTINGCHANGE:
@@ -2462,7 +3690,8 @@ LRESULT CALLBACK ControllerWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
         return HandleTrayLayoutChanged();
 
     case WM_RECONCILE:
-        HandleOverlayStateGuards();
+        HandleOverlayStateGuards(L"reconcile_message");
+        MaybeLogHealth(L"reconcile_message", true);
         return 0;
 
     case WM_TRAYICON:
@@ -2486,24 +3715,50 @@ bool RegisterWindowClasses(HINSTANCE instance) {
     wc.hbrBackground = nullptr;
     wc.lpszClassName = kControllerWindowClass;
     if (RegisterClassExW(&wc) == 0) {
+        LogError(
+            L"event=startup_component_failed component=window_class stage=controller error=%lu",
+            GetLastError());
         return false;
     }
 
     wc.lpfnWndProc = OverlayWindowProc;
     wc.lpszClassName = kOverlayWindowClass;
-    return RegisterClassExW(&wc) != 0;
+    if (RegisterClassExW(&wc) == 0) {
+        LogError(
+            L"event=startup_component_failed component=window_class stage=overlay error=%lu",
+            GetLastError());
+        return false;
+    }
+    return true;
 }
 
 int Run(HINSTANCE instance) {
     g_app.window.instance = instance;
     g_app.window.taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
+    const DWORD taskbar_message_error =
+        g_app.window.taskbar_created == 0 ? GetLastError() : ERROR_SUCCESS;
     g_app.window.launched_at_startup = CommandLineHasFlag(L"--startup");
     EnableSystemMenuTheme();
     const HRESULT co_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     g_app.window.com_initialized = SUCCEEDED(co_result);
     LoadAppConfig();
     simple_monitor::ResetLog();
-    LogInfo(L"event=startup build=dev command_line=%ls", GetCommandLineW());
+    LogInfo(
+        L"event=startup schema=2 build=dev launch=%ls taskbar_message_id=%u com_hresult=0x%08lx",
+        g_app.window.launched_at_startup ? L"startup" : L"manual",
+        g_app.window.taskbar_created,
+        static_cast<unsigned long>(co_result));
+    LogConfigSnapshot(L"config_loaded");
+    if (taskbar_message_error != ERROR_SUCCESS) {
+        LogError(
+            L"event=startup_component_failed component=taskbar_message error=%lu",
+            taskbar_message_error);
+    }
+    if (FAILED(co_result)) {
+        LogWarning(
+            L"event=startup_component_failed component=com hresult=0x%08lx",
+            static_cast<unsigned long>(co_result));
+    }
 
     using DpiAwarenessContext = HANDLE;
     using SetProcessDpiAwarenessContextFn = BOOL(WINAPI*)(DpiAwarenessContext);
@@ -2511,10 +3766,25 @@ int Run(HINSTANCE instance) {
         reinterpret_cast<SetProcessDpiAwarenessContextFn>(
             GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext"));
     if (set_dpi_awareness) {
-        set_dpi_awareness(reinterpret_cast<DpiAwarenessContext>(-4));
+        if (!set_dpi_awareness(reinterpret_cast<DpiAwarenessContext>(-4))) {
+            const DWORD error = GetLastError();
+            if (error == ERROR_ACCESS_DENIED) {
+                LogDebug(
+                    L"event=startup_component_state component=dpi_awareness "
+                    L"state=already_configured error=%lu",
+                    static_cast<unsigned long>(error));
+            } else {
+                LogWarning(
+                    L"event=startup_component_failed component=dpi_awareness error=%lu",
+                    static_cast<unsigned long>(error));
+            }
+        }
+    } else {
+        LogDebug(L"event=startup_component_unavailable component=dpi_awareness_api");
     }
 
     if (!RegisterWindowClasses(instance)) {
+        LogError(L"event=startup_failed stage=register_window_classes");
         if (g_app.window.com_initialized) {
             CoUninitialize();
         }
@@ -2536,6 +3806,9 @@ int Run(HINSTANCE instance) {
         nullptr);
 
     if (!controller) {
+        LogError(
+            L"event=startup_failed stage=create_controller error=%lu",
+            GetLastError());
         if (g_app.window.com_initialized) {
             CoUninitialize();
         }
@@ -2543,16 +3816,20 @@ int Run(HINSTANCE instance) {
     }
 
     MSG msg{};
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+    BOOL message_result = 0;
+    while ((message_result = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
+    }
+    if (message_result == -1) {
+        LogError(L"event=message_loop_failed error=%lu", GetLastError());
     }
 
     if (g_app.window.com_initialized) {
         CoUninitialize();
     }
 
-    return static_cast<int>(msg.wParam);
+    return message_result == -1 ? 1 : static_cast<int>(msg.wParam);
 }
 
 } // namespace

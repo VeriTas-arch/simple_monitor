@@ -21,7 +21,10 @@ key_font_size=14
 network_arrow_style=thin
 network_arrow_font_size=17
 network_arrow_gap=3
+
+; Enable diagnostics and choose: debug, info, warning, or error.
 debug_log=0
+log_level=info
 
 ; Show the compact CAP/INS/NUM status widget after the disk column.
 show_key_widget=1
