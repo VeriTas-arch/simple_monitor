@@ -19,8 +19,9 @@ build/simple_monitor.exe
 The taskbar-visibility beta is generated separately at
 `build/simple_monitor_dev.exe`. Its hidden controller survives Shell changes
 and recreates a disposable taskbar-owned overlay as needed. The overlay does
-not force global topmost state. It follows the taskbar owner, suppresses itself
-when the taskbar has no meaningful visible area, and uses the Windows
+maintain topmost state while visible so Shell z-order changes cannot bury it.
+It follows the taskbar owner, suppresses itself when the taskbar has no
+meaningful visible area, and uses the Windows
 notification state plus full-monitor coverage to identify presentation mode.
 Build only that target with:
 
@@ -34,8 +35,8 @@ For the usual edit-build-run loop during development, use:
 .\dev-rebuild.ps1
 ```
 
-It stops any running `simple_monitor.exe` and rebuilds the project. Start the
-new executable manually after the build completes.
+It stops any running `simple_monitor_dev.exe` and rebuilds only the dev target.
+Start the new executable manually after the build completes.
 
 ## Current MVP
 
@@ -57,7 +58,8 @@ to keep the taskbar layout stable while values change.
 
 The program reads `simple_monitor.ini` from the executable directory. For
 example, when running `build\simple_monitor.exe`, place the config at
-`build\simple_monitor.ini`.
+`build\simple_monitor.ini`. The tracked `simple_monitor.ini.example` can be
+copied there as a starting point.
 
 ```ini
 [layout]
@@ -89,12 +91,18 @@ Network arrow styles are `thin` (`↑`/`↓`), `triangle` (`▲`/`▼`), `heavy`
 
 Set `debug_log=1` to write event-oriented diagnostics to `debug.log` next to
 the executable. The log records placement changes, tray layout events,
-fullscreen or presentation suppression, and screenshot freeze transitions.
+fullscreen or presentation suppression context, overlay restoration state,
+and screenshot freeze transitions. Each UTF-8 record contains a timestamp,
+severity, process ID, thread ID, and `event=...` fields. On startup, the
+previous session is retained as `debug.log.1`; the active log also rotates at
+2 MiB so logging cannot grow without bound.
 
-`Start with Windows` writes the current executable path to
-`HKCU Run\SimpleMonitor`. The app applies a short startup warmup before using
-its fullscreen-window suppression heuristic, so Explorer and the taskbar have
-time to settle. Disabling startup removes that `HKCU Run` value.
+`Start with Windows` writes the current executable path under `HKCU Run`.
+The stable executable uses `SimpleMonitor`; the dev executable uses
+`SimpleMonitorDev`, so the two builds do not overwrite each other's setting.
+The app applies a short startup warmup before using its fullscreen-window
+suppression heuristic, so Explorer and the taskbar have time to settle.
+Disabling startup removes the corresponding value.
 
 ## Design boundary
 

@@ -16,7 +16,19 @@ add_executable(simple_monitor_dev WIN32
     app.rc
 )
 
-foreach(target simple_monitor simple_monitor_dev)
+set(SIMPLE_MONITOR_TARGETS
+    simple_monitor
+    simple_monitor_dev
+)
+
+set(SIMPLE_MONITOR_COMMON_SOURCES
+    src/app_support.cpp
+    src/logging.cpp
+)
+
+foreach(target IN LISTS SIMPLE_MONITOR_TARGETS)
+    target_sources(${target} PRIVATE ${SIMPLE_MONITOR_COMMON_SOURCES})
+
     target_link_libraries(${target} PRIVATE
         user32
         gdi32
@@ -36,7 +48,7 @@ endforeach()
 # Enable MinGW Unicode entry point handling so the app uses `wWinMain`
 # instead of the ANSI `WinMain` startup path.
 if(MINGW)
-    foreach(target simple_monitor simple_monitor_dev)
+    foreach(target IN LISTS SIMPLE_MONITOR_TARGETS)
         target_compile_options(${target} PRIVATE
             -municode
             $<$<CONFIG:Release>:-ffunction-sections>
@@ -62,7 +74,7 @@ check_ipo_supported(
 
 if(IPO_SUPPORTED)
     # Keep IPO/LTO scoped to Release builds to avoid slower debug iteration.
-    foreach(target simple_monitor simple_monitor_dev)
+    foreach(target IN LISTS SIMPLE_MONITOR_TARGETS)
         set_property(
             TARGET ${target}
             PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE

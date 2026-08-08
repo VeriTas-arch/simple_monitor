@@ -25,8 +25,10 @@
 #include <objbase.h>
 #include <oleacc.h>
 
+#include "app_support.h"
+#include "logging.h"
+
 #include <algorithm>
-#include <cstdarg>
 #include <cstdint>
 #include <cwchar>
 #include <cwctype>
@@ -44,7 +46,6 @@ namespace {
 constexpr wchar_t kControllerWindowClass[] = L"SimpleMonitorDevControllerWindow";
 constexpr wchar_t kOverlayWindowClass[] = L"SimpleMonitorOverlayWindow";
 constexpr wchar_t kRunValue[] = L"SimpleMonitorDev";
-constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
 // Timer roles:
 // - refresh: sample metrics and repaint the overlay.
@@ -200,22 +201,6 @@ struct RenderState {
     int last_frame_height = 0;
 };
 
-struct Config {
-    int content_padding_x_dip = 8;
-    int column_gap_dip = 28;
-    int gap_after_network_dip = -1;
-    int gap_after_system_dip = -1;
-    int offset_right_dip = 8;
-    int font_size_dip = 13;
-    int network_arrow_font_size_dip = 17;
-    int network_arrow_gap_dip = 3;
-    int key_font_size_dip = 13;
-    bool show_key_widget = true;
-    bool debug_log = false;
-    int gap_after_disk_dip = 14;
-    std::wstring network_arrow_style = L"thin";
-};
-
 struct AppState {
     WindowState window;
     TrayState tray;
@@ -223,10 +208,16 @@ struct AppState {
     SuppressionState suppression;
     MetricsState metrics;
     RenderState render;
-    Config config;
+    simple_monitor::Config config;
 };
 
 AppState g_app;
+
+using simple_monitor::ConfigPath;
+using simple_monitor::LogError;
+using simple_monitor::LogInfo;
+using simple_monitor::LogWarning;
+using simple_monitor::ModuleDir;
 
 // Forward declarations for cross-section entry points.
 void RenderOverlay(HWND hwnd);
@@ -285,57 +276,6 @@ double ClampPercent(double value) {
     return value;
 }
 
-std::wstring ModulePath() {
-    std::wstring path(MAX_PATH, L'\0');
-    DWORD size = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
-    while (size == path.size()) {
-        path.resize(path.size() * 2);
-        size = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
-    }
-    path.resize(size);
-    return path;
-}
-
-std::wstring ModuleDir() {
-    std::wstring path = ModulePath();
-    const size_t slash = path.find_last_of(L"\\/");
-    if (slash != std::wstring::npos) {
-        path.resize(slash);
-    }
-    return path;
-}
-
-std::wstring ConfigPath() {
-    return ModuleDir() + L"\\simple_monitor.ini";
-}
-
-std::wstring DebugLogPath() {
-    return ModuleDir() + L"\\debug.log";
-}
-
-int ReadConfigInt(const wchar_t* key, int fallback, int min_value, int max_value) {
-    const UINT raw = GetPrivateProfileIntW(L"layout", key, fallback, ConfigPath().c_str());
-    const int value = static_cast<int>(raw);
-    return std::max(min_value, std::min(max_value, value));
-}
-
-bool ReadConfigBool(const wchar_t* key, bool fallback) {
-    return GetPrivateProfileIntW(L"layout", key, fallback ? 1 : 0, ConfigPath().c_str()) != 0;
-}
-
-std::wstring ReadConfigString(const wchar_t* key, const wchar_t* fallback) {
-    wchar_t buffer[128]{};
-    GetPrivateProfileStringW(L"layout", key, fallback, buffer, ARRAYSIZE(buffer), ConfigPath().c_str());
-    return buffer;
-}
-
-std::wstring LowerString(std::wstring value) {
-    for (wchar_t& ch : value) {
-        ch = static_cast<wchar_t>(std::towlower(ch));
-    }
-    return value;
-}
-
 bool RectEquals(const RECT& a, const RECT& b) {
     return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
 }
@@ -370,144 +310,20 @@ void EnableSystemMenuTheme() {
     }
 }
 
-void ResetDebugLog() {
-    if (!g_app.config.debug_log) {
-        return;
-    }
-
-    HANDLE file = CreateFileW(
-        DebugLogPath().c_str(),
-        GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        nullptr,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        nullptr);
-    if (file != INVALID_HANDLE_VALUE) {
-        CloseHandle(file);
-    }
-}
-
-void AppendDebugLog(const wchar_t* format, ...) {
-    if (!g_app.config.debug_log) {
-        return;
-    }
-
-    wchar_t message[1024]{};
-    va_list args;
-    va_start(args, format);
-    _vsnwprintf_s(message, _countof(message), _TRUNCATE, format, args);
-    va_end(args);
-
-    SYSTEMTIME st{};
-    GetLocalTime(&st);
-
-    wchar_t line[1280]{};
-    _snwprintf_s(
-        line,
-        _countof(line),
-        _TRUNCATE,
-        L"[%04u-%02u-%02u %02u:%02u:%02u.%03u] %ls\r\n",
-        st.wYear,
-        st.wMonth,
-        st.wDay,
-        st.wHour,
-        st.wMinute,
-        st.wSecond,
-        st.wMilliseconds,
-        message);
-
-    HANDLE file = CreateFileW(
-        DebugLogPath().c_str(),
-        FILE_APPEND_DATA,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        nullptr,
-        OPEN_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        return;
-    }
-
-    const int line_chars = static_cast<int>(std::wcslen(line));
-    const int bytes_to_write = WideCharToMultiByte(CP_UTF8, 0, line, line_chars, nullptr, 0, nullptr, nullptr);
-    if (bytes_to_write > 0) {
-        std::vector<char> buffer(static_cast<size_t>(bytes_to_write));
-        if (WideCharToMultiByte(CP_UTF8, 0, line, line_chars, buffer.data(), bytes_to_write, nullptr, nullptr) > 0) {
-            DWORD written = 0;
-            WriteFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &written, nullptr);
-        }
-    }
-
-    CloseHandle(file);
-}
-
 // Configuration.
-void LoadConfig() {
-    g_app.config.content_padding_x_dip = ReadConfigInt(L"content_padding_x", 8, 0, 80);
-    g_app.config.column_gap_dip = ReadConfigInt(L"column_gap", 28, 0, 220);
-    g_app.config.gap_after_network_dip = ReadConfigInt(L"gap_after_network", -1, -1, 220);
-    g_app.config.gap_after_system_dip = ReadConfigInt(L"gap_after_system", -1, -1, 220);
-    g_app.config.offset_right_dip = ReadConfigInt(L"offset_right", 8, -200, 400);
-    g_app.config.font_size_dip = ReadConfigInt(L"font_size", 13, 8, 28);
-    g_app.config.network_arrow_font_size_dip = ReadConfigInt(L"network_arrow_font_size", 17, 8, 36);
-    g_app.config.network_arrow_gap_dip = ReadConfigInt(L"network_arrow_gap", 3, 0, 20);
-    g_app.config.key_font_size_dip = ReadConfigInt(L"key_font_size", g_app.config.font_size_dip, 8, 36);
-    g_app.config.show_key_widget = ReadConfigBool(L"show_key_widget", true);
-    g_app.config.debug_log = ReadConfigBool(L"debug_log", false);
-    g_app.config.gap_after_disk_dip = ReadConfigInt(L"gap_after_disk", 14, 0, 220);
-    g_app.config.network_arrow_style = LowerString(ReadConfigString(L"network_arrow_style", L"thin"));
+void LoadAppConfig() {
+    g_app.config = simple_monitor::LoadConfig();
+    simple_monitor::ConfigureLogging(g_app.config.debug_log, simple_monitor::DebugLogPath());
 }
 
 // Startup integration.
 bool IsStartupEnabled() {
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_READ, &key) != ERROR_SUCCESS) {
-        return false;
-    }
-
-    wchar_t value[2048]{};
-    DWORD value_size = sizeof(value);
-    DWORD type = 0;
-    LONG result = RegQueryValueExW(key, kRunValue, nullptr, &type, reinterpret_cast<LPBYTE>(value), &value_size);
-    RegCloseKey(key);
-
-    return result == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ);
-}
-
-void DeleteLegacyRunStartup() {
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &key) == ERROR_SUCCESS) {
-        RegDeleteValueW(key, kRunValue);
-        RegCloseKey(key);
-    }
-}
-
-bool SetLegacyRunStartup() {
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &key) != ERROR_SUCCESS) {
-        return false;
-    }
-
-    std::wstring command = L"\"" + ModulePath() + L"\" --startup";
-    LONG result = RegSetValueExW(
-        key,
-        kRunValue,
-        0,
-        REG_SZ,
-        reinterpret_cast<const BYTE*>(command.c_str()),
-        static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
-    RegCloseKey(key);
-    return result == ERROR_SUCCESS;
+    return simple_monitor::IsStartupEnabled(kRunValue);
 }
 
 void SetStartupEnabled(bool enabled) {
-    if (enabled) {
-        if (!SetLegacyRunStartup()) {
-            AppendDebugLog(L"startup_hkcu_run=set_failed");
-        }
-    } else {
-        DeleteLegacyRunStartup();
+    if (!simple_monitor::SetStartupEnabled(kRunValue, enabled)) {
+        LogError(L"event=startup_setting_failed enabled=%d", enabled ? 1 : 0);
     }
 }
 
@@ -554,9 +370,24 @@ bool WindowClassIs(HWND hwnd, const wchar_t* class_name) {
            std::wcscmp(current_class, class_name) == 0;
 }
 
+std::wstring WindowClassName(HWND hwnd) {
+    wchar_t class_name[128]{};
+    if (!hwnd || GetClassNameW(hwnd, class_name, ARRAYSIZE(class_name)) == 0) {
+        return L"";
+    }
+    return class_name;
+}
+
 bool IsTaskbarWindowClass(HWND hwnd) {
     return WindowClassIs(hwnd, L"Shell_TrayWnd") ||
            WindowClassIs(hwnd, L"Shell_SecondaryTrayWnd");
+}
+
+bool IsTaskbarPreviewWindow(HWND hwnd) {
+    // Taskbar previews and Task View can cover the monitor without representing
+    // a fullscreen application.
+    return WindowClassIs(hwnd, L"TaskListThumbnailWnd") ||
+           WindowClassIs(hwnd, L"XamlExplorerHostIslandWindow");
 }
 
 bool IsBuiltinScreenshotForeground() {
@@ -653,13 +484,14 @@ bool ForegroundWindowCoversMonitor() {
     if (!foreground ||
         foreground == g_app.window.overlay_hwnd ||
         foreground == g_app.window.controller_hwnd ||
+        IsTaskbarPreviewWindow(foreground) ||
         !IsWindowVisible(foreground) ||
         IsIconic(foreground)) {
         return false;
     }
 
     HWND root = GetAncestor(foreground, GA_ROOT);
-    if (!root || IsTaskbarRelatedWindow(root)) {
+    if (!root || IsTaskbarRelatedWindow(root) || IsTaskbarPreviewWindow(root)) {
         return false;
     }
 
@@ -693,6 +525,25 @@ bool IsHighConfidenceFullscreenPresentation() {
            state == QUNS_PRESENTATION_MODE;
 }
 
+const wchar_t* NotificationStateName(QUERY_USER_NOTIFICATION_STATE state) {
+    switch (state) {
+    case QUNS_NOT_PRESENT:
+        return L"not_present";
+    case QUNS_BUSY:
+        return L"busy";
+    case QUNS_RUNNING_D3D_FULL_SCREEN:
+        return L"d3d_fullscreen";
+    case QUNS_PRESENTATION_MODE:
+        return L"presentation_mode";
+    case QUNS_ACCEPTS_NOTIFICATIONS:
+        return L"accepts_notifications";
+    case QUNS_QUIET_TIME:
+        return L"quiet_time";
+    default:
+        return L"unknown";
+    }
+}
+
 SuppressionReason GetSuppressionReason() {
     if (!TaskbarHasVisibleArea()) {
         return SuppressionReason::TaskbarHidden;
@@ -713,6 +564,72 @@ const wchar_t* SuppressionReasonName(SuppressionReason reason) {
     default:
         return L"none";
     }
+}
+
+void LogSuppressionContext(SuppressionReason reason) {
+    if (!g_app.config.debug_log) {
+        return;
+    }
+
+    QUERY_USER_NOTIFICATION_STATE notification_state = QUNS_NOT_PRESENT;
+    const HRESULT notification_result = SHQueryUserNotificationState(&notification_state);
+    HWND foreground = GetForegroundWindow();
+    HWND root = foreground ? GetAncestor(foreground, GA_ROOT) : nullptr;
+    HWND taskbar = TaskbarWindow();
+
+    RECT foreground_rect{};
+    RECT root_rect{};
+    RECT monitor_rect{};
+    RECT taskbar_rect{};
+    GetWindowRect(foreground, &foreground_rect);
+    GetWindowRect(root, &root_rect);
+    GetWindowRect(taskbar, &taskbar_rect);
+
+    HMONITOR monitor = root ? MonitorFromWindow(root, MONITOR_DEFAULTTONEAREST) : nullptr;
+    if (monitor) {
+        MONITORINFO monitor_info{};
+        monitor_info.cbSize = sizeof(monitor_info);
+        if (GetMonitorInfoW(monitor, &monitor_info)) {
+            monitor_rect = monitor_info.rcMonitor;
+        }
+    }
+
+    const std::wstring foreground_exe = WindowProcessBasename(foreground);
+    const std::wstring root_exe = WindowProcessBasename(root);
+    const std::wstring foreground_class = WindowClassName(foreground);
+    const std::wstring root_class = WindowClassName(root);
+    LogInfo(
+        L"event=suppression_context reason=%ls notification_hr=0x%08lx notification_state=%d notification_name=%ls "
+        L"foreground_hwnd=%p foreground_exe=%ls foreground_class=%ls foreground_rect=(%ld,%ld,%ld,%ld) "
+        L"root_hwnd=%p root_exe=%ls root_class=%ls root_rect=(%ld,%ld,%ld,%ld) "
+        L"monitor_rect=(%ld,%ld,%ld,%ld) taskbar_hwnd=%p taskbar_rect=(%ld,%ld,%ld,%ld)",
+        SuppressionReasonName(reason),
+        static_cast<unsigned long>(notification_result),
+        static_cast<int>(notification_state),
+        NotificationStateName(notification_state),
+        foreground,
+        foreground_exe.c_str(),
+        foreground_class.c_str(),
+        foreground_rect.left,
+        foreground_rect.top,
+        foreground_rect.right,
+        foreground_rect.bottom,
+        root,
+        root_exe.c_str(),
+        root_class.c_str(),
+        root_rect.left,
+        root_rect.top,
+        root_rect.right,
+        root_rect.bottom,
+        monitor_rect.left,
+        monitor_rect.top,
+        monitor_rect.right,
+        monitor_rect.bottom,
+        taskbar,
+        taskbar_rect.left,
+        taskbar_rect.top,
+        taskbar_rect.right,
+        taskbar_rect.bottom);
 }
 
 // Metric formatting and sampling.
@@ -871,7 +788,7 @@ void InitPdhGroup(PdhGroup& group, const wchar_t* wildcard_path) {
         &buffer_size,
         0);
 
-    if (expand_result != PDH_MORE_DATA || buffer_size == 0) {
+    if (expand_result != static_cast<PDH_STATUS>(PDH_MORE_DATA) || buffer_size == 0) {
         PdhCloseQuery(group.query);
         group.query = nullptr;
         return;
@@ -1345,12 +1262,12 @@ void RepositionWindow() {
 
     SetWindowPos(
         overlay,
-        nullptr,
+        HWND_TOPMOST,
         x,
         y,
         width,
         height,
-        SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
 
     RECT overlay_rect{x, y, x + width, y + height};
     const bool taskbar_changed = !g_app.placement.has_last_logged_taskbar_rect || !RectEquals(taskbar, g_app.placement.last_logged_taskbar_rect);
@@ -1360,8 +1277,8 @@ void RepositionWindow() {
                             !g_app.placement.has_last_logged_anchor_rect || !RectEquals(anchor_rect, g_app.placement.last_logged_anchor_rect));
     const bool overlay_changed = !g_app.placement.has_last_logged_overlay_rect || !RectEquals(overlay_rect, g_app.placement.last_logged_overlay_rect);
     if (taskbar_changed || anchor_changed || overlay_changed) {
-        AppendDebugLog(
-            L"placement taskbar=(%ld,%ld,%ld,%ld) anchor_mode=%d anchor=(%ld,%ld,%ld,%ld) overlay=(%ld,%ld,%ld,%ld)",
+        LogInfo(
+            L"event=placement taskbar=(%ld,%ld,%ld,%ld) anchor_mode=%d anchor=(%ld,%ld,%ld,%ld) overlay=(%ld,%ld,%ld,%ld)",
             taskbar.left,
             taskbar.top,
             taskbar.right,
@@ -1432,6 +1349,27 @@ void RemoveTrayIcon(HWND hwnd) {
     Shell_NotifyIconW(NIM_DELETE, &nid);
 }
 
+void LogOverlayWindowState(const wchar_t* event_name, HWND overlay) {
+    if (!g_app.config.debug_log || !overlay || !IsWindow(overlay)) {
+        return;
+    }
+
+    const LONG_PTR ex_style = GetWindowLongPtrW(overlay, GWL_EXSTYLE);
+    HWND above = GetWindow(overlay, GW_HWNDPREV);
+    const std::wstring above_exe = WindowProcessBasename(above);
+    const std::wstring above_class = WindowClassName(above);
+    LogInfo(
+        L"event=%ls hwnd=%p visible=%d topmost=%d owner=%p above_hwnd=%p above_exe=%ls above_class=%ls",
+        event_name,
+        overlay,
+        IsWindowVisible(overlay) ? 1 : 0,
+        (ex_style & WS_EX_TOPMOST) != 0 ? 1 : 0,
+        GetWindow(overlay, GW_OWNER),
+        above,
+        above_exe.c_str(),
+        above_class.c_str());
+}
+
 void DestroyOverlayWindow(const wchar_t* reason) {
     HWND overlay = g_app.window.overlay_hwnd;
     if (!overlay || !IsWindow(overlay)) {
@@ -1440,12 +1378,12 @@ void DestroyOverlayWindow(const wchar_t* reason) {
         return;
     }
 
-    AppendDebugLog(L"event=overlay_destroy_requested reason=%ls hwnd=%p", reason, overlay);
+    LogInfo(L"event=overlay_destroy_requested reason=%ls hwnd=%p", reason, overlay);
     g_app.window.overlay_destroy_expected = true;
     const BOOL destroyed = DestroyWindow(overlay);
     g_app.window.overlay_destroy_expected = false;
     if (!destroyed && IsWindow(overlay)) {
-        AppendDebugLog(L"event=overlay_destroy_failed error=%lu", GetLastError());
+        LogError(L"event=overlay_destroy_failed error=%lu", GetLastError());
         return;
     }
     g_app.window.overlay_hwnd = nullptr;
@@ -1471,6 +1409,7 @@ bool EnsureOverlayWindow() {
 
     const DWORD ex_style =
         WS_EX_TOOLWINDOW |
+        WS_EX_TOPMOST |
         WS_EX_LAYERED |
         WS_EX_NOACTIVATE;
     overlay = CreateWindowExW(
@@ -1487,7 +1426,7 @@ bool EnsureOverlayWindow() {
         g_app.window.instance,
         nullptr);
     if (!overlay) {
-        AppendDebugLog(L"event=overlay_create_failed error=%lu", GetLastError());
+        LogError(L"event=overlay_create_failed error=%lu", GetLastError());
         return false;
     }
 
@@ -1495,7 +1434,7 @@ bool EnsureOverlayWindow() {
     g_app.window.dpi = WindowDpi(overlay);
     g_app.placement.taskbar_owner = taskbar;
     UpdateLayeredStyle(overlay);
-    AppendDebugLog(
+    LogInfo(
         L"event=overlay_created hwnd=%p requested_owner=%p effective_owner=%p",
         overlay,
         taskbar,
@@ -1512,7 +1451,7 @@ bool ReconnectTaskbarIfNeeded(bool force) {
         return false;
     }
 
-    AppendDebugLog(
+    LogInfo(
         L"event=taskbar_reconnect force=%d old_hwnd=%p new_hwnd=%p old_pid=%lu new_pid=%lu",
         force ? 1 : 0,
         g_app.placement.observed_taskbar,
@@ -1535,7 +1474,8 @@ bool ReconnectTaskbarIfNeeded(bool force) {
 }
 
 void ReloadConfigAndRefresh() {
-    LoadConfig();
+    LoadAppConfig();
+    LogInfo(L"event=config_reloaded debug_log=%d", g_app.config.debug_log ? 1 : 0);
     if (!EnsureOverlayWindow()) {
         return;
     }
@@ -1548,7 +1488,7 @@ void ReloadConfigAndRefresh() {
 }
 
 void RecoverTaskbar() {
-    AppendDebugLog(L"event=manual_taskbar_recovery");
+    LogInfo(L"event=manual_taskbar_recovery");
     ReconnectTaskbarIfNeeded(true);
     if (!EnsureOverlayWindow()) {
         return;
@@ -1561,6 +1501,7 @@ void RecoverTaskbar() {
     RepositionWindow();
     ResetLayeredSurface(overlay);
     RenderOverlay(overlay);
+    LogOverlayWindowState(L"manual_recovery_complete", overlay);
 }
 
 bool HandleMenuCommand(HWND hwnd, UINT command) {
@@ -1632,6 +1573,7 @@ void ShowTrayMenu(HWND hwnd) {
 HRESULT EnsureRenderResources() {
     RenderResources& render = g_app.render.resources;
     HRESULT hr = S_OK;
+    const bool dpi_changed = render.text_format_dpi != g_app.window.dpi;
 
     if (!render.d2d_factory) {
         hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &render.d2d_factory);
@@ -1662,7 +1604,7 @@ HRESULT EnsureRenderResources() {
     }
 
     if (!render.text_format ||
-        render.text_format_dpi != g_app.window.dpi ||
+        dpi_changed ||
         render.text_format_font_size_dip != g_app.config.font_size_dip) {
         SafeRelease(render.text_format);
         hr = render.dwrite_factory->CreateTextFormat(
@@ -1680,12 +1622,11 @@ HRESULT EnsureRenderResources() {
 
         render.text_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         render.text_format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-        render.text_format_dpi = g_app.window.dpi;
         render.text_format_font_size_dip = g_app.config.font_size_dip;
     }
 
     if (!render.arrow_text_format ||
-        render.text_format_dpi != g_app.window.dpi ||
+        dpi_changed ||
         render.arrow_text_format_font_size_dip != g_app.config.network_arrow_font_size_dip) {
         SafeRelease(render.arrow_text_format);
         hr = render.dwrite_factory->CreateTextFormat(
@@ -1707,7 +1648,7 @@ HRESULT EnsureRenderResources() {
     }
 
     if (!render.key_text_format ||
-        render.text_format_dpi != g_app.window.dpi ||
+        dpi_changed ||
         render.key_text_format_font_size_dip != g_app.config.key_font_size_dip) {
         SafeRelease(render.key_text_format);
         hr = render.dwrite_factory->CreateTextFormat(
@@ -1727,6 +1668,8 @@ HRESULT EnsureRenderResources() {
         render.key_text_format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         render.key_text_format_font_size_dip = g_app.config.key_font_size_dip;
     }
+
+    render.text_format_dpi = g_app.window.dpi;
 
     return S_OK;
 }
@@ -1990,13 +1933,13 @@ void DrawAdaptiveColumnsDwrite(
 bool PresentPixels(HWND hwnd, const BYTE* source_pixels, int width, int height) {
     RECT window_rect{};
     if (!GetWindowRect(hwnd, &window_rect) || width <= 0 || height <= 0 || !source_pixels) {
-        AppendDebugLog(L"present_failed stage=validate error=%lu width=%d height=%d", GetLastError(), width, height);
+        LogError(L"event=present_failed stage=validate error=%lu width=%d height=%d", GetLastError(), width, height);
         return false;
     }
 
     HDC screen_dc = GetDC(nullptr);
     if (!screen_dc) {
-        AppendDebugLog(L"present_failed stage=get_screen_dc error=%lu", GetLastError());
+        LogError(L"event=present_failed stage=get_screen_dc error=%lu", GetLastError());
         return false;
     }
 
@@ -2020,7 +1963,7 @@ bool PresentPixels(HWND hwnd, const BYTE* source_pixels, int width, int height) 
             DeleteDC(mem_dc);
         }
         ReleaseDC(nullptr, screen_dc);
-        AppendDebugLog(L"present_failed stage=create_bitmap error=%lu", error);
+        LogError(L"event=present_failed stage=create_bitmap error=%lu", error);
         return false;
     }
 
@@ -2042,7 +1985,7 @@ bool PresentPixels(HWND hwnd, const BYTE* source_pixels, int width, int height) 
     DeleteDC(mem_dc);
     ReleaseDC(nullptr, screen_dc);
     if (!updated) {
-        AppendDebugLog(L"present_failed stage=update_layered_window error=%lu width=%d height=%d", update_error, width, height);
+        LogError(L"event=present_failed stage=update_layered_window error=%lu width=%d height=%d", update_error, width, height);
     }
     return updated != FALSE;
 }
@@ -2060,12 +2003,12 @@ void ResetLayeredSurface(HWND hwnd) {
     SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style);
     SetWindowPos(
         hwnd,
-        nullptr,
+        HWND_TOPMOST,
         0,
         0,
         0,
         0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
     ReapplyLastFrame(hwnd);
 }
 
@@ -2075,7 +2018,8 @@ bool UpdateOverlaySuppression(HWND hwnd) {
     const bool is_visible = IsWindowVisible(hwnd) != FALSE;
     if (should_suppress) {
         if (g_app.suppression.active_reason != reason) {
-            AppendDebugLog(L"suppression=on reason=%ls", SuppressionReasonName(reason));
+            LogInfo(L"event=suppression_on reason=%ls", SuppressionReasonName(reason));
+            LogSuppressionContext(reason);
         }
         g_app.suppression.active_reason = reason;
         if (is_visible) {
@@ -2087,7 +2031,7 @@ bool UpdateOverlaySuppression(HWND hwnd) {
     if (g_app.suppression.active_reason != SuppressionReason::None) {
         const SuppressionReason previous_reason = g_app.suppression.active_reason;
         g_app.suppression.active_reason = SuppressionReason::None;
-        AppendDebugLog(L"suppression=off previous_reason=%ls", SuppressionReasonName(previous_reason));
+        LogInfo(L"event=suppression_off previous_reason=%ls", SuppressionReasonName(previous_reason));
 
         if (previous_reason == SuppressionReason::FullscreenPresentation) {
             DestroyOverlayWindow(L"presentation_exit");
@@ -2101,6 +2045,7 @@ bool UpdateOverlaySuppression(HWND hwnd) {
         RepositionWindow();
         ReapplyLastFrame(hwnd);
         RenderOverlay(hwnd);
+        LogOverlayWindowState(L"suppression_restore_complete", hwnd);
         return true;
     }
 
@@ -2110,7 +2055,7 @@ bool UpdateOverlaySuppression(HWND hwnd) {
 bool UpdateFreezeState(HWND hwnd) {
     if (ShouldFreezeOverlayUpdate()) {
         if (!g_app.suppression.overlay_update_frozen) {
-            AppendDebugLog(L"freeze=on reason=screenshot");
+            LogInfo(L"event=freeze_on reason=screenshot");
         }
         g_app.suppression.overlay_update_frozen = true;
         ReapplyLastFrame(hwnd);
@@ -2119,7 +2064,7 @@ bool UpdateFreezeState(HWND hwnd) {
 
     if (g_app.suppression.overlay_update_frozen) {
         g_app.suppression.overlay_update_frozen = false;
-        AppendDebugLog(L"freeze=off");
+        LogInfo(L"event=freeze_off");
         g_app.suppression.refresh_resume_tick = GetTickCount() + 800;
         ReapplyLastFrame(hwnd);
         return true;
@@ -2252,7 +2197,7 @@ void RenderOverlay(HWND hwnd) {
                 }
             }
             if (!has_visible_pixels) {
-                AppendDebugLog(L"render_empty_frame width=%d height=%d", width, height);
+                LogWarning(L"event=render_empty_frame width=%d height=%d", width, height);
             }
         }
         if (SUCCEEDED(hr) && PresentPixels(hwnd, frame.data(), width, height)) {
@@ -2274,7 +2219,7 @@ void ValidatePaint(HWND hwnd) {
 }
 
 LRESULT HandleTaskbarCreated() {
-    AppendDebugLog(L"event=taskbar_created");
+    LogInfo(L"event=taskbar_created");
     if (!g_app.window.monitor_initialized) {
         return 0;
     }
@@ -2300,7 +2245,7 @@ void InitializeMonitor(HWND controller) {
     }
 
     g_app.window.monitor_initialized = true;
-    AppendDebugLog(L"monitor_init delayed=%d", g_app.window.launched_at_startup ? 1 : 0);
+    LogInfo(L"event=monitor_init delayed=%d", g_app.window.launched_at_startup ? 1 : 0);
     g_app.placement.observed_taskbar = TaskbarWindow();
     g_app.placement.observed_taskbar_process_id = WindowProcessId(g_app.placement.observed_taskbar);
     AddTrayIcon(controller);
@@ -2326,7 +2271,6 @@ void InitializeMonitor(HWND controller) {
 
 LRESULT HandleControllerCreate(HWND hwnd) {
     g_app.window.controller_hwnd = hwnd;
-    LoadConfig();
     if (g_app.window.launched_at_startup) {
         SetTimer(hwnd, kStartupInitTimer, kStartupInitDelayMs, nullptr);
     } else {
@@ -2372,12 +2316,12 @@ LRESULT HandleDpiChanged(HWND hwnd, WPARAM wparam, LPARAM lparam) {
         const RECT* suggested = reinterpret_cast<const RECT*>(lparam);
         SetWindowPos(
             hwnd,
-            nullptr,
+            HWND_TOPMOST,
             suggested->left,
             suggested->top,
             suggested->right - suggested->left,
             suggested->bottom - suggested->top,
-            SWP_NOACTIVATE | SWP_NOZORDER);
+            SWP_NOACTIVATE);
     }
     if (UpdateOverlaySuppression(hwnd)) {
         return 0;
@@ -2418,7 +2362,7 @@ LRESULT HandleTrayLayoutChanged() {
         return 0;
     }
 
-    AppendDebugLog(L"event=tray_layout_changed");
+    LogInfo(L"event=tray_layout_changed");
     ReconnectTaskbarIfNeeded(false);
     if (!EnsureOverlayWindow()) {
         return 0;
@@ -2442,6 +2386,7 @@ LRESULT HandleTrayIcon(HWND hwnd, LPARAM lparam) {
 }
 
 LRESULT HandleControllerDestroy(HWND hwnd) {
+    LogInfo(L"event=shutdown build=dev");
     g_app.window.monitor_initialized = false;
     KillTimer(hwnd, kRefreshTimer);
     KillTimer(hwnd, kPlacementTimer);
@@ -2476,7 +2421,7 @@ LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
     case WM_DESTROY:
         if (g_app.window.overlay_hwnd == hwnd) {
             const bool expected = g_app.window.overlay_destroy_expected;
-            AppendDebugLog(L"event=overlay_destroyed hwnd=%p expected=%d", hwnd, expected ? 1 : 0);
+            LogInfo(L"event=overlay_destroyed hwnd=%p expected=%d", hwnd, expected ? 1 : 0);
             g_app.window.overlay_hwnd = nullptr;
             g_app.placement.taskbar_owner = nullptr;
             if (!expected && g_app.window.monitor_initialized && g_app.window.controller_hwnd) {
@@ -2556,9 +2501,9 @@ int Run(HINSTANCE instance) {
     EnableSystemMenuTheme();
     const HRESULT co_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     g_app.window.com_initialized = SUCCEEDED(co_result);
-    LoadConfig();
-    ResetDebugLog();
-    AppendDebugLog(L"startup debug_log=1 command_line=%ls", GetCommandLineW());
+    LoadAppConfig();
+    simple_monitor::ResetLog();
+    LogInfo(L"event=startup build=dev command_line=%ls", GetCommandLineW());
 
     using DpiAwarenessContext = HANDLE;
     using SetProcessDpiAwarenessContextFn = BOOL(WINAPI*)(DpiAwarenessContext);
