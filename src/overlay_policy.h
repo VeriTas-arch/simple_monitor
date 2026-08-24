@@ -1,0 +1,204 @@
+#pragma once
+
+#include <cstdint>
+
+namespace simple_monitor::overlay_policy {
+
+enum class SuppressionReason {
+    None,
+    TaskbarHidden,
+    FullscreenPresentation,
+};
+
+enum class TaskbarVisibility {
+    Unknown,
+    Hidden,
+    Visible,
+};
+
+enum class PresentationVisibility {
+    Unknown,
+    Clear,
+    Fullscreen,
+};
+
+struct SuppressionObservation {
+    bool known = false;
+    SuppressionReason reason = SuppressionReason::None;
+};
+
+constexpr SuppressionObservation ResolveSuppressionObservation(
+    TaskbarVisibility taskbar,
+    bool screenshot_foreground,
+    PresentationVisibility presentation) {
+    if (screenshot_foreground) {
+        return {};
+    }
+    if (taskbar == TaskbarVisibility::Unknown) {
+        return {};
+    }
+    if (taskbar == TaskbarVisibility::Hidden) {
+        return {true, SuppressionReason::TaskbarHidden};
+    }
+    if (presentation == PresentationVisibility::Unknown) {
+        return {};
+    }
+    return {
+        true,
+        presentation == PresentationVisibility::Fullscreen
+            ? SuppressionReason::FullscreenPresentation
+            : SuppressionReason::None,
+    };
+}
+
+struct SuppressionPolicyConfig {
+    std::uint64_t enter_delay_ms = 250;
+    std::uint64_t exit_delay_ms = 500;
+};
+
+struct SuppressionPolicyState {
+    SuppressionReason committed = SuppressionReason::None;
+    SuppressionReason candidate = SuppressionReason::None;
+    std::uint64_t candidate_since_ms = 0;
+    bool candidate_active = false;
+};
+
+struct SuppressionPolicyResult {
+    SuppressionPolicyState state;
+    SuppressionReason previous_committed = SuppressionReason::None;
+    std::uint64_t candidate_dwell_ms = 0;
+    bool committed_changed = false;
+};
+
+constexpr SuppressionPolicyResult ReduceSuppressionPolicy(
+    SuppressionPolicyState state,
+    SuppressionObservation observation,
+    std::uint64_t now_ms,
+    SuppressionPolicyConfig config = {}) {
+    SuppressionPolicyResult result{};
+    result.state = state;
+    result.previous_committed = state.committed;
+
+    if (!observation.known || observation.reason == state.committed) {
+        result.state.candidate = state.committed;
+        result.state.candidate_since_ms = 0;
+        result.state.candidate_active = false;
+        return result;
+    }
+
+    if (!state.candidate_active || state.candidate != observation.reason) {
+        result.state.candidate = observation.reason;
+        result.state.candidate_since_ms = now_ms;
+        result.state.candidate_active = true;
+        return result;
+    }
+
+    result.candidate_dwell_ms = now_ms - state.candidate_since_ms;
+    const std::uint64_t required_delay =
+        observation.reason == SuppressionReason::None
+            ? config.exit_delay_ms
+            : config.enter_delay_ms;
+    if (result.candidate_dwell_ms < required_delay) {
+        return result;
+    }
+
+    result.state.committed = observation.reason;
+    result.state.candidate = observation.reason;
+    result.state.candidate_since_ms = 0;
+    result.state.candidate_active = false;
+    result.committed_changed = true;
+    return result;
+}
+
+struct OverlayIntent {
+    bool should_exist = false;
+    bool should_be_visible = false;
+    bool updates_frozen = false;
+};
+
+constexpr OverlayIntent ComputeOverlayIntent(
+    bool taskbar_ready,
+    SuppressionReason committed_suppression,
+    bool screenshot_foreground) {
+    return {
+        taskbar_ready,
+        taskbar_ready && committed_suppression == SuppressionReason::None,
+        screenshot_foreground || committed_suppression != SuppressionReason::None,
+    };
+}
+
+struct TaskbarIdentity {
+    std::uintptr_t hwnd = 0;
+    std::uint32_t process_id = 0;
+};
+
+constexpr bool operator==(TaskbarIdentity left, TaskbarIdentity right) {
+    return left.hwnd == right.hwnd && left.process_id == right.process_id;
+}
+
+constexpr bool operator!=(TaskbarIdentity left, TaskbarIdentity right) {
+    return !(left == right);
+}
+
+struct TaskbarIdentityState {
+    TaskbarIdentity committed;
+    TaskbarIdentity candidate;
+    std::uint64_t candidate_since_ms = 0;
+    bool candidate_active = false;
+};
+
+struct TaskbarIdentityResult {
+    TaskbarIdentityState state;
+    TaskbarIdentity previous_committed;
+    std::uint64_t candidate_dwell_ms = 0;
+    bool committed_changed = false;
+    bool pending = false;
+};
+
+constexpr TaskbarIdentityResult ReduceTaskbarIdentity(
+    TaskbarIdentityState state,
+    TaskbarIdentity observed,
+    std::uint64_t now_ms,
+    std::uint64_t settle_delay_ms) {
+    TaskbarIdentityResult result{};
+    result.state = state;
+    result.previous_committed = state.committed;
+
+    if (observed.hwnd == 0 || observed.process_id == 0) {
+        result.state.candidate = state.committed;
+        result.state.candidate_since_ms = 0;
+        result.state.candidate_active = false;
+        result.pending = true;
+        return result;
+    }
+
+    if (observed == state.committed) {
+        result.state.candidate = state.committed;
+        result.state.candidate_since_ms = 0;
+        result.state.candidate_active = false;
+        return result;
+    }
+
+    result.pending = true;
+    if (!state.candidate_active || state.candidate != observed) {
+        result.state.candidate = observed;
+        result.state.candidate_since_ms = now_ms;
+        result.state.candidate_active = true;
+        return result;
+    }
+
+    result.candidate_dwell_ms = now_ms - state.candidate_since_ms;
+    if (result.candidate_dwell_ms < settle_delay_ms) {
+        return result;
+    }
+
+    result.state.committed = observed;
+    result.state.candidate = observed;
+    result.state.candidate_since_ms = 0;
+    result.state.candidate_active = false;
+    result.committed_changed = true;
+    result.pending = false;
+    return result;
+}
+
+}  // namespace simple_monitor::overlay_policy

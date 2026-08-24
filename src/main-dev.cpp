@@ -28,6 +28,7 @@
 
 #include "app_support.h"
 #include "logging.h"
+#include "overlay_policy.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -64,6 +65,11 @@ constexpr DWORD kGpuGroupRefreshIntervalMs = 5000;
 constexpr DWORD kHealthLogIntervalMs = 60000;
 constexpr DWORD kOverlayRepairIntervalMs = 5000;
 constexpr DWORD kPresentStaleThresholdMs = 5000;
+constexpr std::uint64_t kTaskbarIdentitySettleMs = 250;
+constexpr simple_monitor::overlay_policy::SuppressionPolicyConfig kSuppressionPolicyConfig{
+    250,
+    500,
+};
 constexpr unsigned kFailureLogIntervalMs = 30000;
 constexpr int kMinimumTaskbarVisibleDip = 8;
 constexpr int kFullscreenCoverageToleranceDip = 2;
@@ -82,10 +88,28 @@ enum MenuId : UINT {
     ID_RECOVER_TASKBAR = 1006,
 };
 
-enum class SuppressionReason {
-    None,
-    TaskbarHidden,
-    FullscreenPresentation,
+using simple_monitor::overlay_policy::ComputeOverlayIntent;
+using simple_monitor::overlay_policy::OverlayIntent;
+using simple_monitor::overlay_policy::PresentationVisibility;
+using simple_monitor::overlay_policy::ReduceSuppressionPolicy;
+using simple_monitor::overlay_policy::ReduceTaskbarIdentity;
+using simple_monitor::overlay_policy::ResolveSuppressionObservation;
+using simple_monitor::overlay_policy::SuppressionObservation;
+using simple_monitor::overlay_policy::SuppressionPolicyState;
+using simple_monitor::overlay_policy::SuppressionReason;
+using simple_monitor::overlay_policy::TaskbarIdentity;
+using simple_monitor::overlay_policy::TaskbarIdentityState;
+using simple_monitor::overlay_policy::TaskbarVisibility;
+
+enum OverlayReconcileFlag : unsigned {
+    OverlayReconcileNone = 0,
+    OverlayReconcileSampleMetrics = 1U << 0,
+    OverlayReconcileSampleKeys = 1U << 1,
+    OverlayReconcileReposition = 1U << 2,
+    OverlayReconcileRender = 1U << 3,
+    OverlayReconcileResetSurface = 1U << 4,
+    OverlayReconcileRefreshTrayIcon = 1U << 5,
+    OverlayReconcileApplyStyle = 1U << 6,
 };
 
 enum class PreferredAppMode {
@@ -191,8 +215,7 @@ struct TrayState {
 
 struct PlacementState {
     HWND taskbar_owner = nullptr;
-    HWND observed_taskbar = nullptr;
-    DWORD observed_taskbar_process_id = 0;
+    TaskbarIdentityState taskbar_identity;
     LONG tray_layout_update_pending = 0;
     RECT last_logged_taskbar_rect{};
     RECT last_logged_anchor_rect{};
@@ -204,10 +227,23 @@ struct PlacementState {
 };
 
 struct SuppressionState {
+    SuppressionPolicyState policy;
     bool overlay_update_frozen = false;
-    SuppressionReason active_reason = SuppressionReason::None;
     DWORD suppression_started_tick = 0;
     DWORD refresh_resume_tick = 0;
+    std::uint64_t decision_sequence = 0;
+};
+
+struct ReconcileState {
+    const wchar_t* pending_trigger = L"coalesced";
+    unsigned pending_flags = OverlayReconcileNone;
+    unsigned deferred_flags = OverlayReconcileNone;
+    DWORD next_destroy_retry_tick = 0;
+    DWORD next_visibility_retry_tick = 0;
+    bool recreate_pending = false;
+    bool visibility_retry_pending = false;
+    bool active = false;
+    bool pending = false;
 };
 
 struct MetricsState {
@@ -252,6 +288,7 @@ struct AppState {
     TrayState tray;
     PlacementState placement;
     SuppressionState suppression;
+    ReconcileState reconcile;
     MetricsState metrics;
     RenderState render;
     DiagnosticsState diagnostics;
@@ -273,10 +310,13 @@ using simple_monitor::ModuleDir;
 
 // Forward declarations for cross-section entry points.
 void RenderOverlay(HWND hwnd);
-bool UpdateOverlaySuppression(HWND hwnd, const wchar_t* trigger = L"unspecified");
 void ResetLayeredSurface(HWND hwnd);
 bool EnsureOverlayWindow(DWORD* error_out = nullptr);
-void DestroyOverlayWindow(const wchar_t* reason);
+bool DestroyOverlayWindow(const wchar_t* reason);
+bool PrepareOverlayForShow(HWND hwnd, const wchar_t* trigger, bool reset_surface);
+void ReconcileOverlayState(
+    const wchar_t* trigger,
+    unsigned flags = OverlayReconcileNone);
 
 // Shared utility helpers.
 ULONGLONG FileTimeToU64(const FILETIME& ft) {
@@ -511,8 +551,7 @@ bool IsTaskbarPreviewWindow(HWND hwnd) {
            WindowClassIs(hwnd, L"XamlExplorerHostIslandWindow");
 }
 
-bool IsBuiltinScreenshotForeground() {
-    HWND foreground = GetForegroundWindow();
+bool IsBuiltinScreenshotForeground(HWND foreground) {
     if (!foreground || foreground == g_app.window.overlay_hwnd) {
         return false;
     }
@@ -521,10 +560,6 @@ bool IsBuiltinScreenshotForeground() {
     return exe == L"snippingtool.exe" ||
            exe == L"screenclippinghost.exe" ||
            exe == L"snipandsketch.exe";
-}
-
-bool ShouldFreezeOverlayUpdate() {
-    return IsBuiltinScreenshotForeground();
 }
 
 HWND TaskbarWindow() {
@@ -539,32 +574,57 @@ DWORD WindowProcessId(HWND hwnd) {
     return process_id;
 }
 
-bool TaskbarHasVisibleArea() {
+TaskbarIdentity CurrentTaskbarIdentity() {
     HWND taskbar = TaskbarWindow();
-    if (!taskbar || !IsWindowVisible(taskbar) || IsIconic(taskbar)) {
-        return false;
+    return {
+        reinterpret_cast<std::uintptr_t>(taskbar),
+        static_cast<std::uint32_t>(WindowProcessId(taskbar)),
+    };
+}
+
+HWND TaskbarIdentityWindow(TaskbarIdentity identity) {
+    return reinterpret_cast<HWND>(identity.hwnd);
+}
+
+HWND CommittedTaskbarWindow() {
+    return TaskbarIdentityWindow(g_app.placement.taskbar_identity.committed);
+}
+
+DWORD CommittedTaskbarProcessId() {
+    return static_cast<DWORD>(g_app.placement.taskbar_identity.committed.process_id);
+}
+
+TaskbarVisibility ObserveTaskbarVisibility() {
+    HWND taskbar = CommittedTaskbarWindow();
+    if (!taskbar || !IsWindow(taskbar)) {
+        return TaskbarVisibility::Unknown;
+    }
+    if (!IsWindowVisible(taskbar) || IsIconic(taskbar)) {
+        return TaskbarVisibility::Hidden;
     }
 
     RECT rect{};
     if (!GetWindowRect(taskbar, &rect)) {
-        return false;
+        return TaskbarVisibility::Unknown;
     }
 
     HMONITOR monitor = MonitorFromWindow(taskbar, MONITOR_DEFAULTTONEAREST);
     MONITORINFO monitor_info{};
     monitor_info.cbSize = sizeof(monitor_info);
     if (!monitor || !GetMonitorInfoW(monitor, &monitor_info)) {
-        return false;
+        return TaskbarVisibility::Unknown;
     }
 
     RECT visible_rect{};
     if (!IntersectRect(&visible_rect, &rect, &monitor_info.rcMonitor)) {
-        return false;
+        return TaskbarVisibility::Hidden;
     }
 
     const int minimum_visible_size = Scale(kMinimumTaskbarVisibleDip, WindowDpi(taskbar));
-    return visible_rect.right - visible_rect.left >= minimum_visible_size &&
-           visible_rect.bottom - visible_rect.top >= minimum_visible_size;
+    const bool visible =
+        visible_rect.right - visible_rect.left >= minimum_visible_size &&
+        visible_rect.bottom - visible_rect.top >= minimum_visible_size;
+    return visible ? TaskbarVisibility::Visible : TaskbarVisibility::Hidden;
 }
 
 bool IsTaskbarRelatedWindow(HWND hwnd) {
@@ -600,70 +660,117 @@ bool IsTaskbarRelatedWindow(HWND hwnd) {
     return false;
 }
 
-bool WindowCoversMonitor(HWND window) {
+enum class MonitorCoverageObservation {
+    Unknown,
+    Clear,
+    Covers,
+};
+
+MonitorCoverageObservation ObserveWindowMonitorCoverage(HWND window) {
     RECT window_rect{};
     if (!GetWindowRect(window, &window_rect)) {
-        return false;
+        return MonitorCoverageObservation::Unknown;
     }
 
     HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
     MONITORINFO monitor_info{};
     monitor_info.cbSize = sizeof(monitor_info);
     if (!monitor || !GetMonitorInfoW(monitor, &monitor_info)) {
-        return false;
+        return MonitorCoverageObservation::Unknown;
     }
 
     const int tolerance = Scale(kFullscreenCoverageToleranceDip, WindowDpi(window));
-    return window_rect.left <= monitor_info.rcMonitor.left + tolerance &&
-           window_rect.top <= monitor_info.rcMonitor.top + tolerance &&
-           window_rect.right >= monitor_info.rcMonitor.right - tolerance &&
-           window_rect.bottom >= monitor_info.rcMonitor.bottom - tolerance;
+    const bool covers =
+        window_rect.left <= monitor_info.rcMonitor.left + tolerance &&
+        window_rect.top <= monitor_info.rcMonitor.top + tolerance &&
+        window_rect.right >= monitor_info.rcMonitor.right - tolerance &&
+        window_rect.bottom >= monitor_info.rcMonitor.bottom - tolerance;
+    return covers ? MonitorCoverageObservation::Covers : MonitorCoverageObservation::Clear;
 }
 
-bool ForegroundWindowCoversMonitor() {
-    HWND foreground = GetForegroundWindow();
-    if (!foreground ||
-        foreground == g_app.window.overlay_hwnd ||
+MonitorCoverageObservation ObserveForegroundMonitorCoverage(HWND foreground) {
+    if (!foreground || !IsWindow(foreground)) {
+        return MonitorCoverageObservation::Unknown;
+    }
+    if (foreground == g_app.window.overlay_hwnd ||
         foreground == g_app.window.controller_hwnd ||
         IsTaskbarPreviewWindow(foreground) ||
         !IsWindowVisible(foreground) ||
         IsIconic(foreground)) {
-        return false;
+        return MonitorCoverageObservation::Clear;
     }
 
     const DWORD foreground_process_id = WindowProcessId(foreground);
+    if (foreground_process_id == 0) {
+        return MonitorCoverageObservation::Unknown;
+    }
     HWND candidate = GetAncestor(foreground, GA_ROOT);
+    if (!candidate) {
+        return MonitorCoverageObservation::Unknown;
+    }
+    bool unknown_observed = false;
     for (unsigned depth = 0; candidate && depth < 8; ++depth) {
+        if (!IsWindow(candidate)) {
+            unknown_observed = true;
+            break;
+        }
         if (candidate != g_app.window.overlay_hwnd &&
             candidate != g_app.window.controller_hwnd &&
             !IsTaskbarRelatedWindow(candidate) &&
             !IsTaskbarPreviewWindow(candidate) &&
             IsWindowVisible(candidate) &&
-            !IsIconic(candidate) &&
-            WindowProcessId(candidate) == foreground_process_id &&
-            WindowCoversMonitor(candidate)) {
-            return true;
+            !IsIconic(candidate)) {
+            const DWORD candidate_process_id = WindowProcessId(candidate);
+            if (candidate_process_id == 0) {
+                unknown_observed = true;
+            } else if (candidate_process_id == foreground_process_id) {
+                const MonitorCoverageObservation coverage =
+                    ObserveWindowMonitorCoverage(candidate);
+                if (coverage == MonitorCoverageObservation::Covers) {
+                    return MonitorCoverageObservation::Covers;
+                }
+                unknown_observed |= coverage == MonitorCoverageObservation::Unknown;
+            }
         }
 
         HWND owner = GetWindow(candidate, GW_OWNER);
         HWND next = owner ? GetAncestor(owner, GA_ROOT) : nullptr;
+        if (owner && !next) {
+            unknown_observed = true;
+            break;
+        }
         if (next == candidate) {
             break;
         }
         candidate = next;
     }
-    return false;
+    return unknown_observed
+        ? MonitorCoverageObservation::Unknown
+        : MonitorCoverageObservation::Clear;
 }
 
-bool IsHighConfidenceFullscreenPresentation() {
+PresentationVisibility ObservePresentationVisibility(HWND foreground) {
     QUERY_USER_NOTIFICATION_STATE state = QUNS_NOT_PRESENT;
-    if (FAILED(SHQueryUserNotificationState(&state)) || !ForegroundWindowCoversMonitor()) {
-        return false;
+    if (FAILED(SHQueryUserNotificationState(&state))) {
+        return PresentationVisibility::Unknown;
     }
 
-    return state == QUNS_BUSY ||
-           state == QUNS_RUNNING_D3D_FULL_SCREEN ||
-           state == QUNS_PRESENTATION_MODE;
+    const bool may_suppress =
+        state == QUNS_BUSY ||
+        state == QUNS_RUNNING_D3D_FULL_SCREEN ||
+        state == QUNS_PRESENTATION_MODE;
+    if (!may_suppress) {
+        return PresentationVisibility::Clear;
+    }
+
+    const MonitorCoverageObservation coverage =
+        ObserveForegroundMonitorCoverage(foreground);
+    if (coverage == MonitorCoverageObservation::Unknown) {
+        return PresentationVisibility::Unknown;
+    }
+    return coverage == MonitorCoverageObservation::Covers
+        ? PresentationVisibility::Fullscreen
+        : PresentationVisibility::Clear;
 }
 
 const wchar_t* NotificationStateName(QUERY_USER_NOTIFICATION_STATE state) {
@@ -685,14 +792,13 @@ const wchar_t* NotificationStateName(QUERY_USER_NOTIFICATION_STATE state) {
     }
 }
 
-SuppressionReason GetSuppressionReason() {
-    if (!TaskbarHasVisibleArea()) {
-        return SuppressionReason::TaskbarHidden;
-    }
-    if (IsHighConfidenceFullscreenPresentation()) {
-        return SuppressionReason::FullscreenPresentation;
-    }
-    return SuppressionReason::None;
+SuppressionObservation ObserveSuppression(HWND foreground, bool screenshot_foreground) {
+    const TaskbarVisibility taskbar = ObserveTaskbarVisibility();
+    const PresentationVisibility presentation =
+        screenshot_foreground
+            ? PresentationVisibility::Clear
+            : ObservePresentationVisibility(foreground);
+    return ResolveSuppressionObservation(taskbar, screenshot_foreground, presentation);
 }
 
 const wchar_t* SuppressionReasonName(SuppressionReason reason) {
@@ -1210,8 +1316,9 @@ void SampleMetrics() {
 }
 
 // Overlay style and taskbar layout events.
-void UpdateLayeredStyle(HWND hwnd) {
+bool UpdateLayeredStyle(HWND hwnd) {
     LONG_PTR ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    ex_style |= WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE;
     if (g_app.tray.click_through) {
         ex_style |= WS_EX_TRANSPARENT;
     } else {
@@ -1232,6 +1339,7 @@ void UpdateLayeredStyle(HWND hwnd) {
             L"overlay.update_style",
             L"event=component_recovered component=overlay_style stage=click_through");
     }
+    return style_error == ERROR_SUCCESS;
 }
 
 void CALLBACK TrayEventProc(
@@ -1596,10 +1704,10 @@ bool GetTaskbarRect(RECT& rect) {
     return true;
 }
 
-void RepositionWindow() {
+bool RepositionWindow() {
     HWND overlay = g_app.window.overlay_hwnd;
     if (!overlay || !IsWindow(overlay)) {
-        return;
+        return false;
     }
 
     RECT taskbar{};
@@ -1648,14 +1756,24 @@ void RepositionWindow() {
         y = taskbar.bottom - height - Scale(8, g_app.window.dpi);
     }
 
-    const BOOL positioned = SetWindowPos(
-        overlay,
-        HWND_TOPMOST,
-        x,
-        y,
-        width,
-        height,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    const RECT requested_rect{x, y, x + width, y + height};
+    RECT previous_rect{};
+    const bool previous_known = GetWindowRect(overlay, &previous_rect) != FALSE;
+    const bool geometry_changed = !previous_known || !RectEquals(previous_rect, requested_rect);
+    const bool needs_topmost =
+        (GetWindowLongPtrW(overlay, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0;
+
+    BOOL positioned = TRUE;
+    if (geometry_changed || needs_topmost) {
+        positioned = SetWindowPos(
+            overlay,
+            HWND_TOPMOST,
+            x,
+            y,
+            width,
+            height,
+            SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    }
     const DWORD position_error = positioned ? ERROR_SUCCESS : GetLastError();
     if (positioned) {
         g_app.diagnostics.last_reposition_success_tick = GetTickCount();
@@ -1674,7 +1792,6 @@ void RepositionWindow() {
             y + height);
     }
 
-    const RECT requested_rect{x, y, x + width, y + height};
     RECT overlay_rect{};
     bool actual_known = false;
     if (positioned) {
@@ -1735,6 +1852,7 @@ void RepositionWindow() {
         mi.cbSize = sizeof(mi);
         GetMonitorInfoW(monitor, &mi);
     }
+    return positioned && geometry_changed;
 }
 
 // Tray icon and context menu.
@@ -1840,7 +1958,7 @@ struct OverlayStateSnapshot {
 OverlayStateSnapshot CaptureOverlayState(bool expected_visible) {
     OverlayStateSnapshot state;
     state.hwnd = g_app.window.overlay_hwnd;
-    state.expected_owner = TaskbarWindow();
+    state.expected_owner = CommittedTaskbarWindow();
     state.valid = state.hwnd && IsWindow(state.hwnd);
     if (!state.valid) {
         state.issues |= OverlayInvariantMissing;
@@ -1961,7 +2079,7 @@ void LogOverlayInvariantFailure(const wchar_t* trigger, const OverlayStateSnapsh
         foreground,
         foreground_exe.c_str(),
         foreground_class.c_str(),
-        SuppressionReasonName(g_app.suppression.active_reason),
+        SuppressionReasonName(g_app.suppression.policy.committed),
         g_app.suppression.overlay_update_frozen ? 1 : 0,
         TickAgeMs(now, g_app.diagnostics.last_present_success_tick),
         TickAgeMs(now, g_app.diagnostics.last_reposition_success_tick));
@@ -1987,46 +2105,66 @@ void ResetOverlayPresentDiagnostics() {
     g_app.diagnostics.overlay_created_tick = 0;
 }
 
-void DestroyOverlayWindow(const wchar_t* reason) {
+bool DestroyOverlayWindow(const wchar_t* reason) {
     HWND overlay = g_app.window.overlay_hwnd;
     if (!overlay || !IsWindow(overlay)) {
         g_app.window.overlay_hwnd = nullptr;
         g_app.placement.taskbar_owner = nullptr;
         ResetOverlayPresentDiagnostics();
-        return;
+        return true;
     }
 
     LogInfo(L"event=overlay_destroy_requested reason=%ls hwnd=%p", reason, overlay);
     g_app.window.overlay_destroy_expected = true;
     const BOOL destroyed = DestroyWindow(overlay);
+    const DWORD destroy_error = destroyed ? ERROR_SUCCESS : GetLastError();
     g_app.window.overlay_destroy_expected = false;
     if (!destroyed && IsWindow(overlay)) {
-        LogError(L"event=overlay_destroy_failed error=%lu", GetLastError());
-        return;
+        LogError(L"event=overlay_destroy_failed error=%lu", destroy_error);
+        return false;
     }
     g_app.window.overlay_hwnd = nullptr;
     g_app.placement.taskbar_owner = nullptr;
     ResetOverlayPresentDiagnostics();
+    return true;
 }
 
 bool EnsureOverlayWindow(DWORD* error_out) {
     if (error_out) {
         *error_out = ERROR_SUCCESS;
     }
-    HWND taskbar = TaskbarWindow();
+    HWND taskbar = CommittedTaskbarWindow();
+    const bool taskbar_valid =
+        taskbar &&
+        IsWindow(taskbar) &&
+        IsTaskbarWindowClass(taskbar) &&
+        WindowProcessId(taskbar) == CommittedTaskbarProcessId();
     HWND overlay = g_app.window.overlay_hwnd;
-    if (overlay && IsWindow(overlay) && g_app.placement.taskbar_owner == taskbar) {
+    if (taskbar_valid &&
+        overlay &&
+        IsWindow(overlay) &&
+        g_app.placement.taskbar_owner == taskbar) {
         return true;
     }
 
     if (overlay && IsWindow(overlay)) {
-        DestroyOverlayWindow(L"taskbar_generation_changed");
+        if (error_out) {
+            *error_out = ERROR_INVALID_STATE;
+        }
+        LogErrorRateLimited(
+            L"overlay.owner_generation_mismatch",
+            kFailureLogIntervalMs,
+            L"event=overlay_create_blocked reason=owner_generation_mismatch hwnd=%p cached_owner=%p committed_owner=%p",
+            overlay,
+            g_app.placement.taskbar_owner,
+            taskbar);
+        return false;
     }
     g_app.window.overlay_hwnd = nullptr;
     g_app.placement.taskbar_owner = nullptr;
     ResetOverlayPresentDiagnostics();
 
-    if (!taskbar) {
+    if (!taskbar_valid) {
         if (error_out) {
             *error_out = ERROR_NOT_FOUND;
         }
@@ -2090,35 +2228,41 @@ bool EnsureOverlayWindow(DWORD* error_out) {
     return true;
 }
 
-bool ReconnectTaskbarIfNeeded(bool force) {
-    HWND taskbar = TaskbarWindow();
-    const DWORD taskbar_process_id = WindowProcessId(taskbar);
-    if (!force &&
-        taskbar == g_app.placement.observed_taskbar &&
-        taskbar_process_id == g_app.placement.observed_taskbar_process_id) {
-        return false;
+simple_monitor::overlay_policy::TaskbarIdentityResult UpdateTaskbarIdentity(
+    const wchar_t* trigger) {
+    const TaskbarIdentity observed = CurrentTaskbarIdentity();
+    const TaskbarIdentityState previous_state = g_app.placement.taskbar_identity;
+    auto result = ReduceTaskbarIdentity(
+        previous_state,
+        observed,
+        GetTickCount64(),
+        kTaskbarIdentitySettleMs);
+    g_app.placement.taskbar_identity = result.state;
+
+    const bool candidate_started =
+        result.state.candidate_active &&
+        (!previous_state.candidate_active || previous_state.candidate != result.state.candidate);
+    if (candidate_started) {
+        LogInfo(
+            L"event=taskbar_identity_candidate trigger=%ls old_hwnd=%p new_hwnd=%p old_pid=%lu new_pid=%lu",
+            trigger,
+            TaskbarIdentityWindow(previous_state.committed),
+            TaskbarIdentityWindow(result.state.candidate),
+            static_cast<DWORD>(previous_state.committed.process_id),
+            static_cast<DWORD>(result.state.candidate.process_id));
     }
 
-    LogInfo(
-        L"event=taskbar_reconnect force=%d old_hwnd=%p new_hwnd=%p old_pid=%lu new_pid=%lu",
-        force ? 1 : 0,
-        g_app.placement.observed_taskbar,
-        taskbar,
-        g_app.placement.observed_taskbar_process_id,
-        taskbar_process_id);
-
-    HWND controller = g_app.window.controller_hwnd;
-    if (controller) {
-        RemoveTrayIcon(controller);
+    if (result.committed_changed) {
+        LogInfo(
+            L"event=taskbar_identity_committed trigger=%ls old_hwnd=%p new_hwnd=%p old_pid=%lu new_pid=%lu dwell_ms=%llu",
+            trigger,
+            TaskbarIdentityWindow(result.previous_committed),
+            TaskbarIdentityWindow(result.state.committed),
+            static_cast<DWORD>(result.previous_committed.process_id),
+            static_cast<DWORD>(result.state.committed.process_id),
+            static_cast<unsigned long long>(result.candidate_dwell_ms));
     }
-    g_app.placement.observed_taskbar = taskbar;
-    g_app.placement.observed_taskbar_process_id = taskbar_process_id;
-    DestroyOverlayWindow(L"taskbar_reconnect");
-    if (controller && taskbar) {
-        AddTrayIcon(controller);
-    }
-    EnsureOverlayWindow();
-    return true;
+    return result;
 }
 
 void RepairOverlayInvariant(const wchar_t* trigger, const OverlayStateSnapshot& before) {
@@ -2186,36 +2330,16 @@ void RepairOverlayInvariant(const wchar_t* trigger, const OverlayStateSnapshot& 
 
     HWND overlay = g_app.window.overlay_hwnd;
     if (overlay && IsWindow(overlay)) {
-        LONG_PTR ex_style = GetWindowLongPtrW(overlay, GWL_EXSTYLE);
+        const LONG_PTR ex_style = GetWindowLongPtrW(overlay, GWL_EXSTYLE);
         if ((ex_style & (WS_EX_TOPMOST | WS_EX_LAYERED)) != (WS_EX_TOPMOST | WS_EX_LAYERED)) {
             actions |= 2U;
-            ex_style |= WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE;
-            if (g_app.tray.click_through) {
-                ex_style |= WS_EX_TRANSPARENT;
-            }
-            SetLastError(ERROR_SUCCESS);
-            const LONG_PTR previous_style = SetWindowLongPtrW(overlay, GWL_EXSTYLE, ex_style);
-            const DWORD style_error = previous_style == 0 ? GetLastError() : ERROR_SUCCESS;
-            if (style_error != ERROR_SUCCESS) {
-                repair_error = style_error;
-            }
         }
 
         if (recreated || (before.issues & kCheapRepairIssues) != 0) {
-            actions |= 4U;
-            ShowWindow(overlay, SW_SHOWNOACTIVATE);
-            RepositionWindow();
-        }
-
-        if (recreated ||
-            (before.issues &
-             (OverlayInvariantHidden |
-              OverlayInvariantMissingLayeredStyle |
-              OverlayInvariantInvalidRect |
-              OverlayInvariantPresentStale)) != 0) {
-            actions |= 8U;
-            ResetLayeredSurface(overlay);
-            RenderOverlay(overlay);
+            actions |= 4U | 8U;
+            if (!PrepareOverlayForShow(overlay, trigger, false)) {
+                repair_error = ERROR_GEN_FAILURE;
+            }
         }
     }
 
@@ -2288,9 +2412,17 @@ void MaybeLogHealth(const wchar_t* trigger, bool force = false) {
     }
     g_app.diagnostics.last_health_log_tick = now;
 
+    HWND committed_taskbar = CommittedTaskbarWindow();
+    const bool taskbar_ready =
+        committed_taskbar &&
+        IsWindow(committed_taskbar) &&
+        WindowProcessId(committed_taskbar) == CommittedTaskbarProcessId();
+    const OverlayIntent intent = ComputeOverlayIntent(
+        taskbar_ready,
+        g_app.suppression.policy.committed,
+        g_app.suppression.overlay_update_frozen);
     const bool expected_visible =
-        g_app.window.monitor_initialized &&
-        g_app.suppression.active_reason == SuppressionReason::None;
+        g_app.window.monitor_initialized && intent.should_be_visible;
     const OverlayStateSnapshot state = CaptureOverlayState(expected_visible);
     const std::wstring above_exe = WindowProcessBasename(state.above);
     const std::wstring above_class = WindowClassName(state.above);
@@ -2300,7 +2432,9 @@ void MaybeLogHealth(const wchar_t* trigger, bool force = false) {
         L"overlay=%p generation=%llu valid=%d visible=%d cloak_known=%d cloak_hresult=0x%08lx "
         L"cloak_flags=0x%08lx topmost=%d layered=%d owner=%p expected_owner=%p "
         L"rect=(%ld,%ld,%ld,%ld) above=%p above_exe=%ls above_class=%ls issues=0x%02x "
-        L"suppression=%ls frozen=%d frame_size=(%d,%d) frame_visible=%d "
+        L"suppression=%ls candidate=%ls candidate_active=%d candidate_age_ms=%lld "
+        L"desired_visible=%d visibility_matches=%d decision=%llu frozen=%d "
+        L"frame_size=(%d,%d) frame_visible=%d "
         L"last_present_attempt_age_ms=%lld last_present_age_ms=%lld "
         L"last_render_attempt_age_ms=%lld last_render_age_ms=%lld last_reposition_age_ms=%lld "
         L"last_metrics_age_ms=%lld state_gap_ms=%lu present_failures=%u render_failures=%u "
@@ -2329,7 +2463,16 @@ void MaybeLogHealth(const wchar_t* trigger, bool force = false) {
         above_exe.c_str(),
         above_class.c_str(),
         state.issues,
-        SuppressionReasonName(g_app.suppression.active_reason),
+        SuppressionReasonName(g_app.suppression.policy.committed),
+        SuppressionReasonName(g_app.suppression.policy.candidate),
+        g_app.suppression.policy.candidate_active ? 1 : 0,
+        g_app.suppression.policy.candidate_active
+            ? static_cast<long long>(
+                  GetTickCount64() - g_app.suppression.policy.candidate_since_ms)
+            : -1LL,
+        expected_visible ? 1 : 0,
+        state.valid && state.visible == expected_visible ? 1 : 0,
+        static_cast<unsigned long long>(g_app.suppression.decision_sequence),
         g_app.suppression.overlay_update_frozen ? 1 : 0,
         g_app.render.last_frame_width,
         g_app.render.last_frame_height,
@@ -2360,32 +2503,20 @@ void ReloadConfigAndRefresh() {
         simple_monitor::ResetLog();
     }
     LogConfigSnapshot(L"config_reloaded");
-    if (!EnsureOverlayWindow()) {
-        return;
-    }
-    HWND overlay = g_app.window.overlay_hwnd;
-    if (UpdateOverlaySuppression(overlay, L"config_reload")) {
-        return;
-    }
-    RepositionWindow();
-    RenderOverlay(overlay);
+    ReconcileOverlayState(
+        L"config_reload",
+        OverlayReconcileReposition | OverlayReconcileRender);
 }
 
 void RecoverTaskbar() {
     LogInfo(L"event=manual_taskbar_recovery");
-    ReconnectTaskbarIfNeeded(true);
-    if (!EnsureOverlayWindow()) {
-        return;
-    }
-    HWND overlay = g_app.window.overlay_hwnd;
-    if (UpdateOverlaySuppression(overlay, L"manual_recovery")) {
-        return;
-    }
-    ShowWindow(overlay, SW_SHOWNOACTIVATE);
-    RepositionWindow();
-    ResetLayeredSurface(overlay);
-    RenderOverlay(overlay);
-    LogOverlayWindowState(L"manual_recovery_complete", overlay);
+    ReconcileOverlayState(
+        L"manual_recovery",
+        OverlayReconcileReposition |
+            OverlayReconcileRender |
+            OverlayReconcileResetSurface |
+            OverlayReconcileRefreshTrayIcon);
+    LogOverlayWindowState(L"manual_recovery_complete", g_app.window.overlay_hwnd);
     MaybeLogHealth(L"manual_recovery", true);
 }
 
@@ -2415,14 +2546,18 @@ bool HandleMenuCommand(HWND hwnd, UINT command) {
         return true;
     case ID_CLICK_THROUGH:
         g_app.tray.click_through = !g_app.tray.click_through;
-        if (g_app.window.overlay_hwnd) {
-            UpdateLayeredStyle(g_app.window.overlay_hwnd);
-        }
+        ReconcileOverlayState(L"click_through", OverlayReconcileApplyStyle);
         if (g_app.window.overlay_hwnd &&
             (((GetWindowLongPtrW(g_app.window.overlay_hwnd, GWL_EXSTYLE) & WS_EX_TRANSPARENT) != 0) ==
              g_app.tray.click_through)) {
             LogInfo(
                 L"event=user_action action=click_through result=ok enabled=%d",
+                g_app.tray.click_through ? 1 : 0);
+        } else if (((g_app.reconcile.deferred_flags | g_app.reconcile.pending_flags) &
+                    OverlayReconcileApplyStyle) != 0 ||
+                   g_app.reconcile.active) {
+            LogInfo(
+                L"event=user_action action=click_through result=pending enabled=%d",
                 g_app.tray.click_through ? 1 : 0);
         } else {
             LogError(
@@ -3097,7 +3232,7 @@ void ResetLayeredSurface(HWND hwnd) {
         0,
         0,
         0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
     if (!positioned) {
         LogErrorRateLimited(
             L"overlay.reset_layered_position",
@@ -3109,114 +3244,402 @@ void ResetLayeredSurface(HWND hwnd) {
             L"overlay.reset_layered_position",
             L"event=component_recovered component=overlay_surface stage=set_window_pos");
     }
-    ReapplyLastFrame(hwnd, L"reset_layered_surface");
 }
 
-bool UpdateOverlaySuppression(HWND hwnd, const wchar_t* trigger) {
-    const SuppressionReason reason = GetSuppressionReason();
-    const bool should_suppress = reason != SuppressionReason::None;
-    const bool is_visible = IsWindowVisible(hwnd) != FALSE;
-    if (should_suppress) {
-        if (g_app.suppression.active_reason != reason) {
-            g_app.suppression.suppression_started_tick = GetTickCount();
-            LogInfo(
-                L"event=suppression_on trigger=%ls reason=%ls",
-                trigger,
-                SuppressionReasonName(reason));
-            LogSuppressionContext(reason);
-        }
-        g_app.suppression.active_reason = reason;
-        if (is_visible) {
-            ShowWindow(hwnd, SW_HIDE);
-        }
+bool CommitOverlayHidden(HWND hwnd, const wchar_t* trigger, const wchar_t* reason) {
+    if (!hwnd || !IsWindow(hwnd) || !IsWindowVisible(hwnd)) {
         return true;
     }
 
-    if (g_app.suppression.active_reason != SuppressionReason::None) {
-        const SuppressionReason previous_reason = g_app.suppression.active_reason;
-        g_app.suppression.active_reason = SuppressionReason::None;
+    const BOOL hidden = SetWindowPos(
+        hwnd,
+        nullptr,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER |
+            SWP_NOACTIVATE | SWP_HIDEWINDOW);
+    if (!hidden) {
+        LogErrorRateLimited(
+            L"overlay.hide_window",
+            kFailureLogIntervalMs,
+            L"event=overlay_visibility_commit result=failed desired=hidden trigger=%ls reason=%ls error=%lu",
+            trigger,
+            reason,
+            GetLastError());
+        return false;
+    }
+
+    LogFailureRecovered(
+        L"overlay.hide_window",
+        L"event=component_recovered component=overlay_visibility stage=hide");
+    LogInfo(
+        L"event=overlay_visibility_commit result=ok desired=hidden trigger=%ls reason=%ls generation=%llu present_sequence=%llu",
+        trigger,
+        reason,
+        static_cast<unsigned long long>(g_app.diagnostics.overlay_generation),
+        static_cast<unsigned long long>(g_app.diagnostics.present_success_sequence));
+    return true;
+}
+
+bool PrepareOverlayForShow(HWND hwnd, const wchar_t* trigger, bool reset_surface) {
+    if (!hwnd || !IsWindow(hwnd)) {
+        return false;
+    }
+
+    if (reset_surface && IsWindowVisible(hwnd)) {
+        if (!CommitOverlayHidden(hwnd, trigger, L"surface_reset")) {
+            return false;
+        }
+    }
+
+    if (!UpdateLayeredStyle(hwnd)) {
+        return false;
+    }
+    RepositionWindow();
+    if (reset_surface) {
+        ResetLayeredSurface(hwnd);
+    }
+
+    const std::uint64_t required_after_sequence =
+        g_app.diagnostics.present_success_sequence;
+    RenderOverlay(hwnd);
+    const bool presented =
+        g_app.diagnostics.present_success_sequence > required_after_sequence;
+    if (!presented) {
+        if (!IsWindowVisible(hwnd)) {
+            CommitOverlayHidden(hwnd, trigger, L"present_failed_before_show");
+        }
+        LogErrorRateLimited(
+            L"overlay.show_without_present",
+            kFailureLogIntervalMs,
+            L"event=overlay_visibility_commit result=blocked desired=visible trigger=%ls generation=%llu present_sequence=%llu required_after_sequence=%llu",
+            trigger,
+            static_cast<unsigned long long>(g_app.diagnostics.overlay_generation),
+            static_cast<unsigned long long>(g_app.diagnostics.present_success_sequence),
+            static_cast<unsigned long long>(required_after_sequence));
+        return false;
+    }
+
+    const BOOL shown = SetWindowPos(
+        hwnd,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (!shown || !IsWindowVisible(hwnd)) {
+        LogError(
+            L"event=overlay_visibility_commit result=failed desired=visible trigger=%ls error=%lu",
+            trigger,
+            shown ? ERROR_GEN_FAILURE : GetLastError());
+        return false;
+    }
+
+    LogFailureRecovered(
+        L"overlay.show_without_present",
+        L"event=component_recovered component=overlay_visibility stage=present_before_show");
+    LogInfo(
+        L"event=overlay_visibility_commit result=ok desired=visible trigger=%ls generation=%llu present_sequence=%llu required_after_sequence=%llu",
+        trigger,
+        static_cast<unsigned long long>(g_app.diagnostics.overlay_generation),
+        static_cast<unsigned long long>(g_app.diagnostics.present_success_sequence),
+        static_cast<unsigned long long>(required_after_sequence));
+    return true;
+}
+
+void UpdateFreezePolicy(bool screenshot_foreground) {
+    if (screenshot_foreground == g_app.suppression.overlay_update_frozen) {
+        return;
+    }
+
+    g_app.suppression.overlay_update_frozen = screenshot_foreground;
+    if (screenshot_foreground) {
+        g_app.suppression.refresh_resume_tick = 0;
+        LogInfo(L"event=freeze_on reason=screenshot");
+    } else {
+        g_app.suppression.refresh_resume_tick = GetTickCount() + 800;
+        LogInfo(L"event=freeze_off");
+    }
+}
+
+bool UpdateSuppressionPolicy(
+    const wchar_t* trigger,
+    HWND foreground,
+    bool screenshot_foreground) {
+    const SuppressionPolicyState previous_state = g_app.suppression.policy;
+    const SuppressionObservation observation =
+        ObserveSuppression(foreground, screenshot_foreground);
+    auto result = ReduceSuppressionPolicy(
+        previous_state,
+        observation,
+        GetTickCount64(),
+        kSuppressionPolicyConfig);
+    g_app.suppression.policy = result.state;
+
+    const bool candidate_started =
+        result.state.candidate_active &&
+        (!previous_state.candidate_active || previous_state.candidate != result.state.candidate);
+    if (candidate_started) {
+        LogInfo(
+            L"event=suppression_candidate trigger=%ls candidate=%ls committed=%ls",
+            trigger,
+            SuppressionReasonName(result.state.candidate),
+            SuppressionReasonName(result.state.committed));
+    }
+
+    if (!result.committed_changed) {
+        return false;
+    }
+
+    ++g_app.suppression.decision_sequence;
+    const DWORD now = GetTickCount();
+    if (result.previous_committed == SuppressionReason::None &&
+        result.state.committed != SuppressionReason::None) {
+        g_app.suppression.suppression_started_tick = now == 0 ? 1 : now;
+        LogInfo(
+            L"event=suppression_on trigger=%ls reason=%ls decision=%llu dwell_ms=%llu",
+            trigger,
+            SuppressionReasonName(result.state.committed),
+            static_cast<unsigned long long>(g_app.suppression.decision_sequence),
+            static_cast<unsigned long long>(result.candidate_dwell_ms));
+        LogSuppressionContext(result.state.committed);
+    } else if (result.previous_committed != SuppressionReason::None &&
+               result.state.committed == SuppressionReason::None) {
         const DWORD duration_ms = g_app.suppression.suppression_started_tick == 0
             ? 0
-            : GetTickCount() - g_app.suppression.suppression_started_tick;
+            : now - g_app.suppression.suppression_started_tick;
         g_app.suppression.suppression_started_tick = 0;
         LogInfo(
-            L"event=suppression_off trigger=%ls previous_reason=%ls duration_ms=%lu",
+            L"event=suppression_off trigger=%ls previous_reason=%ls duration_ms=%lu decision=%llu dwell_ms=%llu",
             trigger,
-            SuppressionReasonName(previous_reason),
-            duration_ms);
+            SuppressionReasonName(result.previous_committed),
+            duration_ms,
+            static_cast<unsigned long long>(g_app.suppression.decision_sequence),
+            static_cast<unsigned long long>(result.candidate_dwell_ms));
         LogSuppressionContext(SuppressionReason::None);
-
-        if (previous_reason == SuppressionReason::FullscreenPresentation) {
-            DestroyOverlayWindow(L"presentation_exit");
-            if (!EnsureOverlayWindow()) {
-                return true;
-            }
-            hwnd = g_app.window.overlay_hwnd;
-        }
-
-        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        RepositionWindow();
-        ReapplyLastFrame(hwnd);
-        RenderOverlay(hwnd);
-        LogOverlayWindowState(L"suppression_restore_complete", hwnd);
-        return true;
+    } else {
+        LogInfo(
+            L"event=suppression_changed trigger=%ls previous_reason=%ls reason=%ls decision=%llu dwell_ms=%llu",
+            trigger,
+            SuppressionReasonName(result.previous_committed),
+            SuppressionReasonName(result.state.committed),
+            static_cast<unsigned long long>(g_app.suppression.decision_sequence),
+            static_cast<unsigned long long>(result.candidate_dwell_ms));
+        LogSuppressionContext(result.state.committed);
     }
-
-    return false;
+    return true;
 }
 
-bool UpdateFreezeState(HWND hwnd) {
-    if (ShouldFreezeOverlayUpdate()) {
-        if (!g_app.suppression.overlay_update_frozen) {
-            LogInfo(L"event=freeze_on reason=screenshot");
-        }
-        g_app.suppression.overlay_update_frozen = true;
-        ReapplyLastFrame(hwnd);
-        return true;
+void RefreshTrayIconForCommittedTaskbar() {
+    HWND controller = g_app.window.controller_hwnd;
+    if (!controller) {
+        return;
     }
-
-    if (g_app.suppression.overlay_update_frozen) {
-        g_app.suppression.overlay_update_frozen = false;
-        LogInfo(L"event=freeze_off");
-        g_app.suppression.refresh_resume_tick = GetTickCount() + 800;
-        ReapplyLastFrame(hwnd);
-        return true;
+    RemoveTrayIcon(controller);
+    if (HWND taskbar = CommittedTaskbarWindow(); taskbar && IsWindow(taskbar)) {
+        AddTrayIcon(controller);
     }
-
-    return false;
 }
 
-bool HandleOverlayStateGuards(const wchar_t* trigger) {
-    const std::uint64_t previous_generation = g_app.diagnostics.overlay_generation;
-    const bool taskbar_reconnected = ReconnectTaskbarIfNeeded(false);
+void ReconcileOverlayStateOnce(const wchar_t* trigger, unsigned flags) {
+    const unsigned incoming_flags = flags;
+    flags |= g_app.reconcile.deferred_flags;
+    g_app.reconcile.deferred_flags = OverlayReconcileNone;
+    constexpr unsigned kDeferredActions =
+        OverlayReconcileResetSurface |
+        OverlayReconcileRefreshTrayIcon |
+        OverlayReconcileApplyStyle;
+    const auto defer_actions = [&](unsigned mask) {
+        g_app.reconcile.deferred_flags |= flags & mask;
+    };
+
+    const auto taskbar_result = UpdateTaskbarIdentity(trigger);
+    HWND committed_taskbar = CommittedTaskbarWindow();
+    const bool committed_taskbar_ready =
+        committed_taskbar &&
+        IsWindow(committed_taskbar) &&
+        IsTaskbarWindowClass(committed_taskbar) &&
+        WindowProcessId(committed_taskbar) == CommittedTaskbarProcessId();
+
+    if (taskbar_result.pending) {
+        if (!committed_taskbar_ready) {
+            CommitOverlayHidden(g_app.window.overlay_hwnd, trigger, L"taskbar_identity_pending");
+        }
+        defer_actions(kDeferredActions);
+        return;
+    }
+
+    if (taskbar_result.committed_changed) {
+        g_app.reconcile.recreate_pending = true;
+        g_app.reconcile.next_destroy_retry_tick = 0;
+    }
+    if (g_app.reconcile.recreate_pending) {
+        const DWORD now = GetTickCount();
+        const bool old_overlay_still_exists =
+            g_app.window.overlay_hwnd && IsWindow(g_app.window.overlay_hwnd);
+        if (g_app.reconcile.next_destroy_retry_tick != 0 &&
+            !TickPassed(now, g_app.reconcile.next_destroy_retry_tick) &&
+            old_overlay_still_exists) {
+            defer_actions(kDeferredActions);
+            return;
+        }
+        CommitOverlayHidden(
+            g_app.window.overlay_hwnd,
+            trigger,
+            L"taskbar_generation_change");
+        if (!DestroyOverlayWindow(L"taskbar_generation_changed")) {
+            g_app.reconcile.next_destroy_retry_tick = now + kOverlayRepairIntervalMs;
+            defer_actions(kDeferredActions);
+            return;
+        }
+        g_app.reconcile.recreate_pending = false;
+        g_app.reconcile.next_destroy_retry_tick = 0;
+        g_app.reconcile.next_visibility_retry_tick = 0;
+        g_app.reconcile.visibility_retry_pending = false;
+        flags |= OverlayReconcileRefreshTrayIcon;
+    }
+    if ((flags & OverlayReconcileRefreshTrayIcon) != 0) {
+        RefreshTrayIconForCommittedTaskbar();
+        flags &= ~OverlayReconcileRefreshTrayIcon;
+    }
+
+    if (!committed_taskbar_ready) {
+        CommitOverlayHidden(g_app.window.overlay_hwnd, trigger, L"taskbar_unavailable");
+        defer_actions(OverlayReconcileResetSurface | OverlayReconcileApplyStyle);
+        return;
+    }
+
+    const std::uint64_t generation_before_ensure = g_app.diagnostics.overlay_generation;
     if (!EnsureOverlayWindow()) {
-        return true;
+        defer_actions(OverlayReconcileResetSurface | OverlayReconcileApplyStyle);
+        return;
     }
     HWND overlay = g_app.window.overlay_hwnd;
     const bool overlay_created =
-        g_app.diagnostics.overlay_generation != previous_generation;
-    if (UpdateOverlaySuppression(overlay, trigger)) {
-        return true;
-    }
-    if (taskbar_reconnected || overlay_created) {
-        ShowWindow(overlay, SW_SHOWNOACTIVATE);
-        RepositionWindow();
-        ResetLayeredSurface(overlay);
-        RenderOverlay(overlay);
-        RepairOverlayInvariant(trigger, CaptureOverlayState(true));
-        return true;
-    }
-    RepairOverlayInvariant(trigger, CaptureOverlayState(true));
-    if (UpdateFreezeState(overlay)) {
-        return true;
-    }
-    if (g_app.suppression.refresh_resume_tick != 0 && !TickPassed(GetTickCount(), g_app.suppression.refresh_resume_tick)) {
-        ReapplyLastFrame(overlay);
-        return true;
+        g_app.diagnostics.overlay_generation != generation_before_ensure;
+
+    HWND foreground = GetForegroundWindow();
+    const bool screenshot_foreground = IsBuiltinScreenshotForeground(foreground);
+    UpdateFreezePolicy(screenshot_foreground);
+    const bool suppression_changed =
+        UpdateSuppressionPolicy(trigger, foreground, screenshot_foreground);
+    const OverlayIntent intent = ComputeOverlayIntent(
+        true,
+        g_app.suppression.policy.committed,
+        screenshot_foreground);
+
+    if ((flags & OverlayReconcileApplyStyle) != 0) {
+        if (!UpdateLayeredStyle(overlay)) {
+            defer_actions(OverlayReconcileResetSurface | OverlayReconcileApplyStyle);
+            return;
+        }
+        flags &= ~OverlayReconcileApplyStyle;
     }
 
+    if (!intent.should_be_visible) {
+        CommitOverlayHidden(
+            overlay,
+            trigger,
+            SuppressionReasonName(g_app.suppression.policy.committed));
+        defer_actions(OverlayReconcileResetSurface);
+        return;
+    }
+
+    const bool resume_pending =
+        g_app.suppression.refresh_resume_tick != 0 &&
+        !TickPassed(GetTickCount(), g_app.suppression.refresh_resume_tick);
+    if (intent.updates_frozen || resume_pending) {
+        defer_actions(OverlayReconcileResetSurface);
+        return;
+    }
     g_app.suppression.refresh_resume_tick = 0;
-    return false;
+
+    const bool restoring_visibility =
+        suppression_changed &&
+        g_app.suppression.policy.committed == SuppressionReason::None;
+    const bool reset_surface = (flags & OverlayReconcileResetSurface) != 0;
+    const bool visibility_missing = IsWindowVisible(overlay) == FALSE;
+    const bool prepare_required =
+        overlay_created ||
+        taskbar_result.committed_changed ||
+        restoring_visibility ||
+        reset_surface ||
+        visibility_missing ||
+        g_app.reconcile.visibility_retry_pending;
+    if (prepare_required) {
+        const DWORD now = GetTickCount();
+        const bool retry_ready =
+            g_app.reconcile.next_visibility_retry_tick == 0 ||
+            TickPassed(now, g_app.reconcile.next_visibility_retry_tick);
+        const bool force_attempt =
+            overlay_created ||
+            taskbar_result.committed_changed ||
+            restoring_visibility ||
+            (incoming_flags & OverlayReconcileResetSurface) != 0;
+        if (!force_attempt && !retry_ready) {
+            defer_actions(OverlayReconcileResetSurface);
+            return;
+        }
+
+        if (PrepareOverlayForShow(overlay, trigger, reset_surface)) {
+            g_app.reconcile.next_visibility_retry_tick = 0;
+            g_app.reconcile.visibility_retry_pending = false;
+        } else {
+            g_app.reconcile.next_visibility_retry_tick =
+                now + kOverlayRepairIntervalMs;
+            g_app.reconcile.visibility_retry_pending = true;
+        }
+        return;
+    }
+
+    RepairOverlayInvariant(trigger, CaptureOverlayState(true));
+
+    if ((flags & OverlayReconcileSampleMetrics) != 0) {
+        SampleMetrics();
+    }
+    bool should_render = (flags & OverlayReconcileRender) != 0;
+    if ((flags & OverlayReconcileSampleKeys) != 0 &&
+        g_app.config.show_key_widget &&
+        SampleKeysIfChanged()) {
+        should_render = true;
+    }
+    if ((flags & OverlayReconcileReposition) != 0 && RepositionWindow()) {
+        should_render = true;
+    }
+    if (should_render) {
+        RenderOverlay(overlay);
+    }
+}
+
+void ReconcileOverlayState(const wchar_t* trigger, unsigned flags) {
+    g_app.reconcile.pending = true;
+    g_app.reconcile.pending_flags |= flags;
+    g_app.reconcile.pending_trigger = trigger ? trigger : L"unspecified";
+    if (g_app.reconcile.active) {
+        return;
+    }
+
+    g_app.reconcile.active = true;
+    for (unsigned pass = 0; pass < 4 && g_app.reconcile.pending; ++pass) {
+        const wchar_t* pending_trigger = g_app.reconcile.pending_trigger;
+        const unsigned pending_flags = g_app.reconcile.pending_flags;
+        g_app.reconcile.pending = false;
+        g_app.reconcile.pending_flags = OverlayReconcileNone;
+        ReconcileOverlayStateOnce(pending_trigger, pending_flags);
+    }
+    const bool needs_follow_up = g_app.reconcile.pending;
+    g_app.reconcile.active = false;
+
+    if (needs_follow_up &&
+        g_app.window.controller_hwnd &&
+        !PostMessageW(g_app.window.controller_hwnd, WM_RECONCILE, 0, 0)) {
+        LogError(
+            L"event=shell_message_failed message=reconcile_follow_up error=%lu",
+            GetLastError());
+    }
 }
 
 void RenderOverlay(HWND hwnd) {
@@ -3401,18 +3824,11 @@ LRESULT HandleTaskbarCreated() {
         return 0;
     }
 
-    ReconnectTaskbarIfNeeded(true);
-    if (!EnsureOverlayWindow()) {
-        return 0;
-    }
-    HWND overlay = g_app.window.overlay_hwnd;
-    if (UpdateOverlaySuppression(overlay, L"taskbar_created")) {
-        return 0;
-    }
-    ShowWindow(overlay, SW_SHOWNOACTIVATE);
-    RepositionWindow();
-    ResetLayeredSurface(overlay);
-    RenderOverlay(overlay);
+    ReconcileOverlayState(
+        L"taskbar_created",
+        OverlayReconcileReposition |
+            OverlayReconcileRender |
+            OverlayReconcileRefreshTrayIcon);
     return 0;
 }
 
@@ -3423,8 +3839,9 @@ void InitializeMonitor(HWND controller) {
 
     g_app.window.monitor_initialized = true;
     LogInfo(L"event=monitor_init delayed=%d", g_app.window.launched_at_startup ? 1 : 0);
-    g_app.placement.observed_taskbar = TaskbarWindow();
-    g_app.placement.observed_taskbar_process_id = WindowProcessId(g_app.placement.observed_taskbar);
+    g_app.placement.taskbar_identity.committed = CurrentTaskbarIdentity();
+    g_app.placement.taskbar_identity.candidate =
+        g_app.placement.taskbar_identity.committed;
     AddTrayIcon(controller);
     RegisterTrayEventHooks();
     InitPdhGroup(g_app.metrics.gpu, L"gpu", L"\\GPU Engine(*)\\Utilization Percentage");
@@ -3438,17 +3855,12 @@ void InitializeMonitor(HWND controller) {
         refresh_timer ? 1 : 0,
         placement_timer ? 1 : 0,
         state_timer ? 1 : 0);
-    if (!EnsureOverlayWindow()) {
-        return;
+    ReconcileOverlayState(
+        L"monitor_init",
+        OverlayReconcileReposition | OverlayReconcileRender);
+    if (g_app.window.overlay_hwnd) {
+        UpdateWindow(g_app.window.overlay_hwnd);
     }
-    HWND overlay = g_app.window.overlay_hwnd;
-    if (UpdateOverlaySuppression(overlay, L"monitor_init")) {
-        return;
-    }
-    RepositionWindow();
-    RenderOverlay(overlay);
-    ShowWindow(overlay, SW_SHOWNOACTIVATE);
-    UpdateWindow(overlay);
 }
 
 LRESULT HandleControllerCreate(HWND hwnd) {
@@ -3488,35 +3900,21 @@ LRESULT HandleTimer(HWND hwnd, UINT_PTR timer_id) {
             }
         }
         g_app.diagnostics.last_state_timer_tick = now;
-        const bool handled = HandleOverlayStateGuards(L"state_timer");
+        ReconcileOverlayState(L"state_timer", OverlayReconcileSampleKeys);
         MaybeLogHealth(L"state_timer");
-        if (handled) {
-            return 0;
-        }
-        if (g_app.config.show_key_widget && SampleKeysIfChanged()) {
-            RenderOverlay(g_app.window.overlay_hwnd);
-        }
         return 0;
     }
 
     const wchar_t* trigger = timer_id == kRefreshTimer ? L"refresh_timer" : L"placement_timer";
-    const bool handled = HandleOverlayStateGuards(trigger);
+    const unsigned flags = timer_id == kRefreshTimer
+        ? OverlayReconcileSampleMetrics | OverlayReconcileReposition | OverlayReconcileRender
+        : OverlayReconcileReposition;
+    ReconcileOverlayState(trigger, flags);
     MaybeLogHealth(trigger);
-    if (handled) {
-        return 0;
-    }
-
-    if (timer_id == kRefreshTimer) {
-        SampleMetrics();
-        RepositionWindow();
-        RenderOverlay(g_app.window.overlay_hwnd);
-    } else if (timer_id == kPlacementTimer) {
-        RepositionWindow();
-    }
     return 0;
 }
 
-LRESULT HandleDpiChanged(HWND hwnd, WPARAM wparam, LPARAM lparam) {
+LRESULT HandleDpiChanged(HWND, WPARAM wparam, LPARAM lparam) {
     const UINT previous_dpi = g_app.window.dpi;
     g_app.window.dpi = HIWORD(wparam);
     LogInfo(
@@ -3524,22 +3922,9 @@ LRESULT HandleDpiChanged(HWND hwnd, WPARAM wparam, LPARAM lparam) {
         previous_dpi,
         g_app.window.dpi,
         lparam ? 1 : 0);
-    if (lparam) {
-        const RECT* suggested = reinterpret_cast<const RECT*>(lparam);
-        SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            suggested->left,
-            suggested->top,
-            suggested->right - suggested->left,
-            suggested->bottom - suggested->top,
-            SWP_NOACTIVATE);
-    }
-    if (UpdateOverlaySuppression(hwnd, L"dpi_change")) {
-        return 0;
-    }
-    RepositionWindow();
-    RenderOverlay(hwnd);
+    ReconcileOverlayState(
+        L"dpi_change",
+        OverlayReconcileReposition | OverlayReconcileRender);
     return 0;
 }
 
@@ -3548,16 +3933,9 @@ LRESULT HandleDisplayChange() {
         return 0;
     }
 
-    ReconnectTaskbarIfNeeded(false);
-    if (!EnsureOverlayWindow()) {
-        return 0;
-    }
-    HWND overlay = g_app.window.overlay_hwnd;
-    if (UpdateOverlaySuppression(overlay, L"display_or_device_change")) {
-        return 0;
-    }
-    RepositionWindow();
-    RenderOverlay(overlay);
+    ReconcileOverlayState(
+        L"display_or_device_change",
+        OverlayReconcileReposition | OverlayReconcileRender);
     return 0;
 }
 
@@ -3575,16 +3953,7 @@ LRESULT HandleTrayLayoutChanged() {
     }
 
     LogInfo(L"event=tray_layout_changed");
-    ReconnectTaskbarIfNeeded(false);
-    if (!EnsureOverlayWindow()) {
-        return 0;
-    }
-    HWND overlay = g_app.window.overlay_hwnd;
-    if (UpdateOverlaySuppression(overlay, L"tray_layout_change")) {
-        return 0;
-    }
-    RepositionWindow();
-    RenderOverlay(overlay);
+    ReconcileOverlayState(L"tray_layout_change", OverlayReconcileReposition);
     return 0;
 }
 
@@ -3592,7 +3961,7 @@ LRESULT HandleTrayIcon(HWND hwnd, LPARAM lparam) {
     if (LOWORD(lparam) == WM_CONTEXTMENU) {
         ShowTrayMenu(hwnd);
     } else if (LOWORD(lparam) == WM_LBUTTONDBLCLK) {
-        RepositionWindow();
+        ReconcileOverlayState(L"tray_double_click", OverlayReconcileReposition);
     }
     return 0;
 }
@@ -3658,9 +4027,10 @@ LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
     return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
-// The hidden controller owns process lifetime; the overlay is disposable.
+// The hidden controller owns process lifetime; the overlay persists for one
+// committed taskbar generation.
 LRESULT CALLBACK ControllerWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
-    if (msg == g_app.window.taskbar_created) {
+    if (g_app.window.taskbar_created != 0 && msg == g_app.window.taskbar_created) {
         return HandleTaskbarCreated();
     }
 
@@ -3690,7 +4060,9 @@ LRESULT CALLBACK ControllerWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
         return HandleTrayLayoutChanged();
 
     case WM_RECONCILE:
-        HandleOverlayStateGuards(L"reconcile_message");
+        ReconcileOverlayState(
+            L"reconcile_message",
+            OverlayReconcileReposition | OverlayReconcileRender);
         MaybeLogHealth(L"reconcile_message", true);
         return 0;
 

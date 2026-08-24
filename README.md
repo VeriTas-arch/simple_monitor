@@ -18,15 +18,24 @@ build/simple_monitor.exe
 
 The taskbar-visibility beta is generated separately at
 `build/simple_monitor_dev.exe`. Its hidden controller survives Shell changes
-and recreates a disposable taskbar-owned overlay as needed. The overlay does
-maintain topmost state while visible so Shell z-order changes cannot bury it.
-It follows the taskbar owner, suppresses itself when the taskbar has no
-meaningful visible area, and uses the Windows
-notification state plus full-monitor coverage to identify presentation mode.
+and keeps one taskbar-owned overlay for each committed Explorer taskbar
+generation. A single reconciler owns its style, position, rendering, and final
+show/hide commit; transient or failed observations preserve the last committed
+visibility decision. Suppression transitions use short enter/exit dwell times,
+and a hidden overlay is presented successfully before it is shown again. The
+overlay follows the taskbar owner, suppresses itself when the taskbar has no
+meaningful visible area, and uses the Windows notification state plus
+full-monitor coverage to identify presentation mode.
 Build only that target with:
 
 ```pwsh
 cmake --build build --target simple_monitor_dev
+```
+
+Run the platform-independent visibility-policy tests with:
+
+```pwsh
+ctest --test-dir build --output-on-failure
 ```
 
 For the usual edit-build-run loop during development, use:
@@ -108,10 +117,12 @@ Repeated sustained failures are rate-limited with suppressed counts and duration
 Rapid failure/recovery flapping is sampled using the same cooldown, with one
 recovery record for each reported failure period. At `info` or `debug` level,
 the dev build also writes a 60-second health record containing
-overlay visibility, ownership, z-order style, suppression state, frame state,
-and the ages of render, present, placement, and metrics activity. For an overlay
-disappearance, inspect `overlay_invariant_failed`, `overlay_repair`, `health`,
-`render_failed`, `present_failed`, and `timer_gap` in sequence.
+overlay visibility, ownership, z-order style, committed and candidate
+suppression state, desired visibility, decision and presentation sequences,
+frame state, and the ages of render, present, placement, and metrics activity.
+For an overlay disappearance, inspect `suppression_candidate`,
+`overlay_visibility_commit`, `overlay_invariant_failed`, `overlay_repair`,
+`health`, `render_failed`, `present_failed`, and `timer_gap` in sequence.
 
 Raw performance samples, key states, window titles, and the full command line
 are not logged. Logs do include the configuration path plus relevant process

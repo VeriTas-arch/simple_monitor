@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.20)
 
 project(SimpleMonitor LANGUAGES CXX RC)
 
+include(CTest)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -46,6 +48,22 @@ foreach(target IN LISTS SIMPLE_MONITOR_TARGETS)
 endforeach()
 
 target_link_libraries(simple_monitor_dev PRIVATE dwmapi)
+
+if(BUILD_TESTING)
+    add_executable(overlay_policy_tests
+        tests/overlay_policy_tests.cpp
+    )
+    target_include_directories(overlay_policy_tests PRIVATE src)
+    if(MINGW)
+        target_compile_options(overlay_policy_tests PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+            -Werror
+        )
+    endif()
+    add_test(NAME overlay_policy_tests COMMAND overlay_policy_tests)
+endif()
 
 # Enable MinGW Unicode entry point handling so the app uses `wWinMain`
 # instead of the ANSI `WinMain` startup path.
