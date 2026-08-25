@@ -155,6 +155,60 @@ void TestSuppressionCandidateMustRemainStable() {
     Check(result.committed_changed, "a stable restarted candidate should eventually commit");
 }
 
+void TestRepairSeparatesRefreshFromVisibilityCommit() {
+    const auto stale = policy::ComputeOverlayRepairIntent({
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+    });
+    Check(stale.present, "stale visible content should request a new present");
+    Check(!stale.commit_visible, "stale visible content must not request another show commit");
+    Check(!stale.apply_style, "stale visible content should not churn window style");
+    Check(!stale.reposition, "stale visible content should not move the overlay");
+
+    const auto hidden = policy::ComputeOverlayRepairIntent({
+        true,
+        false,
+        true,
+        true,
+        true,
+        false,
+    });
+    Check(hidden.commit_visible, "a hidden overlay should use the guarded visibility commit");
+    Check(hidden.present, "a hidden overlay must present before it is shown");
+
+    const auto missing = policy::ComputeOverlayRepairIntent({});
+    Check(missing.ensure_exists, "a missing overlay should be recreated");
+    Check(missing.commit_visible, "a recreated overlay should use the guarded visibility commit");
+
+    const auto z_order = policy::ComputeOverlayRepairIntent({
+        true,
+        true,
+        false,
+        true,
+        true,
+        false,
+    });
+    Check(z_order.reposition, "lost topmost state should request z-order repair");
+    Check(!z_order.present, "z-order-only repair should preserve the current surface");
+    Check(!z_order.commit_visible, "z-order-only repair must not request another show commit");
+
+    const auto layered = policy::ComputeOverlayRepairIntent({
+        true,
+        true,
+        true,
+        false,
+        true,
+        false,
+    });
+    Check(layered.apply_style, "missing layered style should be restored");
+    Check(layered.present, "restored layered style should receive a new surface");
+    Check(!layered.commit_visible, "style repair on a visible overlay must not call show");
+}
+
 void TestTaskbarIdentityCommitsOnce() {
     policy::TaskbarIdentityState state{};
     state.committed = {1, 10};
@@ -194,6 +248,7 @@ int main() {
     TestSuppressionHysteresis();
     TestSuppressionDoesNotDestroyOverlayIntent();
     TestSuppressionCandidateMustRemainStable();
+    TestRepairSeparatesRefreshFromVisibilityCommit();
     TestTaskbarIdentityCommitsOnce();
 
     if (failures != 0) {

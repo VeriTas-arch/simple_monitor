@@ -22,8 +22,10 @@ and keeps one taskbar-owned overlay for each committed Explorer taskbar
 generation. A single reconciler owns its style, position, rendering, and final
 show/hide commit; transient or failed observations preserve the last committed
 visibility decision. Suppression transitions use short enter/exit dwell times,
-and a hidden overlay is presented successfully before it is shown again. The
-overlay follows the taskbar owner, suppresses itself when the taskbar has no
+and a hidden overlay is presented successfully before it is shown again.
+Refreshing stale content on an already visible overlay never recommits its
+visibility or churns its style and position. The overlay follows the taskbar
+owner, suppresses itself when the taskbar has no
 meaningful visible area, and uses the Windows notification state plus
 full-monitor coverage to identify presentation mode.
 Build only that target with:
@@ -119,10 +121,12 @@ recovery record for each reported failure period. At `info` or `debug` level,
 the dev build also writes a 60-second health record containing
 overlay visibility, ownership, z-order style, committed and candidate
 suppression state, desired visibility, decision and presentation sequences,
-frame state, and the ages of render, present, placement, and metrics activity.
+frame state, repair/refresh counts, and the ages of render, present, placement,
+and metrics activity.
 For an overlay disappearance, inspect `suppression_candidate`,
-`overlay_visibility_commit`, `overlay_invariant_failed`, `overlay_repair`,
-`health`, `render_failed`, `present_failed`, and `timer_gap` in sequence.
+`overlay_visibility_commit`, `overlay_refresh`, `overlay_invariant_failed`,
+`overlay_repair`, `health`, `render_failed`, `present_failed`, and `timer_gap`
+in sequence.
 
 Raw performance samples, key states, window titles, and the full command line
 are not logged. Logs do include the configuration path plus relevant process

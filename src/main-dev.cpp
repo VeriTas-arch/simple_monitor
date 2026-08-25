@@ -89,7 +89,9 @@ enum MenuId : UINT {
 };
 
 using simple_monitor::overlay_policy::ComputeOverlayIntent;
+using simple_monitor::overlay_policy::ComputeOverlayRepairIntent;
 using simple_monitor::overlay_policy::OverlayIntent;
+using simple_monitor::overlay_policy::OverlayRepairObservation;
 using simple_monitor::overlay_policy::PresentationVisibility;
 using simple_monitor::overlay_policy::ReduceSuppressionPolicy;
 using simple_monitor::overlay_policy::ReduceTaskbarIdentity;
@@ -280,6 +282,8 @@ struct DiagnosticsState {
     unsigned render_failures = 0;
     unsigned overlay_repairs = 0;
     unsigned overlay_repair_failures = 0;
+    unsigned overlay_refreshes = 0;
+    unsigned overlay_refresh_failures = 0;
     bool last_frame_has_visible_pixels = false;
 };
 
@@ -2281,18 +2285,18 @@ void RepairOverlayInvariant(const wchar_t* trigger, const OverlayStateSnapshot& 
     }
 
     const DWORD now = GetTickCount();
-    if (ShouldLogOverlayInvariantDetail(now)) {
+    const bool refresh_only = before.issues == OverlayInvariantPresentStale;
+    if (!refresh_only && ShouldLogOverlayInvariantDetail(now)) {
         LogOverlayInvariantFailure(trigger, before);
     }
 
-    constexpr unsigned kRecreateIssues = OverlayInvariantMissing;
-    constexpr unsigned kCheapRepairIssues =
+    constexpr unsigned kActionableIssues =
+        OverlayInvariantMissing |
         OverlayInvariantHidden |
         OverlayInvariantNotTopmost |
         OverlayInvariantMissingLayeredStyle |
         OverlayInvariantInvalidRect |
         OverlayInvariantPresentStale;
-    constexpr unsigned kActionableIssues = kRecreateIssues | kCheapRepairIssues;
     if ((before.issues & kActionableIssues) == 0) {
         // Cloaking is controlled by DWM and can be transient. Keep recording it,
         // but do not churn the HWND while the shell owns that state.
@@ -2308,37 +2312,78 @@ void RepairOverlayInvariant(const wchar_t* trigger, const OverlayStateSnapshot& 
         return;
     }
     g_app.diagnostics.last_overlay_repair_tick = now == 0 ? 1 : now;
+    if (refresh_only) {
+        LogInfo(
+            L"event=overlay_refresh_requested trigger=%ls reason=present_stale last_present_age_ms=%lld",
+            trigger,
+            TickAgeMs(now, g_app.diagnostics.last_present_success_tick));
+    }
     const std::uint64_t present_sequence_before_repair =
         g_app.diagnostics.present_success_sequence;
+
+    constexpr unsigned kRepairEnsure = 1U << 0;
+    constexpr unsigned kRepairStyle = 1U << 1;
+    constexpr unsigned kRepairPosition = 1U << 2;
+    constexpr unsigned kRepairPresent = 1U << 3;
+    constexpr unsigned kRepairCommitVisible = 1U << 4;
+    const auto plan = ComputeOverlayRepairIntent({
+        before.valid,
+        before.visible,
+        (before.ex_style & WS_EX_TOPMOST) != 0,
+        (before.ex_style & WS_EX_LAYERED) != 0,
+        before.valid && (before.issues & OverlayInvariantInvalidRect) == 0,
+        (before.issues & OverlayInvariantPresentStale) != 0,
+    });
 
     unsigned actions = 0;
     DWORD repair_error = ERROR_SUCCESS;
     HWND old_overlay = before.hwnd;
-    bool recreated = false;
+    bool created = false;
 
-    if ((before.issues & kRecreateIssues) != 0) {
-        actions |= 1U;
+    if (plan.ensure_exists) {
+        actions |= kRepairEnsure;
         const std::uint64_t generation_before_ensure =
             g_app.diagnostics.overlay_generation;
         DWORD ensure_error = ERROR_SUCCESS;
         if (!EnsureOverlayWindow(&ensure_error)) {
             repair_error = ensure_error;
         }
-        recreated =
+        created =
             g_app.diagnostics.overlay_generation != generation_before_ensure;
     }
 
     HWND overlay = g_app.window.overlay_hwnd;
     if (overlay && IsWindow(overlay)) {
-        const LONG_PTR ex_style = GetWindowLongPtrW(overlay, GWL_EXSTYLE);
-        if ((ex_style & (WS_EX_TOPMOST | WS_EX_LAYERED)) != (WS_EX_TOPMOST | WS_EX_LAYERED)) {
-            actions |= 2U;
-        }
-
-        if (recreated || (before.issues & kCheapRepairIssues) != 0) {
-            actions |= 4U | 8U;
+        const bool needs_visibility_commit =
+            created || IsWindowVisible(overlay) == FALSE;
+        if (needs_visibility_commit) {
+            actions |=
+                kRepairStyle |
+                kRepairPosition |
+                kRepairPresent |
+                kRepairCommitVisible;
             if (!PrepareOverlayForShow(overlay, trigger, false)) {
                 repair_error = ERROR_GEN_FAILURE;
+            }
+        } else {
+            bool can_present = true;
+            if (plan.apply_style) {
+                actions |= kRepairStyle;
+                if (!UpdateLayeredStyle(overlay)) {
+                    repair_error = ERROR_GEN_FAILURE;
+                    can_present = false;
+                }
+            }
+
+            bool geometry_changed = false;
+            if (plan.reposition) {
+                actions |= kRepairPosition;
+                geometry_changed = RepositionWindow();
+            }
+
+            if (can_present && (plan.present || geometry_changed)) {
+                actions |= kRepairPresent;
+                RenderOverlay(overlay);
             }
         }
     }
@@ -2348,15 +2393,33 @@ void RepairOverlayInvariant(const wchar_t* trigger, const OverlayStateSnapshot& 
     }
 
     OverlayStateSnapshot after = CaptureOverlayState(true);
-    const bool presentation_required = recreated || (actions & 8U) != 0;
+    const bool presentation_required = (actions & kRepairPresent) != 0;
     const bool presented_after_repair =
         !presentation_required ||
         g_app.diagnostics.present_success_sequence > present_sequence_before_repair;
     if (!presented_after_repair) {
         after.issues |= OverlayInvariantPresentStale;
     }
-    const bool repaired = (after.issues & kActionableIssues) == OverlayInvariantNone;
+    const bool repaired =
+        presented_after_repair &&
+        (after.issues & kActionableIssues) == OverlayInvariantNone;
     if (repaired) {
+        if (refresh_only) {
+            ++g_app.diagnostics.overlay_refreshes;
+            LogFailureRecovered(
+                L"overlay.refresh",
+                L"event=component_recovered component=overlay_refresh trigger=%ls",
+                trigger);
+            LogInfo(
+                L"event=overlay_refresh trigger=%ls result=ok actions=0x%02x presented=%d visibility_commit=%d duration_ms=%lu",
+                trigger,
+                actions,
+                presented_after_repair ? 1 : 0,
+                (actions & kRepairCommitVisible) != 0 ? 1 : 0,
+                GetTickCount() - now);
+            return;
+        }
+
         ++g_app.diagnostics.overlay_repairs;
         if (after.issues == OverlayInvariantNone) {
             LogFailureRecovered(
@@ -2370,16 +2433,31 @@ void RepairOverlayInvariant(const wchar_t* trigger, const OverlayStateSnapshot& 
             trigger);
         LogInfo(
             L"event=overlay_repair trigger=%ls result=ok issues=0x%02x remaining=0x%02x actions=0x%02x "
-            L"presented=%d old_hwnd=%p new_hwnd=%p duration_ms=%lu",
+            L"presented=%d visibility_commit=%d old_hwnd=%p new_hwnd=%p duration_ms=%lu",
             trigger,
             before.issues,
             after.issues,
             actions,
             presented_after_repair ? 1 : 0,
+            (actions & kRepairCommitVisible) != 0 ? 1 : 0,
             old_overlay,
             after.hwnd,
             GetTickCount() - now);
     } else {
+        if (refresh_only) {
+            ++g_app.diagnostics.overlay_refresh_failures;
+            LogErrorRateLimited(
+                L"overlay.refresh",
+                kFailureLogIntervalMs,
+                L"event=overlay_refresh trigger=%ls result=failed actions=0x%02x presented=%d visibility_commit=%d error=%lu",
+                trigger,
+                actions,
+                presented_after_repair ? 1 : 0,
+                (actions & kRepairCommitVisible) != 0 ? 1 : 0,
+                repair_error == ERROR_SUCCESS ? ERROR_GEN_FAILURE : repair_error);
+            return;
+        }
+
         ++g_app.diagnostics.overlay_repair_failures;
         const DWORD reported_error =
             repair_error == ERROR_SUCCESS ? ERROR_GEN_FAILURE : repair_error;
@@ -2387,12 +2465,13 @@ void RepairOverlayInvariant(const wchar_t* trigger, const OverlayStateSnapshot& 
             L"overlay.repair",
             kFailureLogIntervalMs,
             L"event=overlay_repair trigger=%ls result=failed issues=0x%02x remaining=0x%02x "
-            L"actions=0x%02x presented=%d old_hwnd=%p new_hwnd=%p error=%lu",
+            L"actions=0x%02x presented=%d visibility_commit=%d old_hwnd=%p new_hwnd=%p error=%lu",
             trigger,
             before.issues,
             after.issues,
             actions,
             presented_after_repair ? 1 : 0,
+            (actions & kRepairCommitVisible) != 0 ? 1 : 0,
             old_overlay,
             after.hwnd,
             reported_error);
@@ -2438,7 +2517,7 @@ void MaybeLogHealth(const wchar_t* trigger, bool force = false) {
         L"last_present_attempt_age_ms=%lld last_present_age_ms=%lld "
         L"last_render_attempt_age_ms=%lld last_render_age_ms=%lld last_reposition_age_ms=%lld "
         L"last_metrics_age_ms=%lld state_gap_ms=%lu present_failures=%u render_failures=%u "
-        L"repairs=%u repair_failures=%u",
+        L"repairs=%u repair_failures=%u refreshes=%u refresh_failures=%u",
         trigger,
         g_app.window.controller_hwnd,
         g_app.window.monitor_initialized ? 1 : 0,
@@ -2487,7 +2566,9 @@ void MaybeLogHealth(const wchar_t* trigger, bool force = false) {
         g_app.diagnostics.present_failures,
         g_app.diagnostics.render_failures,
         g_app.diagnostics.overlay_repairs,
-        g_app.diagnostics.overlay_repair_failures);
+        g_app.diagnostics.overlay_repair_failures,
+        g_app.diagnostics.overlay_refreshes,
+        g_app.diagnostics.overlay_refresh_failures);
 }
 
 void ReloadConfigAndRefresh() {
@@ -3555,7 +3636,13 @@ void ReconcileOverlayStateOnce(const wchar_t* trigger, unsigned flags) {
         defer_actions(OverlayReconcileResetSurface);
         return;
     }
-    g_app.suppression.refresh_resume_tick = 0;
+    if (g_app.suppression.refresh_resume_tick != 0) {
+        flags |=
+            OverlayReconcileSampleMetrics |
+            OverlayReconcileReposition |
+            OverlayReconcileRender;
+        g_app.suppression.refresh_resume_tick = 0;
+    }
 
     const bool restoring_visibility =
         suppression_changed &&
@@ -3595,8 +3682,6 @@ void ReconcileOverlayStateOnce(const wchar_t* trigger, unsigned flags) {
         return;
     }
 
-    RepairOverlayInvariant(trigger, CaptureOverlayState(true));
-
     if ((flags & OverlayReconcileSampleMetrics) != 0) {
         SampleMetrics();
     }
@@ -3612,6 +3697,8 @@ void ReconcileOverlayStateOnce(const wchar_t* trigger, unsigned flags) {
     if (should_render) {
         RenderOverlay(overlay);
     }
+
+    RepairOverlayInvariant(trigger, CaptureOverlayState(true));
 }
 
 void ReconcileOverlayState(const wchar_t* trigger, unsigned flags) {

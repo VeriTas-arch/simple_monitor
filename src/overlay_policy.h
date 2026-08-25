@@ -127,6 +127,46 @@ constexpr OverlayIntent ComputeOverlayIntent(
     };
 }
 
+struct OverlayRepairObservation {
+    bool valid = false;
+    bool visible = false;
+    bool topmost = false;
+    bool layered = false;
+    bool rect_valid = false;
+    bool present_stale = false;
+};
+
+struct OverlayRepairIntent {
+    bool ensure_exists = false;
+    bool apply_style = false;
+    bool reposition = false;
+    bool present = false;
+    bool commit_visible = false;
+};
+
+constexpr OverlayRepairIntent ComputeOverlayRepairIntent(
+    OverlayRepairObservation observation) {
+    if (!observation.valid || !observation.visible) {
+        return {
+            !observation.valid,
+            true,
+            true,
+            true,
+            true,
+        };
+    }
+
+    const bool apply_style = !observation.layered;
+    const bool reposition = !observation.topmost || !observation.rect_valid;
+    return {
+        false,
+        apply_style,
+        reposition,
+        observation.present_stale || apply_style || !observation.rect_valid,
+        false,
+    };
+}
+
 struct TaskbarIdentity {
     std::uintptr_t hwnd = 0;
     std::uint32_t process_id = 0;
