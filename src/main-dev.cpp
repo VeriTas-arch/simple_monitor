@@ -69,6 +69,8 @@ constexpr std::uint64_t kTaskbarIdentitySettleMs = 250;
 constexpr simple_monitor::overlay_policy::SuppressionPolicyConfig kSuppressionPolicyConfig{
     250,
     500,
+    0,
+    100,
 };
 constexpr unsigned kFailureLogIntervalMs = 30000;
 constexpr int kMinimumTaskbarVisibleDip = 8;
@@ -99,6 +101,7 @@ using simple_monitor::overlay_policy::ResolveSuppressionObservation;
 using simple_monitor::overlay_policy::SuppressionObservation;
 using simple_monitor::overlay_policy::SuppressionPolicyState;
 using simple_monitor::overlay_policy::SuppressionReason;
+using simple_monitor::overlay_policy::SuppressionTransitionProfile;
 using simple_monitor::overlay_policy::TaskbarIdentity;
 using simple_monitor::overlay_policy::TaskbarIdentityState;
 using simple_monitor::overlay_policy::TaskbarVisibility;
@@ -670,6 +673,16 @@ enum class MonitorCoverageObservation {
     Covers,
 };
 
+struct ForegroundCoverageObservation {
+    MonitorCoverageObservation coverage = MonitorCoverageObservation::Unknown;
+    bool power_point_slideshow = false;
+};
+
+struct PresentationObservation {
+    PresentationVisibility visibility = PresentationVisibility::Unknown;
+    SuppressionTransitionProfile transition_profile = SuppressionTransitionProfile::Default;
+};
+
 MonitorCoverageObservation ObserveWindowMonitorCoverage(HWND window) {
     RECT window_rect{};
     if (!GetWindowRect(window, &window_rect)) {
@@ -692,25 +705,25 @@ MonitorCoverageObservation ObserveWindowMonitorCoverage(HWND window) {
     return covers ? MonitorCoverageObservation::Covers : MonitorCoverageObservation::Clear;
 }
 
-MonitorCoverageObservation ObserveForegroundMonitorCoverage(HWND foreground) {
+ForegroundCoverageObservation ObserveForegroundMonitorCoverage(HWND foreground) {
     if (!foreground || !IsWindow(foreground)) {
-        return MonitorCoverageObservation::Unknown;
+        return {};
     }
     if (foreground == g_app.window.overlay_hwnd ||
         foreground == g_app.window.controller_hwnd ||
         IsTaskbarPreviewWindow(foreground) ||
         !IsWindowVisible(foreground) ||
         IsIconic(foreground)) {
-        return MonitorCoverageObservation::Clear;
+        return {MonitorCoverageObservation::Clear, false};
     }
 
     const DWORD foreground_process_id = WindowProcessId(foreground);
     if (foreground_process_id == 0) {
-        return MonitorCoverageObservation::Unknown;
+        return {};
     }
     HWND candidate = GetAncestor(foreground, GA_ROOT);
     if (!candidate) {
-        return MonitorCoverageObservation::Unknown;
+        return {};
     }
     bool unknown_observed = false;
     for (unsigned depth = 0; candidate && depth < 8; ++depth) {
@@ -731,7 +744,13 @@ MonitorCoverageObservation ObserveForegroundMonitorCoverage(HWND foreground) {
                 const MonitorCoverageObservation coverage =
                     ObserveWindowMonitorCoverage(candidate);
                 if (coverage == MonitorCoverageObservation::Covers) {
-                    return MonitorCoverageObservation::Covers;
+                    const bool power_point_slideshow =
+                        WindowClassIs(candidate, L"screenClass") &&
+                        WindowProcessBasename(candidate) == L"powerpnt.exe";
+                    return {
+                        MonitorCoverageObservation::Covers,
+                        power_point_slideshow,
+                    };
                 }
                 unknown_observed |= coverage == MonitorCoverageObservation::Unknown;
             }
@@ -748,15 +767,28 @@ MonitorCoverageObservation ObserveForegroundMonitorCoverage(HWND foreground) {
         }
         candidate = next;
     }
-    return unknown_observed
-        ? MonitorCoverageObservation::Unknown
-        : MonitorCoverageObservation::Clear;
+    return {
+        unknown_observed
+            ? MonitorCoverageObservation::Unknown
+            : MonitorCoverageObservation::Clear,
+        false,
+    };
 }
 
-PresentationVisibility ObservePresentationVisibility(HWND foreground) {
+bool IsPowerPointEditorMainWindow(HWND foreground) {
+    return foreground &&
+           GetAncestor(foreground, GA_ROOT) == foreground &&
+           GetWindow(foreground, GW_OWNER) == nullptr &&
+           WindowClassIs(foreground, L"PPTFrameClass") &&
+           WindowProcessBasename(foreground) == L"powerpnt.exe";
+}
+
+PresentationObservation ObservePresentation(
+    HWND foreground,
+    SuppressionReason committed_suppression) {
     QUERY_USER_NOTIFICATION_STATE state = QUNS_NOT_PRESENT;
     if (FAILED(SHQueryUserNotificationState(&state))) {
-        return PresentationVisibility::Unknown;
+        return {};
     }
 
     const bool may_suppress =
@@ -764,17 +796,42 @@ PresentationVisibility ObservePresentationVisibility(HWND foreground) {
         state == QUNS_RUNNING_D3D_FULL_SCREEN ||
         state == QUNS_PRESENTATION_MODE;
     if (!may_suppress) {
-        return PresentationVisibility::Clear;
+        if (committed_suppression != SuppressionReason::FullscreenPresentation ||
+            WindowProcessBasename(foreground) != L"powerpnt.exe") {
+            return {PresentationVisibility::Clear, SuppressionTransitionProfile::Default};
+        }
+
+        const ForegroundCoverageObservation coverage =
+            ObserveForegroundMonitorCoverage(foreground);
+        if (coverage.power_point_slideshow) {
+            return {PresentationVisibility::Fullscreen, SuppressionTransitionProfile::Fast};
+        }
+        if (coverage.coverage == MonitorCoverageObservation::Unknown) {
+            return {};
+        }
+        return {
+            PresentationVisibility::Clear,
+            state == QUNS_ACCEPTS_NOTIFICATIONS &&
+                    coverage.coverage == MonitorCoverageObservation::Clear &&
+                    IsPowerPointEditorMainWindow(foreground)
+                ? SuppressionTransitionProfile::Fast
+                : SuppressionTransitionProfile::Default,
+        };
     }
 
-    const MonitorCoverageObservation coverage =
+    const ForegroundCoverageObservation coverage =
         ObserveForegroundMonitorCoverage(foreground);
-    if (coverage == MonitorCoverageObservation::Unknown) {
-        return PresentationVisibility::Unknown;
+    if (coverage.coverage == MonitorCoverageObservation::Unknown) {
+        return {};
     }
-    return coverage == MonitorCoverageObservation::Covers
-        ? PresentationVisibility::Fullscreen
-        : PresentationVisibility::Clear;
+    return {
+        coverage.coverage == MonitorCoverageObservation::Covers
+            ? PresentationVisibility::Fullscreen
+            : PresentationVisibility::Clear,
+        coverage.power_point_slideshow
+            ? SuppressionTransitionProfile::Fast
+            : SuppressionTransitionProfile::Default,
+    };
 }
 
 const wchar_t* NotificationStateName(QUERY_USER_NOTIFICATION_STATE state) {
@@ -796,13 +853,23 @@ const wchar_t* NotificationStateName(QUERY_USER_NOTIFICATION_STATE state) {
     }
 }
 
-SuppressionObservation ObserveSuppression(HWND foreground, bool screenshot_foreground) {
+SuppressionObservation ObserveSuppression(
+    HWND foreground,
+    bool screenshot_foreground,
+    SuppressionReason committed_suppression) {
     const TaskbarVisibility taskbar = ObserveTaskbarVisibility();
-    const PresentationVisibility presentation =
+    const PresentationObservation presentation =
         screenshot_foreground
-            ? PresentationVisibility::Clear
-            : ObservePresentationVisibility(foreground);
-    return ResolveSuppressionObservation(taskbar, screenshot_foreground, presentation);
+            ? PresentationObservation{PresentationVisibility::Clear}
+            : ObservePresentation(foreground, committed_suppression);
+    SuppressionObservation observation = ResolveSuppressionObservation(
+        taskbar,
+        screenshot_foreground,
+        presentation.visibility);
+    if (observation.known && taskbar == TaskbarVisibility::Visible) {
+        observation.transition_profile = presentation.transition_profile;
+    }
+    return observation;
 }
 
 const wchar_t* SuppressionReasonName(SuppressionReason reason) {
@@ -815,6 +882,10 @@ const wchar_t* SuppressionReasonName(SuppressionReason reason) {
     default:
         return L"none";
     }
+}
+
+const wchar_t* SuppressionTransitionProfileName(SuppressionTransitionProfile profile) {
+    return profile == SuppressionTransitionProfile::Fast ? L"fast" : L"default";
 }
 
 void LogSuppressionContext(SuppressionReason reason) {
@@ -3452,7 +3523,10 @@ bool UpdateSuppressionPolicy(
     bool screenshot_foreground) {
     const SuppressionPolicyState previous_state = g_app.suppression.policy;
     const SuppressionObservation observation =
-        ObserveSuppression(foreground, screenshot_foreground);
+        ObserveSuppression(
+            foreground,
+            screenshot_foreground,
+            previous_state.committed);
     auto result = ReduceSuppressionPolicy(
         previous_state,
         observation,
@@ -3462,13 +3536,17 @@ bool UpdateSuppressionPolicy(
 
     const bool candidate_started =
         result.state.candidate_active &&
-        (!previous_state.candidate_active || previous_state.candidate != result.state.candidate);
+        (!previous_state.candidate_active ||
+         previous_state.candidate != result.state.candidate ||
+         previous_state.candidate_profile != result.state.candidate_profile);
     if (candidate_started) {
         LogInfo(
-            L"event=suppression_candidate trigger=%ls candidate=%ls committed=%ls",
+            L"event=suppression_candidate trigger=%ls candidate=%ls committed=%ls profile=%ls required_delay_ms=%llu",
             trigger,
             SuppressionReasonName(result.state.candidate),
-            SuppressionReasonName(result.state.committed));
+            SuppressionReasonName(result.state.committed),
+            SuppressionTransitionProfileName(result.state.candidate_profile),
+            static_cast<unsigned long long>(result.required_delay_ms));
     }
 
     if (!result.committed_changed) {
@@ -3481,11 +3559,13 @@ bool UpdateSuppressionPolicy(
         result.state.committed != SuppressionReason::None) {
         g_app.suppression.suppression_started_tick = now == 0 ? 1 : now;
         LogInfo(
-            L"event=suppression_on trigger=%ls reason=%ls decision=%llu dwell_ms=%llu",
+            L"event=suppression_on trigger=%ls reason=%ls decision=%llu dwell_ms=%llu profile=%ls required_delay_ms=%llu",
             trigger,
             SuppressionReasonName(result.state.committed),
             static_cast<unsigned long long>(g_app.suppression.decision_sequence),
-            static_cast<unsigned long long>(result.candidate_dwell_ms));
+            static_cast<unsigned long long>(result.candidate_dwell_ms),
+            SuppressionTransitionProfileName(result.transition_profile),
+            static_cast<unsigned long long>(result.required_delay_ms));
         LogSuppressionContext(result.state.committed);
     } else if (result.previous_committed != SuppressionReason::None &&
                result.state.committed == SuppressionReason::None) {
@@ -3494,21 +3574,25 @@ bool UpdateSuppressionPolicy(
             : now - g_app.suppression.suppression_started_tick;
         g_app.suppression.suppression_started_tick = 0;
         LogInfo(
-            L"event=suppression_off trigger=%ls previous_reason=%ls duration_ms=%lu decision=%llu dwell_ms=%llu",
+            L"event=suppression_off trigger=%ls previous_reason=%ls duration_ms=%lu decision=%llu dwell_ms=%llu profile=%ls required_delay_ms=%llu",
             trigger,
             SuppressionReasonName(result.previous_committed),
             duration_ms,
             static_cast<unsigned long long>(g_app.suppression.decision_sequence),
-            static_cast<unsigned long long>(result.candidate_dwell_ms));
+            static_cast<unsigned long long>(result.candidate_dwell_ms),
+            SuppressionTransitionProfileName(result.transition_profile),
+            static_cast<unsigned long long>(result.required_delay_ms));
         LogSuppressionContext(SuppressionReason::None);
     } else {
         LogInfo(
-            L"event=suppression_changed trigger=%ls previous_reason=%ls reason=%ls decision=%llu dwell_ms=%llu",
+            L"event=suppression_changed trigger=%ls previous_reason=%ls reason=%ls decision=%llu dwell_ms=%llu profile=%ls required_delay_ms=%llu",
             trigger,
             SuppressionReasonName(result.previous_committed),
             SuppressionReasonName(result.state.committed),
             static_cast<unsigned long long>(g_app.suppression.decision_sequence),
-            static_cast<unsigned long long>(result.candidate_dwell_ms));
+            static_cast<unsigned long long>(result.candidate_dwell_ms),
+            SuppressionTransitionProfileName(result.transition_profile),
+            static_cast<unsigned long long>(result.required_delay_ms));
         LogSuppressionContext(result.state.committed);
     }
     return true;

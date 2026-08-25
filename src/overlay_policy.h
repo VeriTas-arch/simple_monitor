@@ -22,9 +22,15 @@ enum class PresentationVisibility {
     Fullscreen,
 };
 
+enum class SuppressionTransitionProfile {
+    Default,
+    Fast,
+};
+
 struct SuppressionObservation {
     bool known = false;
     SuppressionReason reason = SuppressionReason::None;
+    SuppressionTransitionProfile transition_profile = SuppressionTransitionProfile::Default;
 };
 
 constexpr SuppressionObservation ResolveSuppressionObservation(
@@ -54,6 +60,8 @@ constexpr SuppressionObservation ResolveSuppressionObservation(
 struct SuppressionPolicyConfig {
     std::uint64_t enter_delay_ms = 250;
     std::uint64_t exit_delay_ms = 500;
+    std::uint64_t fast_enter_delay_ms = 0;
+    std::uint64_t fast_exit_delay_ms = 100;
 };
 
 struct SuppressionPolicyState {
@@ -61,12 +69,15 @@ struct SuppressionPolicyState {
     SuppressionReason candidate = SuppressionReason::None;
     std::uint64_t candidate_since_ms = 0;
     bool candidate_active = false;
+    SuppressionTransitionProfile candidate_profile = SuppressionTransitionProfile::Default;
 };
 
 struct SuppressionPolicyResult {
     SuppressionPolicyState state;
     SuppressionReason previous_committed = SuppressionReason::None;
     std::uint64_t candidate_dwell_ms = 0;
+    std::uint64_t required_delay_ms = 0;
+    SuppressionTransitionProfile transition_profile = SuppressionTransitionProfile::Default;
     bool committed_changed = false;
 };
 
@@ -78,27 +89,34 @@ constexpr SuppressionPolicyResult ReduceSuppressionPolicy(
     SuppressionPolicyResult result{};
     result.state = state;
     result.previous_committed = state.committed;
+    result.transition_profile = observation.transition_profile;
 
     if (!observation.known || observation.reason == state.committed) {
         result.state.candidate = state.committed;
         result.state.candidate_since_ms = 0;
         result.state.candidate_active = false;
+        result.state.candidate_profile = SuppressionTransitionProfile::Default;
         return result;
     }
 
-    if (!state.candidate_active || state.candidate != observation.reason) {
+    const bool fast =
+        observation.transition_profile == SuppressionTransitionProfile::Fast;
+    result.required_delay_ms = observation.reason == SuppressionReason::None
+        ? (fast ? config.fast_exit_delay_ms : config.exit_delay_ms)
+        : (fast ? config.fast_enter_delay_ms : config.enter_delay_ms);
+
+    if (!state.candidate_active ||
+        state.candidate != observation.reason ||
+        state.candidate_profile != observation.transition_profile) {
         result.state.candidate = observation.reason;
         result.state.candidate_since_ms = now_ms;
         result.state.candidate_active = true;
-        return result;
+        result.state.candidate_profile = observation.transition_profile;
+    } else {
+        result.candidate_dwell_ms = now_ms - state.candidate_since_ms;
     }
 
-    result.candidate_dwell_ms = now_ms - state.candidate_since_ms;
-    const std::uint64_t required_delay =
-        observation.reason == SuppressionReason::None
-            ? config.exit_delay_ms
-            : config.enter_delay_ms;
-    if (result.candidate_dwell_ms < required_delay) {
+    if (result.candidate_dwell_ms < result.required_delay_ms) {
         return result;
     }
 
@@ -106,6 +124,7 @@ constexpr SuppressionPolicyResult ReduceSuppressionPolicy(
     result.state.candidate = observation.reason;
     result.state.candidate_since_ms = 0;
     result.state.candidate_active = false;
+    result.state.candidate_profile = SuppressionTransitionProfile::Default;
     result.committed_changed = true;
     return result;
 }

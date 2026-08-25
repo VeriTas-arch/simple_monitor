@@ -113,6 +113,57 @@ void TestSuppressionHysteresis() {
     Check(result.committed_changed, "restore should commit after exit dwell");
 }
 
+void TestFastSuppressionProfile() {
+    const policy::SuppressionPolicyConfig config{250, 500, 0, 100};
+    const policy::SuppressionObservation fast_enter{
+        true,
+        policy::SuppressionReason::FullscreenPresentation,
+        policy::SuppressionTransitionProfile::Fast,
+    };
+
+    auto result = policy::ReduceSuppressionPolicy({}, fast_enter, 1000, config);
+    Check(result.committed_changed, "fast suppression should commit on the first sample");
+    Check(result.candidate_dwell_ms == 0, "fast suppression should not add enter dwell");
+    Check(result.required_delay_ms == 0, "fast suppression should report zero enter delay");
+
+    const policy::SuppressionObservation fast_exit{
+        true,
+        policy::SuppressionReason::None,
+        policy::SuppressionTransitionProfile::Fast,
+    };
+    result = policy::ReduceSuppressionPolicy(result.state, fast_exit, 2000, config);
+    Check(!result.committed_changed, "fast restore should still reject a single clear sample");
+    Check(result.required_delay_ms == 100, "fast restore should use its shorter exit delay");
+
+    result = policy::ReduceSuppressionPolicy(result.state, fast_exit, 2099, config);
+    Check(!result.committed_changed, "fast restore should wait for its full exit dwell");
+    result = policy::ReduceSuppressionPolicy(result.state, fast_exit, 2100, config);
+    Check(result.committed_changed, "fast restore should commit after its exit dwell");
+}
+
+void TestSuppressionProfileChangeRestartsDwell() {
+    const policy::SuppressionPolicyConfig config{250, 500, 0, 100};
+    policy::SuppressionPolicyState state{};
+    state.committed = policy::SuppressionReason::FullscreenPresentation;
+    const policy::SuppressionObservation normal_exit{
+        true,
+        policy::SuppressionReason::None,
+    };
+    const policy::SuppressionObservation fast_exit{
+        true,
+        policy::SuppressionReason::None,
+        policy::SuppressionTransitionProfile::Fast,
+    };
+
+    auto result = policy::ReduceSuppressionPolicy(state, normal_exit, 1000, config);
+    result = policy::ReduceSuppressionPolicy(result.state, fast_exit, 1400, config);
+    Check(!result.committed_changed, "changing transition profile should restart candidate dwell");
+    Check(result.candidate_dwell_ms == 0, "restarted profile should begin with zero dwell");
+
+    result = policy::ReduceSuppressionPolicy(result.state, fast_exit, 1500, config);
+    Check(result.committed_changed, "restarted fast profile should commit after its own dwell");
+}
+
 void TestSuppressionDoesNotDestroyOverlayIntent() {
     const auto hidden = policy::ComputeOverlayIntent(
         true,
@@ -246,6 +297,8 @@ int main() {
     TestObservationPriority();
     TestUnknownPreservesCommittedSuppression();
     TestSuppressionHysteresis();
+    TestFastSuppressionProfile();
+    TestSuppressionProfileChangeRestartsDwell();
     TestSuppressionDoesNotDestroyOverlayIntent();
     TestSuppressionCandidateMustRemainStable();
     TestRepairSeparatesRefreshFromVisibilityCommit();
