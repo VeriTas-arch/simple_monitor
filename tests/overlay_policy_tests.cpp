@@ -206,6 +206,39 @@ void TestSuppressionCandidateMustRemainStable() {
     Check(result.committed_changed, "a stable restarted candidate should eventually commit");
 }
 
+void TestInitialOwnerBindingRetryBoundary() {
+    using Action = policy::InitialOwnerBindingAction;
+
+    Check(
+        policy::DecideInitialOwnerBindingAction(
+            false, true, true, false, 0, 8, 1000, 1000) == Action::None,
+        "runtime owner mismatch must not arm initial binding repair");
+    Check(
+        policy::DecideInitialOwnerBindingAction(
+            true, true, true, true, 1, 8, 1000, 1000) == Action::Complete,
+        "a verified owner should complete initial binding repair");
+    Check(
+        policy::DecideInitialOwnerBindingAction(
+            true, true, true, true, 0, 8, 999, 1000) == Action::Wait,
+        "creation-time owner verification should wait for its observation deadline");
+    Check(
+        policy::DecideInitialOwnerBindingAction(
+            true, true, false, false, 1, 8, 1000, 1000) == Action::Wait,
+        "initial binding repair should wait for a valid taskbar target");
+    Check(
+        policy::DecideInitialOwnerBindingAction(
+            true, true, true, false, 1, 8, 999, 1000) == Action::Wait,
+        "initial binding repair should respect its retry deadline");
+    Check(
+        policy::DecideInitialOwnerBindingAction(
+            true, true, true, false, 1, 8, 1000, 1000) == Action::Retry,
+        "a due creation-time owner mismatch should request a retry");
+    Check(
+        policy::DecideInitialOwnerBindingAction(
+            true, true, true, false, 8, 8, 1000, 1000) == Action::Exhausted,
+        "initial binding repair must remain bounded");
+}
+
 void TestRepairSeparatesRefreshFromVisibilityCommit() {
     const auto stale = policy::ComputeOverlayRepairIntent({
         true,
@@ -301,6 +334,7 @@ int main() {
     TestSuppressionProfileChangeRestartsDwell();
     TestSuppressionDoesNotDestroyOverlayIntent();
     TestSuppressionCandidateMustRemainStable();
+    TestInitialOwnerBindingRetryBoundary();
     TestRepairSeparatesRefreshFromVisibilityCommit();
     TestTaskbarIdentityCommitsOnce();
 

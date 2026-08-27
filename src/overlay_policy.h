@@ -27,6 +27,38 @@ enum class SuppressionTransitionProfile {
     Fast,
 };
 
+enum class InitialOwnerBindingAction {
+    None,
+    Complete,
+    Wait,
+    Retry,
+    Exhausted,
+};
+
+constexpr InitialOwnerBindingAction DecideInitialOwnerBindingAction(
+    bool pending,
+    bool overlay_valid,
+    bool target_valid,
+    bool owner_matches,
+    unsigned attempts,
+    unsigned max_attempts,
+    std::uint64_t now_ms,
+    std::uint64_t next_retry_ms) {
+    if (!pending) {
+        return InitialOwnerBindingAction::None;
+    }
+    if (attempts >= max_attempts) {
+        return InitialOwnerBindingAction::Exhausted;
+    }
+    if (!overlay_valid || !target_valid || now_ms < next_retry_ms) {
+        return InitialOwnerBindingAction::Wait;
+    }
+    if (owner_matches) {
+        return InitialOwnerBindingAction::Complete;
+    }
+    return InitialOwnerBindingAction::Retry;
+}
+
 struct SuppressionObservation {
     bool known = false;
     SuppressionReason reason = SuppressionReason::None;

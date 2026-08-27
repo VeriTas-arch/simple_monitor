@@ -65,6 +65,8 @@ constexpr DWORD kGpuGroupRefreshIntervalMs = 5000;
 constexpr DWORD kHealthLogIntervalMs = 60000;
 constexpr DWORD kOverlayRepairIntervalMs = 5000;
 constexpr DWORD kPresentStaleThresholdMs = 5000;
+constexpr std::uint64_t kInitialOwnerBindingRetryIntervalMs = 500;
+constexpr unsigned kInitialOwnerBindingMaxAttempts = 8;
 constexpr std::uint64_t kTaskbarIdentitySettleMs = 250;
 constexpr simple_monitor::overlay_policy::SuppressionPolicyConfig kSuppressionPolicyConfig{
     250,
@@ -92,6 +94,8 @@ enum MenuId : UINT {
 
 using simple_monitor::overlay_policy::ComputeOverlayIntent;
 using simple_monitor::overlay_policy::ComputeOverlayRepairIntent;
+using simple_monitor::overlay_policy::DecideInitialOwnerBindingAction;
+using simple_monitor::overlay_policy::InitialOwnerBindingAction;
 using simple_monitor::overlay_policy::OverlayIntent;
 using simple_monitor::overlay_policy::OverlayRepairObservation;
 using simple_monitor::overlay_policy::PresentationVisibility;
@@ -240,6 +244,14 @@ struct SuppressionState {
 };
 
 struct ReconcileState {
+    struct InitialOwnerBindingState {
+        HWND target = nullptr;
+        std::uint64_t next_retry_ms = 0;
+        unsigned attempts = 0;
+        bool pending = false;
+        bool exhausted = false;
+    } initial_owner_binding;
+
     const wchar_t* pending_trigger = L"coalesced";
     unsigned pending_flags = OverlayReconcileNone;
     unsigned deferred_flags = OverlayReconcileNone;
@@ -544,6 +556,24 @@ std::wstring WindowClassName(HWND hwnd) {
         return L"";
     }
     return class_name;
+}
+
+std::wstring WindowTitleForLog(HWND hwnd) {
+    wchar_t title[160]{};
+    const int length = hwnd ? GetWindowTextW(hwnd, title, ARRAYSIZE(title)) : 0;
+    if (length <= 0) {
+        return L"";
+    }
+
+    std::wstring result(title, static_cast<size_t>(length));
+    for (wchar_t& ch : result) {
+        if (ch == L'\r' || ch == L'\n' || ch == L'\t') {
+            ch = L' ';
+        } else if (ch == L'"') {
+            ch = L'\'';
+        }
+    }
+    return result;
 }
 
 bool IsTaskbarWindowClass(HWND hwnd) {
@@ -920,25 +950,43 @@ void LogSuppressionContext(SuppressionReason reason) {
     const std::wstring root_exe = WindowProcessBasename(root);
     const std::wstring foreground_class = WindowClassName(foreground);
     const std::wstring root_class = WindowClassName(root);
+    const std::wstring foreground_title = WindowTitleForLog(foreground);
+    const std::wstring root_title = WindowTitleForLog(root);
+    const LONG_PTR foreground_style = GetWindowLongPtrW(foreground, GWL_STYLE);
+    const LONG_PTR foreground_ex_style = GetWindowLongPtrW(foreground, GWL_EXSTYLE);
+    HWND foreground_owner = foreground ? GetWindow(foreground, GW_OWNER) : nullptr;
+    HWND foreground_root_owner = foreground ? GetAncestor(foreground, GA_ROOTOWNER) : nullptr;
     LogInfo(
         L"event=suppression_context reason=%ls notification_hr=0x%08lx notification_state=%d notification_name=%ls "
-        L"foreground_hwnd=%p foreground_exe=%ls foreground_class=%ls foreground_rect=(%ld,%ld,%ld,%ld) "
-        L"root_hwnd=%p root_exe=%ls root_class=%ls root_rect=(%ld,%ld,%ld,%ld) "
+        L"foreground_hwnd=%p foreground_pid=%lu foreground_exe=%ls foreground_class=%ls foreground_title=\"%ls\" "
+        L"foreground_visible=%d foreground_iconic=%d foreground_style=0x%llx foreground_exstyle=0x%llx "
+        L"foreground_owner=%p foreground_root_owner=%p foreground_rect=(%ld,%ld,%ld,%ld) "
+        L"root_hwnd=%p root_pid=%lu root_exe=%ls root_class=%ls root_title=\"%ls\" root_rect=(%ld,%ld,%ld,%ld) "
         L"monitor_rect=(%ld,%ld,%ld,%ld) taskbar_hwnd=%p taskbar_rect=(%ld,%ld,%ld,%ld)",
         SuppressionReasonName(reason),
         static_cast<unsigned long>(notification_result),
         static_cast<int>(notification_state),
         NotificationStateName(notification_state),
         foreground,
+        WindowProcessId(foreground),
         foreground_exe.c_str(),
         foreground_class.c_str(),
+        foreground_title.c_str(),
+        foreground && IsWindowVisible(foreground) ? 1 : 0,
+        foreground && IsIconic(foreground) ? 1 : 0,
+        static_cast<unsigned long long>(foreground_style),
+        static_cast<unsigned long long>(foreground_ex_style),
+        foreground_owner,
+        foreground_root_owner,
         foreground_rect.left,
         foreground_rect.top,
         foreground_rect.right,
         foreground_rect.bottom,
         root,
+        WindowProcessId(root),
         root_exe.c_str(),
         root_class.c_str(),
+        root_title.c_str(),
         root_rect.left,
         root_rect.top,
         root_rect.right,
@@ -2174,6 +2222,142 @@ bool ShouldLogOverlayInvariantDetail(DWORD now) {
     return true;
 }
 
+void ResetInitialOwnerBindingState() {
+    g_app.reconcile.initial_owner_binding = {};
+}
+
+void ArmInitialOwnerBindingVerification(
+    HWND overlay,
+    HWND target,
+    const wchar_t* source,
+    std::uint64_t delay_ms) {
+    ResetInitialOwnerBindingState();
+    if (!overlay || !IsWindow(overlay) || !target || !IsWindow(target)) {
+        return;
+    }
+
+    const HWND effective_owner = GetWindow(overlay, GW_OWNER);
+    auto& state = g_app.reconcile.initial_owner_binding;
+    state.target = target;
+    state.next_retry_ms = GetTickCount64() + delay_ms;
+    state.pending = true;
+    if (effective_owner != target) {
+        LogWarning(
+            L"event=overlay_owner_binding result=pending source=%ls hwnd=%p target=%p effective_owner=%p "
+            L"generation=%llu retry_delay_ms=%llu max_attempts=%u",
+            source,
+            overlay,
+            target,
+            effective_owner,
+            static_cast<unsigned long long>(g_app.diagnostics.overlay_generation),
+            static_cast<unsigned long long>(delay_ms),
+            kInitialOwnerBindingMaxAttempts);
+    }
+}
+
+bool ReconcileInitialOwnerBinding(const wchar_t* trigger) {
+    auto& state = g_app.reconcile.initial_owner_binding;
+    HWND overlay = g_app.window.overlay_hwnd;
+    HWND target = state.target;
+    HWND effective_owner = overlay && IsWindow(overlay) ? GetWindow(overlay, GW_OWNER) : nullptr;
+    const bool overlay_valid = overlay && IsWindow(overlay);
+    const bool target_valid =
+        target &&
+        target == CommittedTaskbarWindow() &&
+        IsWindow(target) &&
+        IsTaskbarWindowClass(target) &&
+        WindowProcessId(target) == CommittedTaskbarProcessId();
+    const std::uint64_t now_ms = GetTickCount64();
+    const InitialOwnerBindingAction action = DecideInitialOwnerBindingAction(
+        state.pending,
+        overlay_valid,
+        target_valid,
+        effective_owner == target,
+        state.attempts,
+        kInitialOwnerBindingMaxAttempts,
+        now_ms,
+        state.next_retry_ms);
+
+    if (action == InitialOwnerBindingAction::None ||
+        action == InitialOwnerBindingAction::Wait) {
+        return false;
+    }
+    if (action == InitialOwnerBindingAction::Complete) {
+        LogInfo(
+            L"event=overlay_owner_binding result=observed_bound trigger=%ls hwnd=%p target=%p attempts=%u generation=%llu",
+            trigger,
+            overlay,
+            target,
+            state.attempts,
+            static_cast<unsigned long long>(g_app.diagnostics.overlay_generation));
+        ResetInitialOwnerBindingState();
+        return false;
+    }
+    if (action == InitialOwnerBindingAction::Exhausted) {
+        state.pending = false;
+        state.exhausted = true;
+        LogWarning(
+            L"event=overlay_owner_binding result=exhausted trigger=%ls hwnd=%p target=%p effective_owner=%p "
+            L"attempts=%u generation=%llu",
+            trigger,
+            overlay,
+            target,
+            effective_owner,
+            state.attempts,
+            static_cast<unsigned long long>(g_app.diagnostics.overlay_generation));
+        return false;
+    }
+
+    ++state.attempts;
+    SetLastError(ERROR_SUCCESS);
+    const LONG_PTR previous_owner_value = SetWindowLongPtrW(
+        overlay,
+        GWLP_HWNDPARENT,
+        reinterpret_cast<LONG_PTR>(target));
+    const DWORD set_error =
+        previous_owner_value == 0 ? GetLastError() : ERROR_SUCCESS;
+    effective_owner = GetWindow(overlay, GW_OWNER);
+    state.next_retry_ms = now_ms + kInitialOwnerBindingRetryIntervalMs;
+    if (effective_owner != target) {
+        LogWarning(
+            L"event=overlay_owner_binding result=retry_failed trigger=%ls hwnd=%p target=%p effective_owner=%p "
+            L"attempt=%u max_attempts=%u set_error=%lu generation=%llu",
+            trigger,
+            overlay,
+            target,
+            effective_owner,
+            state.attempts,
+            kInitialOwnerBindingMaxAttempts,
+            set_error,
+            static_cast<unsigned long long>(g_app.diagnostics.overlay_generation));
+        return false;
+    }
+
+    SetLastError(ERROR_SUCCESS);
+    const BOOL positioned = SetWindowPos(
+        overlay,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    const DWORD position_error = positioned ? ERROR_SUCCESS : GetLastError();
+    LogInfo(
+        L"event=overlay_owner_binding result=ok trigger=%ls hwnd=%p target=%p effective_owner=%p "
+        L"attempt=%u set_error=%lu topmost_error=%lu generation=%llu",
+        trigger,
+        overlay,
+        target,
+        effective_owner,
+        state.attempts,
+        set_error,
+        position_error,
+        static_cast<unsigned long long>(g_app.diagnostics.overlay_generation));
+    ResetInitialOwnerBindingState();
+    return true;
+}
+
 void ResetOverlayPresentDiagnostics() {
     g_app.diagnostics.last_present_attempt_tick = 0;
     g_app.diagnostics.last_present_success_tick = 0;
@@ -2185,6 +2369,7 @@ bool DestroyOverlayWindow(const wchar_t* reason) {
     if (!overlay || !IsWindow(overlay)) {
         g_app.window.overlay_hwnd = nullptr;
         g_app.placement.taskbar_owner = nullptr;
+        ResetInitialOwnerBindingState();
         ResetOverlayPresentDiagnostics();
         return true;
     }
@@ -2200,6 +2385,7 @@ bool DestroyOverlayWindow(const wchar_t* reason) {
     }
     g_app.window.overlay_hwnd = nullptr;
     g_app.placement.taskbar_owner = nullptr;
+    ResetInitialOwnerBindingState();
     ResetOverlayPresentDiagnostics();
     return true;
 }
@@ -2237,6 +2423,7 @@ bool EnsureOverlayWindow(DWORD* error_out) {
     }
     g_app.window.overlay_hwnd = nullptr;
     g_app.placement.taskbar_owner = nullptr;
+    ResetInitialOwnerBindingState();
     ResetOverlayPresentDiagnostics();
 
     if (!taskbar_valid) {
@@ -2295,11 +2482,19 @@ bool EnsureOverlayWindow(DWORD* error_out) {
     g_app.window.dpi = WindowDpi(overlay);
     g_app.placement.taskbar_owner = taskbar;
     UpdateLayeredStyle(overlay);
+    const HWND effective_owner = GetWindow(overlay, GW_OWNER);
     LogInfo(
-        L"event=overlay_created hwnd=%p requested_owner=%p effective_owner=%p",
+        L"event=overlay_created hwnd=%p requested_owner=%p effective_owner=%p owner_bound=%d generation=%llu",
         overlay,
         taskbar,
-        GetWindow(overlay, GW_OWNER));
+        effective_owner,
+        effective_owner == taskbar ? 1 : 0,
+        static_cast<unsigned long long>(g_app.diagnostics.overlay_generation));
+    ArmInitialOwnerBindingVerification(
+        overlay,
+        taskbar,
+        L"overlay_create",
+        kInitialOwnerBindingRetryIntervalMs);
     return true;
 }
 
@@ -2581,6 +2776,7 @@ void MaybeLogHealth(const wchar_t* trigger, bool force = false) {
         L"event=health trigger=%ls controller=%p monitor_initialized=%d taskbar=%p taskbar_pid=%lu "
         L"overlay=%p generation=%llu valid=%d visible=%d cloak_known=%d cloak_hresult=0x%08lx "
         L"cloak_flags=0x%08lx topmost=%d layered=%d owner=%p expected_owner=%p "
+        L"owner_bind_pending=%d owner_bind_exhausted=%d owner_bind_attempts=%u owner_bind_target=%p "
         L"rect=(%ld,%ld,%ld,%ld) above=%p above_exe=%ls above_class=%ls issues=0x%02x "
         L"suppression=%ls candidate=%ls candidate_active=%d candidate_age_ms=%lld "
         L"desired_visible=%d visibility_matches=%d decision=%llu frozen=%d "
@@ -2605,6 +2801,10 @@ void MaybeLogHealth(const wchar_t* trigger, bool force = false) {
         (state.ex_style & WS_EX_LAYERED) != 0 ? 1 : 0,
         state.owner,
         state.expected_owner,
+        g_app.reconcile.initial_owner_binding.pending ? 1 : 0,
+        g_app.reconcile.initial_owner_binding.exhausted ? 1 : 0,
+        g_app.reconcile.initial_owner_binding.attempts,
+        g_app.reconcile.initial_owner_binding.target,
         state.rect.left,
         state.rect.top,
         state.rect.right,
@@ -2662,6 +2862,11 @@ void ReloadConfigAndRefresh() {
 
 void RecoverTaskbar() {
     LogInfo(L"event=manual_taskbar_recovery");
+    ArmInitialOwnerBindingVerification(
+        g_app.window.overlay_hwnd,
+        CommittedTaskbarWindow(),
+        L"manual_recovery",
+        0);
     ReconcileOverlayState(
         L"manual_recovery",
         OverlayReconcileReposition |
@@ -3685,6 +3890,9 @@ void ReconcileOverlayStateOnce(const wchar_t* trigger, unsigned flags) {
     HWND overlay = g_app.window.overlay_hwnd;
     const bool overlay_created =
         g_app.diagnostics.overlay_generation != generation_before_ensure;
+    if (ReconcileInitialOwnerBinding(trigger)) {
+        flags |= OverlayReconcileReposition | OverlayReconcileRender;
+    }
 
     HWND foreground = GetForegroundWindow();
     const bool screenshot_foreground = IsBuiltinScreenshotForeground(foreground);
@@ -4183,6 +4391,7 @@ LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
             LogInfo(L"event=overlay_destroyed hwnd=%p expected=%d", hwnd, expected ? 1 : 0);
             g_app.window.overlay_hwnd = nullptr;
             g_app.placement.taskbar_owner = nullptr;
+            ResetInitialOwnerBindingState();
             ResetOverlayPresentDiagnostics();
             if (!expected && g_app.window.monitor_initialized && g_app.window.controller_hwnd) {
                 if (!PostMessageW(g_app.window.controller_hwnd, WM_RECONCILE, 0, 0)) {
@@ -4217,7 +4426,10 @@ LRESULT CALLBACK ControllerWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
         return HandleDisplayChange();
 
     case WM_DEVICECHANGE:
-        LogInfo(L"event=environment_changed type=device");
+        LogInfo(
+            L"event=environment_changed type=device code=0x%llx payload=0x%llx",
+            static_cast<unsigned long long>(wparam),
+            static_cast<unsigned long long>(lparam));
         return HandleDisplayChange();
 
     case WM_SETTINGCHANGE:
