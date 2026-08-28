@@ -9,6 +9,91 @@ namespace simple_monitor {
 namespace {
 
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+constexpr wchar_t kConfigFileName[] = L"simple_monitor.ini";
+constexpr wchar_t kConfigTemplateName[] = L"simple_monitor.ini.example";
+
+bool IsExistingFile(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+           (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+bool EnsureDirectory(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES) {
+        return (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    }
+    if (CreateDirectoryW(path.c_str(), nullptr)) {
+        return true;
+    }
+    return GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+bool CreateMinimalConfig(const std::wstring& path) {
+    HANDLE file = CreateFileW(
+        path.c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        nullptr,
+        CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return GetLastError() == ERROR_FILE_EXISTS && IsExistingFile(path);
+    }
+
+    constexpr char contents[] = "[layout]\r\n";
+    DWORD written = 0;
+    const BOOL write_ok = WriteFile(
+        file,
+        contents,
+        static_cast<DWORD>(sizeof(contents) - 1),
+        &written,
+        nullptr);
+    CloseHandle(file);
+    if (!write_ok || written != sizeof(contents) - 1) {
+        DeleteFileW(path.c_str());
+        return false;
+    }
+    return true;
+}
+
+std::wstring ResolveConfigPath() {
+    const std::wstring module_dir = ModuleDir();
+    const std::wstring legacy_path = module_dir + L"\\" + kConfigFileName;
+#ifdef SIMPLE_MONITOR_CONFIG_DIR
+    const std::wstring config_dir = SIMPLE_MONITOR_CONFIG_DIR;
+#else
+    const std::wstring config_dir = module_dir;
+#endif
+    if (!EnsureDirectory(config_dir)) {
+        return legacy_path;
+    }
+
+    const std::wstring persistent_path = config_dir + L"\\" + kConfigFileName;
+    if (IsExistingFile(persistent_path)) {
+        return persistent_path;
+    }
+
+    if (IsExistingFile(legacy_path)) {
+        if (CopyFileW(legacy_path.c_str(), persistent_path.c_str(), TRUE) ||
+            IsExistingFile(persistent_path)) {
+            return persistent_path;
+        }
+        return legacy_path;
+    }
+
+    const std::wstring template_path = config_dir + L"\\" + kConfigTemplateName;
+    if (IsExistingFile(template_path) &&
+        (CopyFileW(template_path.c_str(), persistent_path.c_str(), TRUE) ||
+         IsExistingFile(persistent_path))) {
+        return persistent_path;
+    }
+    if (CreateMinimalConfig(persistent_path)) {
+        return persistent_path;
+    }
+    return legacy_path;
+}
 
 int ReadConfigInt(
     const std::wstring& path,
@@ -63,7 +148,8 @@ std::wstring ModuleDir() {
 }
 
 std::wstring ConfigPath() {
-    return ModuleDir() + L"\\simple_monitor.ini";
+    static const std::wstring path = ResolveConfigPath();
+    return path;
 }
 
 std::wstring DebugLogPath(const wchar_t* filename) {

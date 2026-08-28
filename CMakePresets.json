@@ -1,0 +1,51 @@
+{
+  "version": 2,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "w64devkit-release",
+      "displayName": "w64devkit Release",
+      "description": "Release/Ninja build pinned to the local w64devkit toolchain.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": {
+          "type": "STRING",
+          "value": "Release"
+        },
+        "CMAKE_CXX_COMPILER": {
+          "type": "FILEPATH",
+          "value": "D:/Dependency/w64devkit/bin/g++.exe"
+        },
+        "CMAKE_RC_COMPILER": {
+          "type": "FILEPATH",
+          "value": "D:/Dependency/w64devkit/bin/windres.exe"
+        },
+        "CMAKE_AR": {
+          "type": "FILEPATH",
+          "value": "D:/Dependency/w64devkit/bin/ar.exe"
+        },
+        "CMAKE_RANLIB": {
+          "type": "FILEPATH",
+          "value": "D:/Dependency/w64devkit/bin/ranlib.exe"
+        },
+        "CMAKE_MAKE_PROGRAM": {
+          "type": "FILEPATH",
+          "value": "D:/Dependency/w64devkit/bin/ninja.exe"
+        },
+        "SIMPLE_MONITOR_CONFIG_DIR": {
+          "type": "PATH",
+          "value": "${sourceDir}/config"
+        },
+        "SIMPLE_MONITOR_ENABLE_IPO": {
+          "type": "BOOL",
+          "value": "OFF"
+        }
+      }
+    }
+  ]
+}

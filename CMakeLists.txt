@@ -4,6 +4,13 @@ project(SimpleMonitor LANGUAGES CXX RC)
 
 include(CTest)
 
+set(
+    SIMPLE_MONITOR_CONFIG_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/config"
+    CACHE PATH
+    "Directory containing the user-editable simple_monitor.ini"
+)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -44,6 +51,9 @@ set(SIMPLE_MONITOR_COMMON_SOURCES
 foreach(target IN LISTS SIMPLE_MONITOR_TARGETS)
     target_sources(${target} PRIVATE ${SIMPLE_MONITOR_COMMON_SOURCES})
     simple_monitor_enable_warnings(${target})
+    target_compile_definitions(${target} PRIVATE
+        SIMPLE_MONITOR_CONFIG_DIR=L"${SIMPLE_MONITOR_CONFIG_DIR}"
+    )
 
     target_link_libraries(${target} PRIVATE
         user32
@@ -98,31 +108,46 @@ if(MINGW)
 
         target_link_options(${target} PRIVATE
             -municode
+            $<$<CONFIG:Release>:-s>
             $<$<CONFIG:Release>:-Wl,--gc-sections>
         )
     endforeach()
+
+    if(BUILD_TESTING)
+        foreach(target IN ITEMS
+            overlay_policy_tests
+            overlay_policy_trace_tests
+            metric_refresh_policy_tests
+        )
+            target_link_options(${target} PRIVATE
+                $<$<CONFIG:Release>:-s>
+            )
+        endforeach()
+    endif()
 endif()
 
-# Probe whether the active compiler and linker support IPO/LTO before
-# enabling it for the Release configuration.
-include(CheckIPOSupported)
+option(SIMPLE_MONITOR_ENABLE_IPO "Probe and enable IPO/LTO for Release builds" ON)
+if(SIMPLE_MONITOR_ENABLE_IPO)
+    include(CheckIPOSupported)
+    check_ipo_supported(
+        RESULT IPO_SUPPORTED
+        OUTPUT IPO_ERROR
+        LANGUAGES CXX
+    )
 
-check_ipo_supported(
-    RESULT IPO_SUPPORTED
-    OUTPUT IPO_ERROR
-    LANGUAGES CXX
-)
+    if(IPO_SUPPORTED)
+        # Keep IPO/LTO scoped to Release builds to avoid slower debug iteration.
+        foreach(target IN LISTS SIMPLE_MONITOR_TARGETS)
+            set_property(
+                TARGET ${target}
+                PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE
+            )
+        endforeach()
 
-if(IPO_SUPPORTED)
-    # Keep IPO/LTO scoped to Release builds to avoid slower debug iteration.
-    foreach(target IN LISTS SIMPLE_MONITOR_TARGETS)
-        set_property(
-            TARGET ${target}
-            PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE
-        )
-    endforeach()
-
-    message(STATUS "IPO/LTO enabled for simple_monitor Release build")
+        message(STATUS "IPO/LTO enabled for simple_monitor Release build")
+    else()
+        message(WARNING "IPO/LTO is not supported: ${IPO_ERROR}")
+    endif()
 else()
-    message(WARNING "IPO/LTO is not supported: ${IPO_ERROR}")
+    message(STATUS "IPO/LTO probe disabled by configuration")
 endif()

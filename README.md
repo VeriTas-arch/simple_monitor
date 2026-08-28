@@ -5,10 +5,19 @@ independent top-level window, not an Explorer taskbar component or DeskBand.
 
 ## Build with MinGW
 
-```bash
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+The checked-in `w64devkit-release` preset pins this Windows checkout to the
+toolchain under `D:/Dependency/w64devkit`, including GCC, windres, binutils,
+and Ninja. It also skips the IPO/LTO probe because the packaged compiler is
+built without LTO support. Configure it with:
+
+```pwsh
+cmake --preset w64devkit-release
 cmake --build build
 ```
+
+When replacing the toolchain behind that path or migrating an older build
+directory, use `cmake --fresh --preset w64devkit-release` once so the compiler
+and auxiliary-tool entries in `CMakeCache.txt` are regenerated together.
 
 The executable is generated at:
 
@@ -89,10 +98,17 @@ to keep the taskbar layout stable while values change.
 
 ## Configuration
 
-The program reads `simple_monitor.ini` from the executable directory. For
-example, when running `build\simple_monitor.exe`, place the config at
-`build\simple_monitor.ini`. The tracked `simple_monitor.ini.example` can be
-copied there as a starting point.
+The checked-in CMake configuration points both the stable and dev executables
+to `config\simple_monitor.ini` in this repository, outside the disposable
+`build` directory. The local config is ignored by Git, while
+`config\simple_monitor.ini.example` remains tracked as the template.
+The repository path is compiled into the executables; after moving the checkout,
+reconfigure and rebuild with the preset so they pick up the new absolute path.
+
+If the repository config is missing, an existing `simple_monitor.ini` beside
+the executable is copied there without deleting the old file. If neither file
+exists, the program copies the tracked example or creates a minimal config as a
+final fallback. An existing repository config is never overwritten at startup.
 
 ```ini
 [layout]
@@ -140,9 +156,11 @@ logger preserves the current file, reports the logger failure, and retries later
 When the dev build is launched with `--startup`, it also appends structured
 process-performance checkpoints to `build/startup-perf-dev.log`. This file is
 not reset by manual restarts, rotates to `.1` at 256 KiB, and records the
-`logging_ready`, `controller_ready`, `monitor_ready`, and 30-second `settled`
+`logging_ready`, `controller_ready`, `overlay_ready`, `monitor_ready`, and 30-second `settled`
 stages. Records include cumulative process CPU time, process I/O byte counts,
-PDH initialization duration, and the observed GPU instance count. Process I/O
+PDH initialization duration, and the observed GPU instance count. `overlay_ready`
+marks the first presented overlay before deferred PDH provider initialization;
+`monitor_ready` marks completion of that initialization. Process I/O
 counters do not include every form of memory-mapped image paging, so use a WPR
 boot trace when Windows-equivalent CPU and disk attribution is required.
 Repeated sustained failures are rate-limited with suppressed counts and duration.
