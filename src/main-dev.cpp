@@ -86,6 +86,7 @@ constexpr UINT kTrayIconId = 1;
 constexpr UINT WM_TRAYICON = WM_APP + 1;
 constexpr UINT WM_TRAY_LAYOUT_CHANGED = WM_APP + 2;
 constexpr UINT WM_RECONCILE = WM_APP + 3;
+constexpr UINT WM_INITIALIZE_METRICS = WM_APP + 4;
 constexpr int kAppIconResource = 101;
 
 enum MenuId : UINT {
@@ -266,6 +267,8 @@ struct ReconcileState {
 
     const wchar_t* pending_trigger = L"coalesced";
     unsigned pending_flags = OverlayReconcileNone;
+    std::wstring queued_trigger = L"queued";
+    unsigned queued_flags = OverlayReconcileNone;
     unsigned deferred_flags = OverlayReconcileNone;
     DWORD next_destroy_retry_tick = 0;
     DWORD next_visibility_retry_tick = 0;
@@ -273,6 +276,7 @@ struct ReconcileState {
     bool visibility_retry_pending = false;
     bool active = false;
     bool pending = false;
+    bool message_queued = false;
 };
 
 struct MetricsState {
@@ -281,11 +285,12 @@ struct MetricsState {
     PdhGroup gpu;
     PdhGroup disk;
     Metrics current;
+    bool providers_initialized = false;
+    bool initialization_pending = false;
 };
 
 struct RenderState {
     RenderResources resources;
-    std::vector<BYTE> last_frame;
     int last_frame_width = 0;
     int last_frame_height = 0;
 };
@@ -344,6 +349,10 @@ using simple_monitor::LogLevel;
 using simple_monitor::LogWarning;
 using simple_monitor::LogWarningRateLimited;
 using simple_monitor::ModuleDir;
+using simple_monitor::metric_refresh_policy::AggregateBusiestGpuEngine;
+using simple_monitor::metric_refresh_policy::ClassifyPdhSample;
+using simple_monitor::metric_refresh_policy::GpuEngineSampleView;
+using simple_monitor::metric_refresh_policy::PdhSampleDisposition;
 using simple_monitor::metric_refresh_policy::ShouldReinitializePdhGroup;
 
 // Forward declarations for cross-section entry points.
@@ -353,6 +362,9 @@ bool EnsureOverlayWindow(DWORD* error_out = nullptr);
 bool DestroyOverlayWindow(const wchar_t* reason);
 bool PrepareOverlayForShow(HWND hwnd, const wchar_t* trigger, bool reset_surface);
 void ReconcileOverlayState(
+    const wchar_t* trigger,
+    unsigned flags = OverlayReconcileNone);
+void RequestOverlayReconcile(
     const wchar_t* trigger,
     unsigned flags = OverlayReconcileNone);
 
@@ -1549,6 +1561,30 @@ bool IsPdhValueStatusValid(PDH_STATUS status) {
     return status == PDH_CSTATUS_VALID_DATA || status == PDH_CSTATUS_NEW_DATA;
 }
 
+bool IsTransientPdhCalculationStatus(PDH_STATUS status) {
+    return status == static_cast<PDH_STATUS>(PDH_CALC_NEGATIVE_DENOMINATOR) ||
+           status == static_cast<PDH_STATUS>(PDH_CALC_NEGATIVE_TIMEBASE) ||
+           status == static_cast<PDH_STATUS>(PDH_CALC_NEGATIVE_VALUE);
+}
+
+void ReportPdhSampleTransient(PdhGroup& group, PDH_STATUS status) {
+    const std::wstring key = PdhFailureKey(group, L"sample_transient");
+    LogWarningRateLimited(
+        key.c_str(),
+        60000,
+        L"event=metric_sample_held provider=%ls stage=format_value status=0x%08lx",
+        group.name.c_str(),
+        static_cast<unsigned long>(status));
+}
+
+void ReportPdhSampleRecovered(PdhGroup& group) {
+    const std::wstring key = PdhFailureKey(group, L"sample_transient");
+    LogFailureRecovered(
+        key.c_str(),
+        L"event=component_recovered component=metric_sample provider=%ls stage=format_value",
+        group.name.c_str());
+}
+
 PDH_STATUS ReadFormattedCounterArray(PdhGroup& group, DWORD& item_count) {
     item_count = 0;
     if (!group.formatted_buffer.empty()) {
@@ -1603,7 +1639,7 @@ PDH_STATUS ReadFormattedCounterArray(PdhGroup& group, DWORD& item_count) {
     return PDH_MORE_DATA;
 }
 
-double SamplePdhGroup(PdhGroup& group, bool sum_values) {
+double SamplePdhGroup(PdhGroup& group) {
     if (!group.ready || group.query == nullptr || group.counter == nullptr) {
         return -1.0;
     }
@@ -1620,7 +1656,6 @@ double SamplePdhGroup(PdhGroup& group, bool sum_values) {
         return group.value;
     }
 
-    double total = 0.0;
     double max_value = -1.0;
     bool any = false;
     PDH_STATUS first_format_failure = ERROR_SUCCESS;
@@ -1646,6 +1681,8 @@ double SamplePdhGroup(PdhGroup& group, bool sum_values) {
 
         const auto* items = reinterpret_cast<const PDH_FMT_COUNTERVALUE_ITEM_W*>(
             group.formatted_buffer.data());
+        std::vector<GpuEngineSampleView> samples;
+        samples.reserve(item_count);
         for (DWORD index = 0; index < item_count; ++index) {
             const PDH_FMT_COUNTERVALUE& value = items[index].FmtValue;
             if (!IsPdhValueStatusValid(value.CStatus)) {
@@ -1656,13 +1693,13 @@ double SamplePdhGroup(PdhGroup& group, bool sum_values) {
             }
 
             any = true;
-            total += value.doubleValue;
-            max_value = std::max(max_value, value.doubleValue);
+            samples.push_back({items[index].szName, value.doubleValue});
         }
         if (item_count == 0) {
             any = true;
-            total = 0.0;
             max_value = 0.0;
+        } else if (any) {
+            max_value = AggregateBusiestGpuEngine(samples);
         }
     } else {
         PDH_FMT_COUNTERVALUE value{};
@@ -1673,7 +1710,6 @@ double SamplePdhGroup(PdhGroup& group, bool sum_values) {
             &value);
         if (format_result == ERROR_SUCCESS && IsPdhValueStatusValid(value.CStatus)) {
             any = true;
-            total = value.doubleValue;
             max_value = value.doubleValue;
         } else {
             first_format_failure = format_result != ERROR_SUCCESS ? format_result : value.CStatus;
@@ -1681,13 +1717,21 @@ double SamplePdhGroup(PdhGroup& group, bool sum_values) {
     }
 
     if (!any) {
+        if (ClassifyPdhSample(
+                false,
+                IsTransientPdhCalculationStatus(first_format_failure)) ==
+            PdhSampleDisposition::KeepPrevious) {
+            ReportPdhSampleTransient(group, first_format_failure);
+            return group.value;
+        }
         ReportPdhFailure(group, L"format_value", first_format_failure);
         return -1.0;
     }
     ReportPdhStageRecovered(group, L"format_value");
+    ReportPdhSampleRecovered(group);
     ReportPdhAvailable(group);
 
-    group.value = ClampPercent(sum_values ? total : max_value);
+    group.value = ClampPercent(max_value);
     return group.value;
 }
 
@@ -1718,8 +1762,8 @@ void SampleMetrics() {
     SampleNetwork(g_app.metrics.network, g_app.metrics.current);
     RecoverPdhGroupIfNeeded(g_app.metrics.gpu);
     RecoverPdhGroupIfNeeded(g_app.metrics.disk);
-    g_app.metrics.current.gpu = SamplePdhGroup(g_app.metrics.gpu, true);
-    g_app.metrics.current.disk = SamplePdhGroup(g_app.metrics.disk, false);
+    g_app.metrics.current.gpu = SamplePdhGroup(g_app.metrics.gpu);
+    g_app.metrics.current.disk = SamplePdhGroup(g_app.metrics.disk);
     SampleKeys(g_app.metrics.current);
     g_app.diagnostics.last_metrics_sample_tick = GetTickCount();
 }
@@ -1907,9 +1951,13 @@ HWND FindDescendantWindow(HWND parent, const wchar_t* class_name) {
     return nullptr;
 }
 
-bool TryGetTrayNotifyRect(RECT& rect) {
+HWND TrayNotifyWindow() {
     HWND tray = TaskbarWindow();
-    HWND notify = tray ? FindDescendantWindow(tray, L"TrayNotifyWnd") : nullptr;
+    return tray ? FindDescendantWindow(tray, L"TrayNotifyWnd") : nullptr;
+}
+
+bool TryGetTrayNotifyRect(RECT& rect) {
+    HWND notify = TrayNotifyWindow();
     if (!notify) {
         return false;
     }
@@ -2041,8 +2089,7 @@ bool TryGetTrayAnchorRect(RECT& rect) {
         return false;
     }
 
-    HWND tray = TaskbarWindow();
-    HWND notify = tray ? FindDescendantWindow(tray, L"TrayNotifyWnd") : nullptr;
+    HWND notify = TrayNotifyWindow();
     if (!notify) {
         return false;
     }
@@ -2126,7 +2173,6 @@ bool RepositionWindow() {
         taskbar = {work.left, work.bottom - Scale(48, g_app.window.dpi), work.right, work.bottom};
     }
 
-    HMONITOR monitor = MonitorFromRect(&taskbar, MONITOR_DEFAULTTONEAREST);
     g_app.window.dpi = WindowDpi(overlay);
 
     const int width = Scale(CalculateOverlayWidthDip(), g_app.window.dpi);
@@ -2256,11 +2302,6 @@ bool RepositionWindow() {
         g_app.placement.last_logged_anchor_mode = anchor_mode;
     }
 
-    if (monitor) {
-        MONITORINFO mi{};
-        mi.cbSize = sizeof(mi);
-        GetMonitorInfoW(monitor, &mi);
-    }
     return positioned && geometry_changed;
 }
 
@@ -4287,13 +4328,38 @@ void ReconcileOverlayState(const wchar_t* trigger, unsigned flags) {
     const bool needs_follow_up = g_app.reconcile.pending;
     g_app.reconcile.active = false;
 
-    if (needs_follow_up &&
-        g_app.window.controller_hwnd &&
-        !PostMessageW(g_app.window.controller_hwnd, WM_RECONCILE, 0, 0)) {
+    if (needs_follow_up) {
+        RequestOverlayReconcile(L"reconcile_follow_up", OverlayReconcileNone);
+    }
+}
+
+void RequestOverlayReconcile(const wchar_t* trigger, unsigned flags) {
+    g_app.reconcile.queued_flags |= flags;
+    g_app.reconcile.queued_trigger = trigger ? trigger : L"unspecified";
+    if (g_app.reconcile.message_queued) {
+        return;
+    }
+
+    HWND controller = g_app.window.controller_hwnd;
+    if (!controller) {
+        return;
+    }
+    g_app.reconcile.message_queued = true;
+    if (!PostMessageW(controller, WM_RECONCILE, 0, 0)) {
+        g_app.reconcile.message_queued = false;
         LogError(
-            L"event=shell_message_failed message=reconcile_follow_up error=%lu",
+            L"event=shell_message_failed message=reconcile error=%lu",
             GetLastError());
     }
+}
+
+void HandleQueuedOverlayReconcile() {
+    g_app.reconcile.message_queued = false;
+    std::wstring trigger = std::move(g_app.reconcile.queued_trigger);
+    const unsigned flags = g_app.reconcile.queued_flags;
+    g_app.reconcile.queued_trigger = L"queued";
+    g_app.reconcile.queued_flags = OverlayReconcileNone;
+    ReconcileOverlayState(trigger.c_str(), flags);
 }
 
 void RenderOverlay(HWND hwnd) {
@@ -4455,7 +4521,6 @@ void RenderOverlay(HWND hwnd) {
             g_app.diagnostics.last_render_success_tick = GetTickCount();
         }
         if (SUCCEEDED(hr) && PresentPixels(hwnd, frame.data(), width, height, L"render")) {
-            g_app.render.last_frame = std::move(frame);
             g_app.render.last_frame_width = width;
             g_app.render.last_frame_height = height;
         }
@@ -4486,18 +4551,13 @@ LRESULT HandleTaskbarCreated() {
     return 0;
 }
 
-void InitializeMonitor(HWND controller) {
-    if (g_app.window.monitor_initialized) {
+void InitializeMetricProviders() {
+    g_app.metrics.initialization_pending = false;
+    if (g_app.metrics.providers_initialized) {
         return;
     }
 
-    g_app.window.monitor_initialized = true;
-    LogInfo(L"event=monitor_init delayed=%d", g_app.window.launched_at_startup ? 1 : 0);
-    g_app.placement.taskbar_identity.committed = CurrentTaskbarIdentity();
-    g_app.placement.taskbar_identity.candidate =
-        g_app.placement.taskbar_identity.committed;
-    AddTrayIcon(controller);
-    RegisterTrayEventHooks();
+    g_app.metrics.providers_initialized = true;
     InitializePdhGroupMeasured(
         g_app.metrics.gpu,
         L"gpu",
@@ -4510,6 +4570,37 @@ void InitializeMonitor(HWND controller) {
         L"\\PhysicalDisk(_Total)\\% Disk Time",
         false,
         L"initial");
+    SampleMetrics();
+    ReconcileOverlayState(L"metric_provider_init", OverlayReconcileRender);
+    RecordStartupPerformance(L"monitor_ready");
+}
+
+void RequestMetricProviderInitialization(HWND controller) {
+    if (g_app.metrics.providers_initialized || g_app.metrics.initialization_pending) {
+        return;
+    }
+
+    g_app.metrics.initialization_pending = true;
+    if (!PostMessageW(controller, WM_INITIALIZE_METRICS, 0, 0)) {
+        LogWarning(
+            L"event=metric_initialization_defer_failed error=%lu",
+            GetLastError());
+        InitializeMetricProviders();
+    }
+}
+
+void InitializeMonitor(HWND controller) {
+    if (g_app.window.monitor_initialized) {
+        return;
+    }
+
+    g_app.window.monitor_initialized = true;
+    LogInfo(L"event=monitor_init delayed=%d", g_app.window.launched_at_startup ? 1 : 0);
+    g_app.placement.taskbar_identity.committed = CurrentTaskbarIdentity();
+    g_app.placement.taskbar_identity.candidate =
+        g_app.placement.taskbar_identity.committed;
+    AddTrayIcon(controller);
+    RegisterTrayEventHooks();
     SampleMetrics();
     const bool refresh_timer = InstallTimer(controller, kRefreshTimer, 1000, L"refresh");
     const bool placement_timer = SetPlacementTimer(kPlacementIntervalMs);
@@ -4525,7 +4616,8 @@ void InitializeMonitor(HWND controller) {
     if (g_app.window.overlay_hwnd) {
         UpdateWindow(g_app.window.overlay_hwnd);
     }
-    RecordStartupPerformance(L"monitor_ready");
+    RecordStartupPerformance(L"overlay_ready");
+    RequestMetricProviderInitialization(controller);
 }
 
 LRESULT HandleControllerCreate(HWND hwnd) {
@@ -4573,7 +4665,7 @@ LRESULT HandleTimer(HWND hwnd, UINT_PTR timer_id) {
 
     const wchar_t* trigger = timer_id == kRefreshTimer ? L"refresh_timer" : L"placement_timer";
     const unsigned flags = timer_id == kRefreshTimer
-        ? OverlayReconcileSampleMetrics | OverlayReconcileReposition | OverlayReconcileRender
+        ? OverlayReconcileSampleMetrics | OverlayReconcileRender
         : OverlayReconcileReposition;
     ReconcileOverlayState(trigger, flags);
     MaybeLogHealth(trigger);
@@ -4597,13 +4689,13 @@ LRESULT HandleDpiChanged(HWND, WPARAM wparam, LPARAM lparam) {
     return 0;
 }
 
-LRESULT HandleDisplayChange() {
+LRESULT HandleDisplayChange(const wchar_t* trigger) {
     if (!g_app.window.monitor_initialized) {
         return 0;
     }
 
-    ReconcileOverlayState(
-        L"display_or_device_change",
+    RequestOverlayReconcile(
+        trigger,
         OverlayReconcileReposition | OverlayReconcileRender);
     return 0;
 }
@@ -4612,7 +4704,7 @@ LRESULT HandleSettingChange(LPARAM lparam) {
     if (lparam && std::wcscmp(reinterpret_cast<const wchar_t*>(lparam), L"ImmersiveColorSet") == 0) {
         EnableSystemMenuTheme();
     }
-    return HandleDisplayChange();
+    return HandleDisplayChange(L"setting_change");
 }
 
 LRESULT HandleTrayLayoutChanged() {
@@ -4622,7 +4714,7 @@ LRESULT HandleTrayLayoutChanged() {
     }
 
     LogInfo(L"event=tray_layout_changed");
-    ReconcileOverlayState(L"tray_layout_change", OverlayReconcileReposition);
+    RequestOverlayReconcile(L"tray_layout_change", OverlayReconcileReposition);
     return 0;
 }
 
@@ -4684,11 +4776,9 @@ LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
             ResetInitialOwnerBindingState();
             ResetOverlayPresentDiagnostics();
             if (!expected && g_app.window.monitor_initialized && g_app.window.controller_hwnd) {
-                if (!PostMessageW(g_app.window.controller_hwnd, WM_RECONCILE, 0, 0)) {
-                    LogError(
-                        L"event=shell_message_failed message=reconcile error=%lu",
-                        GetLastError());
-                }
+                RequestOverlayReconcile(
+                    L"overlay_destroyed_unexpected",
+                    OverlayReconcileReposition | OverlayReconcileRender);
             }
         }
         return 0;
@@ -4713,14 +4803,14 @@ LRESULT CALLBACK ControllerWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
 
     case WM_DISPLAYCHANGE:
         LogInfo(L"event=environment_changed type=display");
-        return HandleDisplayChange();
+        return HandleDisplayChange(L"display_change");
 
     case WM_DEVICECHANGE:
         LogInfo(
             L"event=environment_changed type=device code=0x%llx payload=0x%llx",
             static_cast<unsigned long long>(wparam),
             static_cast<unsigned long long>(lparam));
-        return HandleDisplayChange();
+        return HandleDisplayChange(L"device_change");
 
     case WM_SETTINGCHANGE:
         return HandleSettingChange(lparam);
@@ -4733,10 +4823,12 @@ LRESULT CALLBACK ControllerWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
         return HandleTrayLayoutChanged();
 
     case WM_RECONCILE:
-        ReconcileOverlayState(
-            L"reconcile_message",
-            OverlayReconcileReposition | OverlayReconcileRender);
+        HandleQueuedOverlayReconcile();
         MaybeLogHealth(L"reconcile_message", true);
+        return 0;
+
+    case WM_INITIALIZE_METRICS:
+        InitializeMetricProviders();
         return 0;
 
     case WM_TRAYICON:

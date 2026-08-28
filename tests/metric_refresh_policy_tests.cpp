@@ -20,7 +20,49 @@ void Expect(bool condition, const char* message) {
 }  // namespace
 
 int main() {
+    using simple_monitor::metric_refresh_policy::AggregateBusiestGpuEngine;
+    using simple_monitor::metric_refresh_policy::CanonicalGpuEngineKey;
+    using simple_monitor::metric_refresh_policy::ClassifyPdhSample;
+    using simple_monitor::metric_refresh_policy::GpuEngineSampleView;
+    using simple_monitor::metric_refresh_policy::PdhSampleDisposition;
     using simple_monitor::metric_refresh_policy::ShouldReinitializePdhGroup;
+
+    Expect(
+        ClassifyPdhSample(true, false) == PdhSampleDisposition::UseValue,
+        "a valid PDH sample should be published");
+    Expect(
+        ClassifyPdhSample(false, true) == PdhSampleDisposition::KeepPrevious,
+        "a transient PDH calculation status should preserve the query and value");
+    Expect(
+        ClassifyPdhSample(false, false) == PdhSampleDisposition::Reinitialize,
+        "a non-transient PDH failure should rebuild the query");
+
+    const std::wstring_view engine_a_pid_1 =
+        L"pid_100_luid_0x00000000_0x00001234_phys_0_eng_0_engtype_3D";
+    const std::wstring_view engine_a_pid_2 =
+        L"pid_200_luid_0x00000000_0x00001234_phys_0_eng_0_engtype_3D";
+    Expect(
+        CanonicalGpuEngineKey(engine_a_pid_1) ==
+            CanonicalGpuEngineKey(engine_a_pid_2),
+        "GPU samples from different processes should share one physical engine key");
+    Expect(
+        CanonicalGpuEngineKey(L"pid_100_engtype_Copy_0") == L"_engtype_Copy_0",
+        "GPU engine keys should tolerate instance names without a LUID");
+
+    const std::vector<GpuEngineSampleView> gpu_samples{
+        {engine_a_pid_1, 20.0},
+        {engine_a_pid_2, 30.0},
+        {L"pid_300_luid_0x00000000_0x00001234_phys_0_eng_1_engtype_Copy", 60.0},
+    };
+    Expect(
+        AggregateBusiestGpuEngine(gpu_samples) == 60.0,
+        "overall GPU usage should use the busiest aggregated engine");
+    Expect(
+        AggregateBusiestGpuEngine({
+            {engine_a_pid_1, 70.0},
+            {engine_a_pid_2, 50.0},
+        }) == 100.0,
+        "busiest GPU engine utilization should remain percentage bounded");
 
     Expect(
         !ShouldReinitializePdhGroup(true, true, 60000, 1000, 5000),

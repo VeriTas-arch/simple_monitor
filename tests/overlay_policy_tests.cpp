@@ -237,6 +237,10 @@ void TestInitialOwnerBindingRetryBoundary() {
         policy::DecideInitialOwnerBindingAction(
             true, true, true, false, 8, 8, 1000, 1000) == Action::Exhausted,
         "initial binding repair must remain bounded");
+    Check(
+        policy::DecideInitialOwnerBindingAction(
+            true, true, true, true, 8, 8, 1000, 1000) == Action::Complete,
+        "a successful owner observation at the retry boundary must complete");
 }
 
 void TestRepairSeparatesRefreshFromVisibilityCommit() {

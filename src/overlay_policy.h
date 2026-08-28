@@ -47,14 +47,14 @@ constexpr InitialOwnerBindingAction DecideInitialOwnerBindingAction(
     if (!pending) {
         return InitialOwnerBindingAction::None;
     }
-    if (attempts >= max_attempts) {
-        return InitialOwnerBindingAction::Exhausted;
-    }
     if (!overlay_valid || !target_valid || now_ms < next_retry_ms) {
         return InitialOwnerBindingAction::Wait;
     }
     if (owner_matches) {
         return InitialOwnerBindingAction::Complete;
+    }
+    if (attempts >= max_attempts) {
+        return InitialOwnerBindingAction::Exhausted;
     }
     return InitialOwnerBindingAction::Retry;
 }
