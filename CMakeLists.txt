@@ -77,6 +77,13 @@ if(BUILD_TESTING)
     target_include_directories(overlay_policy_trace_tests PRIVATE src)
     simple_monitor_enable_warnings(overlay_policy_trace_tests)
     add_test(NAME overlay_policy_trace_tests COMMAND overlay_policy_trace_tests)
+
+    add_executable(metric_refresh_policy_tests
+        tests/metric_refresh_policy_tests.cpp
+    )
+    target_include_directories(metric_refresh_policy_tests PRIVATE src)
+    simple_monitor_enable_warnings(metric_refresh_policy_tests)
+    add_test(NAME metric_refresh_policy_tests COMMAND metric_refresh_policy_tests)
 endif()
 
 # Enable MinGW Unicode entry point handling so the app uses `wWinMain`

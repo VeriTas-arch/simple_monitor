@@ -28,6 +28,7 @@
 
 #include "app_support.h"
 #include "logging.h"
+#include "metric_refresh_policy.h"
 #include "overlay_policy.h"
 #include "win32_function.h"
 
@@ -62,7 +63,10 @@ constexpr UINT_PTR kStartupInitTimer = 5;
 constexpr UINT kStateIntervalMs = 100;
 constexpr UINT kPlacementIntervalMs = 5000;
 constexpr UINT kStartupInitDelayMs = 8000;
-constexpr DWORD kGpuGroupRefreshIntervalMs = 5000;
+constexpr DWORD kPdhRetryIntervalMs = 5000;
+constexpr ULONGLONG kStartupPerformanceSettledMs = 30000;
+constexpr ULONGLONG kStartupPerformanceLogMaxBytes = 256ULL * 1024ULL;
+constexpr wchar_t kStartupPerformanceLogName[] = L"startup-perf-dev.log";
 constexpr DWORD kHealthLogIntervalMs = 60000;
 constexpr DWORD kOverlayRepairIntervalMs = 5000;
 constexpr DWORD kPresentStaleThresholdMs = 5000;
@@ -158,15 +162,21 @@ struct NetworkSampler {
 
 struct PdhGroup {
     HQUERY query = nullptr;
-    std::vector<HCOUNTER> counters;
+    HCOUNTER counter = nullptr;
     bool ready = false;
     bool needs_second_sample = false;
     bool availability_known = false;
     bool provider_available = false;
+    bool wildcard_array = false;
+    bool instance_count_known = false;
+    bool instance_inventory_logged = false;
     double value = -1.0;
     std::wstring name;
     std::wstring wildcard_path;
-    DWORD last_refresh_tick = 0;
+    std::vector<BYTE> formatted_buffer;
+    DWORD last_init_attempt_tick = 0;
+    DWORD last_instance_count = 0;
+    ULONGLONG last_init_duration_ms = 0;
 };
 
 struct Metrics {
@@ -304,6 +314,11 @@ struct DiagnosticsState {
     bool last_frame_has_visible_pixels = false;
 };
 
+struct StartupPerformanceState {
+    ULONGLONG process_entry_tick = 0;
+    bool settled_recorded = false;
+};
+
 struct AppState {
     WindowState window;
     TrayState tray;
@@ -313,6 +328,7 @@ struct AppState {
     MetricsState metrics;
     RenderState render;
     DiagnosticsState diagnostics;
+    StartupPerformanceState startup_performance;
     simple_monitor::Config config;
 };
 
@@ -328,6 +344,7 @@ using simple_monitor::LogLevel;
 using simple_monitor::LogWarning;
 using simple_monitor::LogWarningRateLimited;
 using simple_monitor::ModuleDir;
+using simple_monitor::metric_refresh_policy::ShouldReinitializePdhGroup;
 
 // Forward declarations for cross-section entry points.
 void RenderOverlay(HWND hwnd);
@@ -498,6 +515,200 @@ void LogConfigSnapshot(const wchar_t* event_name) {
         g_app.config.network_arrow_font_size_dip,
         g_app.config.network_arrow_gap_dip,
         g_app.config.show_key_widget ? 1 : 0);
+}
+
+struct ProcessPerformanceSnapshot {
+    ULONGLONG kernel_100ns = 0;
+    ULONGLONG user_100ns = 0;
+    IO_COUNTERS io{};
+    bool cpu_valid = false;
+    bool io_valid = false;
+};
+
+ULONGLONG FileTimeValue(const FILETIME& value) {
+    ULARGE_INTEGER result{};
+    result.LowPart = value.dwLowDateTime;
+    result.HighPart = value.dwHighDateTime;
+    return result.QuadPart;
+}
+
+ProcessPerformanceSnapshot CaptureProcessPerformance() {
+    ProcessPerformanceSnapshot snapshot;
+    FILETIME creation{};
+    FILETIME exit{};
+    FILETIME kernel{};
+    FILETIME user{};
+    snapshot.cpu_valid = GetProcessTimes(
+        GetCurrentProcess(),
+        &creation,
+        &exit,
+        &kernel,
+        &user) != FALSE;
+    if (snapshot.cpu_valid) {
+        snapshot.kernel_100ns = FileTimeValue(kernel);
+        snapshot.user_100ns = FileTimeValue(user);
+    }
+    snapshot.io_valid = GetProcessIoCounters(GetCurrentProcess(), &snapshot.io) != FALSE;
+    return snapshot;
+}
+
+void AppendStartupPerformanceLine(const wchar_t* line) {
+    const std::wstring path = simple_monitor::DebugLogPath(kStartupPerformanceLogName);
+    WIN32_FILE_ATTRIBUTE_DATA attributes{};
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes)) {
+        ULARGE_INTEGER size{};
+        size.HighPart = attributes.nFileSizeHigh;
+        size.LowPart = attributes.nFileSizeLow;
+        if (size.QuadPart >= kStartupPerformanceLogMaxBytes) {
+            const std::wstring backup_path = path + L".1";
+            if (!MoveFileExW(
+                    path.c_str(),
+                    backup_path.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                LogWarningRateLimited(
+                    L"startup_performance.persist",
+                    kFailureLogIntervalMs,
+                    L"event=startup_performance_log_failed stage=rotate error=%lu",
+                    GetLastError());
+            }
+        }
+    }
+
+    HANDLE file = CreateFileW(
+        path.c_str(),
+        FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        LogWarningRateLimited(
+            L"startup_performance.persist",
+            kFailureLogIntervalMs,
+            L"event=startup_performance_log_failed stage=open error=%lu",
+            GetLastError());
+        return;
+    }
+
+    std::wstring record(line ? line : L"");
+    record += L"\r\n";
+    LARGE_INTEGER file_size{};
+    if (GetFileSizeEx(file, &file_size) && file_size.QuadPart == 0) {
+        const wchar_t byte_order_mark = 0xFEFF;
+        DWORD bom_written = 0;
+        if (!WriteFile(
+                file,
+                &byte_order_mark,
+                sizeof(byte_order_mark),
+                &bom_written,
+                nullptr) ||
+            bom_written != sizeof(byte_order_mark)) {
+            const DWORD error = GetLastError();
+            CloseHandle(file);
+            LogWarningRateLimited(
+                L"startup_performance.persist",
+                kFailureLogIntervalMs,
+                L"event=startup_performance_log_failed stage=write_bom error=%lu",
+                error);
+            return;
+        }
+    }
+
+    const DWORD expected_bytes = static_cast<DWORD>(record.size() * sizeof(wchar_t));
+    DWORD written = 0;
+    const BOOL write_result = WriteFile(
+        file,
+        record.data(),
+        expected_bytes,
+        &written,
+        nullptr);
+    const DWORD write_error = write_result ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(file);
+    if (!write_result || written != expected_bytes) {
+        LogWarningRateLimited(
+            L"startup_performance.persist",
+            kFailureLogIntervalMs,
+            L"event=startup_performance_log_failed stage=write error=%lu written=%lu expected=%lu",
+            write_error,
+            written,
+            expected_bytes);
+    }
+}
+
+void RecordStartupPerformance(const wchar_t* stage) {
+    const ProcessPerformanceSnapshot snapshot = CaptureProcessPerformance();
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG wall_ms = g_app.startup_performance.process_entry_tick == 0
+        ? 0
+        : now - g_app.startup_performance.process_entry_tick;
+    const ULONGLONG kernel_ms = snapshot.kernel_100ns / 10000ULL;
+    const ULONGLONG user_ms = snapshot.user_100ns / 10000ULL;
+    const ULONGLONG cpu_ms = kernel_ms + user_ms;
+    const wchar_t* gpu_mode = g_app.metrics.gpu.wildcard_path.empty()
+        ? L"pending"
+        : (g_app.metrics.gpu.wildcard_array ? L"wildcard_array" : L"scalar");
+
+    SYSTEMTIME local_time{};
+    GetLocalTime(&local_time);
+    wchar_t line[1024]{};
+    const int length = _snwprintf_s(
+        line,
+        _countof(line),
+        _TRUNCATE,
+        L"time=%04u-%02u-%02uT%02u:%02u:%02u.%03u event=startup_performance schema=1 build=dev "
+        L"pid=%lu stage=%ls launch=%ls wall_ms=%llu cpu_valid=%d cpu_ms=%llu kernel_ms=%llu user_ms=%llu "
+        L"io_valid=%d read_bytes=%llu write_bytes=%llu other_bytes=%llu gpu_mode=%ls gpu_handles=%d "
+        L"gpu_instances_known=%d gpu_instances=%lu gpu_init_ms=%llu "
+        L"disk_init_ms=%llu",
+        static_cast<unsigned>(local_time.wYear),
+        static_cast<unsigned>(local_time.wMonth),
+        static_cast<unsigned>(local_time.wDay),
+        static_cast<unsigned>(local_time.wHour),
+        static_cast<unsigned>(local_time.wMinute),
+        static_cast<unsigned>(local_time.wSecond),
+        static_cast<unsigned>(local_time.wMilliseconds),
+        GetCurrentProcessId(),
+        stage,
+        g_app.window.launched_at_startup ? L"startup" : L"manual",
+        static_cast<unsigned long long>(wall_ms),
+        snapshot.cpu_valid ? 1 : 0,
+        static_cast<unsigned long long>(cpu_ms),
+        static_cast<unsigned long long>(kernel_ms),
+        static_cast<unsigned long long>(user_ms),
+        snapshot.io_valid ? 1 : 0,
+        static_cast<unsigned long long>(snapshot.io.ReadTransferCount),
+        static_cast<unsigned long long>(snapshot.io.WriteTransferCount),
+        static_cast<unsigned long long>(snapshot.io.OtherTransferCount),
+        gpu_mode,
+        g_app.metrics.gpu.counter ? 1 : 0,
+        g_app.metrics.gpu.instance_count_known ? 1 : 0,
+        g_app.metrics.gpu.last_instance_count,
+        static_cast<unsigned long long>(g_app.metrics.gpu.last_init_duration_ms),
+        static_cast<unsigned long long>(g_app.metrics.disk.last_init_duration_ms));
+    if (length > 0) {
+        LogInfo(L"%ls", line);
+        if (g_app.window.launched_at_startup) {
+            AppendStartupPerformanceLine(line);
+        }
+    } else {
+        LogWarningRateLimited(
+            L"startup_performance.format",
+            kFailureLogIntervalMs,
+            L"event=startup_performance_log_failed stage=format");
+    }
+}
+
+void MaybeRecordStartupPerformanceSettled() {
+    if (g_app.startup_performance.settled_recorded ||
+        g_app.startup_performance.process_entry_tick == 0 ||
+        GetTickCount64() - g_app.startup_performance.process_entry_tick <
+            kStartupPerformanceSettledMs) {
+        return;
+    }
+
+    g_app.startup_performance.settled_recorded = true;
+    RecordStartupPerformance(L"settled");
 }
 
 // Startup integration.
@@ -1183,10 +1394,14 @@ void ResetPdhGroup(PdhGroup& group) {
         PdhCloseQuery(group.query);
         group.query = nullptr;
     }
-    group.counters.clear();
+    group.counter = nullptr;
+    group.formatted_buffer.clear();
     group.ready = false;
     group.needs_second_sample = false;
-    group.last_refresh_tick = 0;
+    group.instance_count_known = false;
+    group.instance_inventory_logged = false;
+    group.last_instance_count = 0;
+    group.last_init_attempt_tick = 0;
 }
 
 std::wstring PdhFailureKey(const PdhGroup& group, const wchar_t* stage) {
@@ -1196,6 +1411,9 @@ std::wstring PdhFailureKey(const PdhGroup& group, const wchar_t* stage) {
 void ReportPdhFailure(PdhGroup& group, const wchar_t* stage, PDH_STATUS status) {
     group.availability_known = true;
     group.provider_available = false;
+    group.ready = false;
+    const DWORD failure_tick = GetTickCount();
+    group.last_init_attempt_tick = failure_tick == 0 ? 1 : failure_tick;
     const std::wstring key = PdhFailureKey(group, stage);
     LogWarningRateLimited(
         key.c_str(),
@@ -1221,18 +1439,24 @@ void ReportPdhAvailable(PdhGroup& group) {
     group.provider_available = true;
     if (availability_changed) {
         LogInfo(
-            L"event=metric_provider_available provider=%ls counters=%llu",
+            L"event=metric_provider_available provider=%ls mode=%ls counter_handles=%d",
             group.name.c_str(),
-            static_cast<unsigned long long>(group.counters.size()));
+            group.wildcard_array ? L"wildcard_array" : L"scalar",
+            group.counter ? 1 : 0);
     }
 }
 
-void InitPdhGroup(PdhGroup& group, const wchar_t* name, const wchar_t* wildcard_path) {
+void InitPdhGroup(
+    PdhGroup& group,
+    const wchar_t* name,
+    const wchar_t* wildcard_path,
+    bool wildcard_array) {
     group.name = name;
     group.wildcard_path = wildcard_path;
+    group.wildcard_array = wildcard_array;
     ResetPdhGroup(group);
     const DWORD init_tick = GetTickCount();
-    group.last_refresh_tick = init_tick == 0 ? 1 : init_tick;
+    group.last_init_attempt_tick = init_tick == 0 ? 1 : init_tick;
     const PDH_STATUS open_result = PdhOpenQueryW(nullptr, 0, &group.query);
     if (open_result != ERROR_SUCCESS) {
         ReportPdhFailure(group, L"open_query", open_result);
@@ -1240,80 +1464,17 @@ void InitPdhGroup(PdhGroup& group, const wchar_t* name, const wchar_t* wildcard_
     }
     ReportPdhStageRecovered(group, L"open_query");
 
-    DWORD buffer_size = 0;
-    PDH_STATUS expand_result = PdhExpandWildCardPathW(
-        nullptr,
+    const PDH_STATUS add_result = PdhAddCounterW(
+        group.query,
         wildcard_path,
-        nullptr,
-        &buffer_size,
-        0);
-
-    if (expand_result != static_cast<PDH_STATUS>(PDH_MORE_DATA) || buffer_size == 0) {
-        ReportPdhFailure(group, L"expand_size", expand_result);
+        0,
+        &group.counter);
+    if (add_result != ERROR_SUCCESS) {
+        ReportPdhFailure(group, L"add_counter", add_result);
         PdhCloseQuery(group.query);
         group.query = nullptr;
+        group.counter = nullptr;
         return;
-    }
-
-    std::vector<wchar_t> buffer(buffer_size);
-    expand_result = PdhExpandWildCardPathW(
-        nullptr,
-        wildcard_path,
-        buffer.data(),
-        &buffer_size,
-        0);
-
-    if (expand_result != ERROR_SUCCESS) {
-        ReportPdhFailure(group, L"expand_path", expand_result);
-        PdhCloseQuery(group.query);
-        group.query = nullptr;
-        return;
-    }
-    ReportPdhStageRecovered(group, L"expand_size");
-    ReportPdhStageRecovered(group, L"expand_path");
-
-    const wchar_t* cursor = buffer.data();
-    size_t total_counters = 0;
-    size_t failed_counters = 0;
-    PDH_STATUS first_add_failure = ERROR_SUCCESS;
-    while (*cursor != L'\0') {
-        ++total_counters;
-        HCOUNTER counter = nullptr;
-        const PDH_STATUS add_result = PdhAddCounterW(group.query, cursor, 0, &counter);
-        if (add_result == ERROR_SUCCESS) {
-            group.counters.push_back(counter);
-        } else {
-            ++failed_counters;
-            if (first_add_failure == ERROR_SUCCESS) {
-                first_add_failure = add_result;
-            }
-        }
-        cursor += std::wcslen(cursor) + 1;
-    }
-
-    if (group.counters.empty()) {
-        ReportPdhFailure(
-            group,
-            L"add_counter",
-            first_add_failure == ERROR_SUCCESS ? PDH_CSTATUS_NO_COUNTER : first_add_failure);
-        PdhCloseQuery(group.query);
-        group.query = nullptr;
-        return;
-    }
-    if (failed_counters > 0) {
-        const std::wstring key = PdhFailureKey(group, L"add_counter_partial");
-        LogWarningRateLimited(
-            key.c_str(),
-            60000,
-            L"event=metric_provider_degraded provider=%ls stage=add_counter added=%llu failed=%llu total=%llu "
-            L"first_status=0x%08lx",
-            group.name.c_str(),
-            static_cast<unsigned long long>(group.counters.size()),
-            static_cast<unsigned long long>(failed_counters),
-            static_cast<unsigned long long>(total_counters),
-            static_cast<unsigned long>(first_add_failure));
-    } else {
-        ReportPdhStageRecovered(group, L"add_counter_partial");
     }
     ReportPdhStageRecovered(group, L"add_counter");
 
@@ -1322,14 +1483,34 @@ void InitPdhGroup(PdhGroup& group, const wchar_t* name, const wchar_t* wildcard_
         ReportPdhFailure(group, L"initial_collect", collect_result);
         PdhCloseQuery(group.query);
         group.query = nullptr;
-        group.counters.clear();
+        group.counter = nullptr;
         return;
     }
     ReportPdhStageRecovered(group, L"initial_collect");
     group.ready = true;
     group.needs_second_sample = true;
-    group.last_refresh_tick = GetTickCount();
     ReportPdhAvailable(group);
+}
+
+void InitializePdhGroupMeasured(
+    PdhGroup& group,
+    const wchar_t* name,
+    const wchar_t* wildcard_path,
+    bool wildcard_array,
+    const wchar_t* reason) {
+    const ULONGLONG started = GetTickCount64();
+    InitPdhGroup(group, name, wildcard_path, wildcard_array);
+    group.last_init_duration_ms = GetTickCount64() - started;
+    if (group.ready) {
+        LogInfo(
+            L"event=metric_provider_initialized provider=%ls reason=%ls mode=%ls "
+            L"counter_handles=%d duration_ms=%llu",
+            group.name.c_str(),
+            reason,
+            group.wildcard_array ? L"wildcard_array" : L"scalar",
+            group.counter ? 1 : 0,
+            static_cast<unsigned long long>(group.last_init_duration_ms));
+    }
 }
 
 void RebuildPdhGroup(PdhGroup& group) {
@@ -1339,30 +1520,91 @@ void RebuildPdhGroup(PdhGroup& group) {
 
     const std::wstring name = group.name;
     const std::wstring wildcard_path = group.wildcard_path;
-    InitPdhGroup(group, name.c_str(), wildcard_path.c_str());
+    const bool wildcard_array = group.wildcard_array;
+    InitializePdhGroupMeasured(
+        group,
+        name.c_str(),
+        wildcard_path.c_str(),
+        wildcard_array,
+        L"retry");
 }
 
-void RefreshPdhGroupIfDue(PdhGroup& group) {
+void RecoverPdhGroupIfNeeded(PdhGroup& group) {
     if (group.wildcard_path.empty()) {
         return;
     }
 
     const DWORD now = GetTickCount();
-    if (!group.ready || group.query == nullptr) {
-        if (group.last_refresh_tick == 0 ||
-            TickPassed(now, group.last_refresh_tick + kGpuGroupRefreshIntervalMs)) {
-            RebuildPdhGroup(group);
-        }
-        return;
-    }
-
-    if (TickPassed(now, group.last_refresh_tick + kGpuGroupRefreshIntervalMs)) {
+    if (ShouldReinitializePdhGroup(
+            group.ready,
+            group.query != nullptr && group.counter != nullptr,
+            now,
+            group.last_init_attempt_tick,
+            kPdhRetryIntervalMs)) {
         RebuildPdhGroup(group);
     }
 }
 
+bool IsPdhValueStatusValid(PDH_STATUS status) {
+    return status == PDH_CSTATUS_VALID_DATA || status == PDH_CSTATUS_NEW_DATA;
+}
+
+PDH_STATUS ReadFormattedCounterArray(PdhGroup& group, DWORD& item_count) {
+    item_count = 0;
+    if (!group.formatted_buffer.empty()) {
+        DWORD buffer_size = static_cast<DWORD>(group.formatted_buffer.size());
+        const PDH_STATUS existing_buffer_result = PdhGetFormattedCounterArrayW(
+            group.counter,
+            PDH_FMT_DOUBLE,
+            &buffer_size,
+            &item_count,
+            reinterpret_cast<PPDH_FMT_COUNTERVALUE_ITEM_W>(group.formatted_buffer.data()));
+        if (existing_buffer_result == ERROR_SUCCESS) {
+            return ERROR_SUCCESS;
+        }
+        if (existing_buffer_result != static_cast<PDH_STATUS>(PDH_MORE_DATA)) {
+            return existing_buffer_result;
+        }
+    }
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        DWORD buffer_size = 0;
+        item_count = 0;
+        const PDH_STATUS size_result = PdhGetFormattedCounterArrayW(
+            group.counter,
+            PDH_FMT_DOUBLE,
+            &buffer_size,
+            &item_count,
+            nullptr);
+        if (size_result == ERROR_SUCCESS && buffer_size == 0 && item_count == 0) {
+            group.formatted_buffer.clear();
+            return ERROR_SUCCESS;
+        }
+        if (size_result != static_cast<PDH_STATUS>(PDH_MORE_DATA) || buffer_size == 0) {
+            return size_result;
+        }
+
+        group.formatted_buffer.resize(buffer_size);
+        DWORD available_size = static_cast<DWORD>(group.formatted_buffer.size());
+        const PDH_STATUS values_result = PdhGetFormattedCounterArrayW(
+            group.counter,
+            PDH_FMT_DOUBLE,
+            &available_size,
+            &item_count,
+            reinterpret_cast<PPDH_FMT_COUNTERVALUE_ITEM_W>(group.formatted_buffer.data()));
+        if (values_result == ERROR_SUCCESS) {
+            return ERROR_SUCCESS;
+        }
+        if (values_result != static_cast<PDH_STATUS>(PDH_MORE_DATA)) {
+            return values_result;
+        }
+    }
+
+    return PDH_MORE_DATA;
+}
+
 double SamplePdhGroup(PdhGroup& group, bool sum_values) {
-    if (!group.ready || group.query == nullptr) {
+    if (!group.ready || group.query == nullptr || group.counter == nullptr) {
         return -1.0;
     }
 
@@ -1383,19 +1625,59 @@ double SamplePdhGroup(PdhGroup& group, bool sum_values) {
     bool any = false;
     PDH_STATUS first_format_failure = ERROR_SUCCESS;
 
-    for (HCOUNTER counter : group.counters) {
-        PDH_FMT_COUNTERVALUE value{};
-        const PDH_STATUS format_result = PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE, nullptr, &value);
-        if (format_result != ERROR_SUCCESS || value.CStatus != ERROR_SUCCESS) {
-            if (first_format_failure == ERROR_SUCCESS) {
-                first_format_failure = format_result != ERROR_SUCCESS ? format_result : value.CStatus;
-            }
-            continue;
+    if (group.wildcard_array) {
+        DWORD item_count = 0;
+        const PDH_STATUS format_result = ReadFormattedCounterArray(group, item_count);
+        if (format_result != ERROR_SUCCESS) {
+            ReportPdhFailure(group, L"format_array", format_result);
+            return -1.0;
+        }
+        ReportPdhStageRecovered(group, L"format_array");
+
+        group.instance_count_known = true;
+        group.last_instance_count = item_count;
+        if (!group.instance_inventory_logged) {
+            group.instance_inventory_logged = true;
+            LogInfo(
+                L"event=metric_provider_inventory provider=%ls instances=%lu",
+                group.name.c_str(),
+                item_count);
         }
 
-        any = true;
-        total += value.doubleValue;
-        max_value = std::max(max_value, value.doubleValue);
+        const auto* items = reinterpret_cast<const PDH_FMT_COUNTERVALUE_ITEM_W*>(
+            group.formatted_buffer.data());
+        for (DWORD index = 0; index < item_count; ++index) {
+            const PDH_FMT_COUNTERVALUE& value = items[index].FmtValue;
+            if (!IsPdhValueStatusValid(value.CStatus)) {
+                if (first_format_failure == ERROR_SUCCESS) {
+                    first_format_failure = value.CStatus;
+                }
+                continue;
+            }
+
+            any = true;
+            total += value.doubleValue;
+            max_value = std::max(max_value, value.doubleValue);
+        }
+        if (item_count == 0) {
+            any = true;
+            total = 0.0;
+            max_value = 0.0;
+        }
+    } else {
+        PDH_FMT_COUNTERVALUE value{};
+        const PDH_STATUS format_result = PdhGetFormattedCounterValue(
+            group.counter,
+            PDH_FMT_DOUBLE,
+            nullptr,
+            &value);
+        if (format_result == ERROR_SUCCESS && IsPdhValueStatusValid(value.CStatus)) {
+            any = true;
+            total = value.doubleValue;
+            max_value = value.doubleValue;
+        } else {
+            first_format_failure = format_result != ERROR_SUCCESS ? format_result : value.CStatus;
+        }
     }
 
     if (!any) {
@@ -1434,10 +1716,8 @@ void SampleMetrics() {
     SampleCpu(g_app.metrics.cpu, g_app.metrics.current);
     SampleMemory(g_app.metrics.current);
     SampleNetwork(g_app.metrics.network, g_app.metrics.current);
-    RefreshPdhGroupIfDue(g_app.metrics.gpu);
-    if (!g_app.metrics.disk.ready || g_app.metrics.disk.query == nullptr) {
-        RefreshPdhGroupIfDue(g_app.metrics.disk);
-    }
+    RecoverPdhGroupIfNeeded(g_app.metrics.gpu);
+    RecoverPdhGroupIfNeeded(g_app.metrics.disk);
     g_app.metrics.current.gpu = SamplePdhGroup(g_app.metrics.gpu, true);
     g_app.metrics.current.disk = SamplePdhGroup(g_app.metrics.disk, false);
     SampleKeys(g_app.metrics.current);
@@ -4218,8 +4498,18 @@ void InitializeMonitor(HWND controller) {
         g_app.placement.taskbar_identity.committed;
     AddTrayIcon(controller);
     RegisterTrayEventHooks();
-    InitPdhGroup(g_app.metrics.gpu, L"gpu", L"\\GPU Engine(*)\\Utilization Percentage");
-    InitPdhGroup(g_app.metrics.disk, L"disk", L"\\PhysicalDisk(_Total)\\% Disk Time");
+    InitializePdhGroupMeasured(
+        g_app.metrics.gpu,
+        L"gpu",
+        L"\\GPU Engine(*)\\Utilization Percentage",
+        true,
+        L"initial");
+    InitializePdhGroupMeasured(
+        g_app.metrics.disk,
+        L"disk",
+        L"\\PhysicalDisk(_Total)\\% Disk Time",
+        false,
+        L"initial");
     SampleMetrics();
     const bool refresh_timer = InstallTimer(controller, kRefreshTimer, 1000, L"refresh");
     const bool placement_timer = SetPlacementTimer(kPlacementIntervalMs);
@@ -4235,10 +4525,12 @@ void InitializeMonitor(HWND controller) {
     if (g_app.window.overlay_hwnd) {
         UpdateWindow(g_app.window.overlay_hwnd);
     }
+    RecordStartupPerformance(L"monitor_ready");
 }
 
 LRESULT HandleControllerCreate(HWND hwnd) {
     g_app.window.controller_hwnd = hwnd;
+    RecordStartupPerformance(L"controller_ready");
     if (g_app.window.launched_at_startup) {
         if (!InstallTimer(hwnd, kStartupInitTimer, kStartupInitDelayMs, L"startup_init")) {
             LogWarning(L"event=startup_delay_bypassed reason=timer_install_failed");
@@ -4285,6 +4577,9 @@ LRESULT HandleTimer(HWND hwnd, UINT_PTR timer_id) {
         : OverlayReconcileReposition;
     ReconcileOverlayState(trigger, flags);
     MaybeLogHealth(trigger);
+    if (timer_id == kRefreshTimer) {
+        MaybeRecordStartupPerformanceSettled();
+    }
     return 0;
 }
 
@@ -4483,6 +4778,7 @@ bool RegisterWindowClasses(HINSTANCE instance) {
 }
 
 int Run(HINSTANCE instance) {
+    g_app.startup_performance.process_entry_tick = GetTickCount64();
     g_app.window.instance = instance;
     g_app.window.taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
     const DWORD taskbar_message_error =
@@ -4499,6 +4795,7 @@ int Run(HINSTANCE instance) {
         g_app.window.taskbar_created,
         static_cast<unsigned long>(co_result));
     LogConfigSnapshot(L"config_loaded");
+    RecordStartupPerformance(L"logging_ready");
     if (taskbar_message_error != ERROR_SUCCESS) {
         LogError(
             L"event=startup_component_failed component=taskbar_message error=%lu",
@@ -4566,7 +4863,6 @@ int Run(HINSTANCE instance) {
         }
         return 1;
     }
-
     MSG msg{};
     BOOL message_result = 0;
     while ((message_result = GetMessageW(&msg, nullptr, 0, 0)) > 0) {

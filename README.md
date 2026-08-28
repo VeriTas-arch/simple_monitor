@@ -55,17 +55,6 @@ For the usual edit-build-run loop during development, use:
 It stops any running `simple_monitor_dev.exe` and rebuilds only the dev target.
 Start the new executable manually after the build completes.
 
-For a complete stop, build, and interactive restart, use:
-
-```pwsh
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\dev-rebuild.ps1 -Restart
-```
-
-The restart path first verifies that it can see the interactive
-`Shell_TrayWnd`, stops only this repository's dev executable, and reports the
-new PID. It deliberately refuses to stop the running instance when the caller
-cannot access the interactive taskbar.
-
 ## Development status
 
 `simple_monitor_dev` remains the taskbar-visibility beta; `simple_monitor` is
@@ -148,6 +137,14 @@ sequence number, monotonic elapsed time, and `event=...` fields. Use
 On startup, the previous active file is normally retained as the corresponding
 `.1` backup. The active log attempts rotation at 2 MiB; if rotation fails, the
 logger preserves the current file, reports the logger failure, and retries later.
+When the dev build is launched with `--startup`, it also appends structured
+process-performance checkpoints to `build/startup-perf-dev.log`. This file is
+not reset by manual restarts, rotates to `.1` at 256 KiB, and records the
+`logging_ready`, `controller_ready`, `monitor_ready`, and 30-second `settled`
+stages. Records include cumulative process CPU time, process I/O byte counts,
+PDH initialization duration, and the observed GPU instance count. Process I/O
+counters do not include every form of memory-mapped image paging, so use a WPR
+boot trace when Windows-equivalent CPU and disk attribution is required.
 Repeated sustained failures are rate-limited with suppressed counts and duration.
 Rapid failure/recovery flapping is sampled using the same cooldown, with one
 recovery record for each reported failure period. At `info` or `debug` level,
