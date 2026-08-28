@@ -167,6 +167,12 @@ struct OverlayIntent {
     bool updates_frozen = false;
 };
 
+constexpr bool HasNewPresentation(
+    std::uint64_t present_success_sequence,
+    std::uint64_t required_after_sequence) {
+    return present_success_sequence > required_after_sequence;
+}
+
 constexpr OverlayIntent ComputeOverlayIntent(
     bool taskbar_ready,
     SuppressionReason committed_suppression,

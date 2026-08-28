@@ -8,6 +8,19 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+function(simple_monitor_enable_warnings target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /WX)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(${target} PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+            -Werror
+        )
+    endif()
+endfunction()
+
 add_executable(simple_monitor WIN32
     src/main.cpp
     app.rc
@@ -30,6 +43,7 @@ set(SIMPLE_MONITOR_COMMON_SOURCES
 
 foreach(target IN LISTS SIMPLE_MONITOR_TARGETS)
     target_sources(${target} PRIVATE ${SIMPLE_MONITOR_COMMON_SOURCES})
+    simple_monitor_enable_warnings(${target})
 
     target_link_libraries(${target} PRIVATE
         user32
@@ -54,15 +68,15 @@ if(BUILD_TESTING)
         tests/overlay_policy_tests.cpp
     )
     target_include_directories(overlay_policy_tests PRIVATE src)
-    if(MINGW)
-        target_compile_options(overlay_policy_tests PRIVATE
-            -Wall
-            -Wextra
-            -Wpedantic
-            -Werror
-        )
-    endif()
+    simple_monitor_enable_warnings(overlay_policy_tests)
     add_test(NAME overlay_policy_tests COMMAND overlay_policy_tests)
+
+    add_executable(overlay_policy_trace_tests
+        tests/overlay_policy_trace_tests.cpp
+    )
+    target_include_directories(overlay_policy_trace_tests PRIVATE src)
+    simple_monitor_enable_warnings(overlay_policy_trace_tests)
+    add_test(NAME overlay_policy_trace_tests COMMAND overlay_policy_trace_tests)
 endif()
 
 # Enable MinGW Unicode entry point handling so the app uses `wWinMain`

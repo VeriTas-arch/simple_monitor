@@ -16,7 +16,7 @@
 - Run the platform-independent policy tests before restarting the GUI:
 
   ```powershell
-  cmake --build build --target overlay_policy_tests
+  cmake --build build --target overlay_policy_tests overlay_policy_trace_tests
   ctest --test-dir build --output-on-failure
   ```
 

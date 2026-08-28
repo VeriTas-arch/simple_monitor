@@ -40,6 +40,12 @@ Run the platform-independent visibility-policy tests with:
 ctest --test-dir build --output-on-failure
 ```
 
+The test suite includes focused reducer tests plus table-driven trace replay for
+PowerPoint transitions, Start/Search transients, screenshot freeze, taskbar
+auto-hide, Explorer restart, display/DPI repair decisions, and the
+present-before-show sequence gate. These tests do not replace validation on an
+interactive Windows desktop.
+
 For the usual edit-build-run loop during development, use:
 
 ```pwsh
@@ -48,6 +54,33 @@ For the usual edit-build-run loop during development, use:
 
 It stops any running `simple_monitor_dev.exe` and rebuilds only the dev target.
 Start the new executable manually after the build completes.
+
+For a complete stop, build, and interactive restart, use:
+
+```pwsh
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\dev-rebuild.ps1 -Restart
+```
+
+The restart path first verifies that it can see the interactive
+`Shell_TrayWnd`, stops only this repository's dev executable, and reports the
+new PID. It deliberately refuses to stop the running instance when the caller
+cannot access the interactive taskbar.
+
+## Development status
+
+`simple_monitor_dev` remains the taskbar-visibility beta; `simple_monitor` is
+the stable implementation. The dev implementation should be promoted only
+after all of the following are true:
+
+- A clean local Release build compiles stable, dev, and both policy-test targets
+  without warnings.
+- Interactive checks pass for normal startup, Start/Search, Snipping Tool,
+  PowerPoint slideshow entry/exit, taskbar auto-hide, Explorer restart, and
+  display/DPI changes.
+- Fresh dev logs show the expected suppression and visibility commits, healthy
+  owner/generation state, and no unexplained warnings or failure counters.
+- CMake, manifest, release notes, and the Git tag are assigned one consistent
+  release version as part of the promotion commit.
 
 ## Current MVP
 
@@ -128,9 +161,11 @@ For an overlay disappearance, inspect `suppression_candidate`,
 `overlay_repair`, `health`, `render_failed`, `present_failed`, and `timer_gap`
 in sequence.
 
-Raw performance samples, key states, window titles, and the full command line
-are not logged. Logs do include the configuration path plus relevant process
-basenames and window classes; review them before sharing outside your system.
+Raw performance samples, key states, and the full command line are not logged.
+Logs do include the configuration path plus relevant process basenames and
+window classes. When a dev suppression decision changes, its context record can
+also include truncated, line-sanitized foreground and root window titles.
+Review logs before sharing them outside your system.
 
 `Start with Windows` writes the current executable path under `HKCU Run`.
 The stable executable uses `SimpleMonitor`; the dev executable uses

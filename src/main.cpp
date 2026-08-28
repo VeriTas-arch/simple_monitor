@@ -27,6 +27,7 @@
 
 #include "app_support.h"
 #include "logging.h"
+#include "win32_function.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -251,7 +252,9 @@ void SafeRelease(T*& value) {
 UINT WindowDpi(HWND hwnd) {
     using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
     static auto get_dpi_for_window =
-        reinterpret_cast<GetDpiForWindowFn>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"));
+        simple_monitor::LoadOptionalFunction<GetDpiForWindowFn>(
+            GetModuleHandleW(L"user32.dll"),
+            "GetDpiForWindow");
 
     if (get_dpi_for_window) {
         UINT dpi = get_dpi_for_window(hwnd);
@@ -299,10 +302,12 @@ void EnableSystemMenuTheme() {
     using SetPreferredAppModeFn = PreferredAppMode(WINAPI*)(PreferredAppMode);
     using FlushMenuThemesFn = void(WINAPI*)();
 
-    auto set_preferred_app_mode =
-        reinterpret_cast<SetPreferredAppModeFn>(GetProcAddress(uxtheme, MAKEINTRESOURCEA(135)));
-    auto flush_menu_themes =
-        reinterpret_cast<FlushMenuThemesFn>(GetProcAddress(uxtheme, MAKEINTRESOURCEA(136)));
+    auto set_preferred_app_mode = simple_monitor::LoadOptionalFunction<SetPreferredAppModeFn>(
+        uxtheme,
+        MAKEINTRESOURCEA(135));
+    auto flush_menu_themes = simple_monitor::LoadOptionalFunction<FlushMenuThemesFn>(
+        uxtheme,
+        MAKEINTRESOURCEA(136));
 
     if (set_preferred_app_mode) {
         set_preferred_app_mode(PreferredAppMode::AllowDark);
@@ -2994,10 +2999,12 @@ int Run(HINSTANCE instance) {
     using DpiAwarenessContext = HANDLE;
     using SetProcessDpiAwarenessContextFn = BOOL(WINAPI*)(DpiAwarenessContext);
     auto set_dpi_awareness =
-        reinterpret_cast<SetProcessDpiAwarenessContextFn>(
-            GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext"));
+        simple_monitor::LoadOptionalFunction<SetProcessDpiAwarenessContextFn>(
+            GetModuleHandleW(L"user32.dll"),
+            "SetProcessDpiAwarenessContext");
     if (set_dpi_awareness) {
-        if (!set_dpi_awareness(reinterpret_cast<DpiAwarenessContext>(-4))) {
+        if (!set_dpi_awareness(
+                reinterpret_cast<DpiAwarenessContext>(static_cast<INT_PTR>(-4)))) {
             const DWORD error = GetLastError();
             if (error == ERROR_ACCESS_DENIED) {
                 LogDebug(

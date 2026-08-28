@@ -29,6 +29,7 @@
 #include "app_support.h"
 #include "logging.h"
 #include "overlay_policy.h"
+#include "win32_function.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -95,6 +96,7 @@ enum MenuId : UINT {
 using simple_monitor::overlay_policy::ComputeOverlayIntent;
 using simple_monitor::overlay_policy::ComputeOverlayRepairIntent;
 using simple_monitor::overlay_policy::DecideInitialOwnerBindingAction;
+using simple_monitor::overlay_policy::HasNewPresentation;
 using simple_monitor::overlay_policy::InitialOwnerBindingAction;
 using simple_monitor::overlay_policy::OverlayIntent;
 using simple_monitor::overlay_policy::OverlayRepairObservation;
@@ -360,7 +362,9 @@ void SafeRelease(T*& value) {
 UINT WindowDpi(HWND hwnd) {
     using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
     static auto get_dpi_for_window =
-        reinterpret_cast<GetDpiForWindowFn>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"));
+        simple_monitor::LoadOptionalFunction<GetDpiForWindowFn>(
+            GetModuleHandleW(L"user32.dll"),
+            "GetDpiForWindow");
 
     if (get_dpi_for_window) {
         UINT dpi = get_dpi_for_window(hwnd);
@@ -412,10 +416,12 @@ void EnableSystemMenuTheme() {
     using SetPreferredAppModeFn = PreferredAppMode(WINAPI*)(PreferredAppMode);
     using FlushMenuThemesFn = void(WINAPI*)();
 
-    auto set_preferred_app_mode =
-        reinterpret_cast<SetPreferredAppModeFn>(GetProcAddress(uxtheme, MAKEINTRESOURCEA(135)));
-    auto flush_menu_themes =
-        reinterpret_cast<FlushMenuThemesFn>(GetProcAddress(uxtheme, MAKEINTRESOURCEA(136)));
+    auto set_preferred_app_mode = simple_monitor::LoadOptionalFunction<SetPreferredAppModeFn>(
+        uxtheme,
+        MAKEINTRESOURCEA(135));
+    auto flush_menu_themes = simple_monitor::LoadOptionalFunction<FlushMenuThemesFn>(
+        uxtheme,
+        MAKEINTRESOURCEA(136));
 
     if (set_preferred_app_mode) {
         set_preferred_app_mode(PreferredAppMode::AllowDark);
@@ -3548,18 +3554,6 @@ bool PresentPixels(
     return updated != FALSE;
 }
 
-bool ReapplyLastFrame(HWND hwnd, const wchar_t* source = L"reapply") {
-    if (g_app.render.last_frame.empty()) {
-        return false;
-    }
-    return PresentPixels(
-        hwnd,
-        g_app.render.last_frame.data(),
-        g_app.render.last_frame_width,
-        g_app.render.last_frame_height,
-        source);
-}
-
 void ResetLayeredSurface(HWND hwnd) {
     const LONG_PTR ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
     SetLastError(ERROR_SUCCESS);
@@ -3662,8 +3656,9 @@ bool PrepareOverlayForShow(HWND hwnd, const wchar_t* trigger, bool reset_surface
     const std::uint64_t required_after_sequence =
         g_app.diagnostics.present_success_sequence;
     RenderOverlay(hwnd);
-    const bool presented =
-        g_app.diagnostics.present_success_sequence > required_after_sequence;
+    const bool presented = HasNewPresentation(
+        g_app.diagnostics.present_success_sequence,
+        required_after_sequence);
     if (!presented) {
         if (!IsWindowVisible(hwnd)) {
             CommitOverlayHidden(hwnd, trigger, L"present_failed_before_show");
@@ -4518,10 +4513,12 @@ int Run(HINSTANCE instance) {
     using DpiAwarenessContext = HANDLE;
     using SetProcessDpiAwarenessContextFn = BOOL(WINAPI*)(DpiAwarenessContext);
     auto set_dpi_awareness =
-        reinterpret_cast<SetProcessDpiAwarenessContextFn>(
-            GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext"));
+        simple_monitor::LoadOptionalFunction<SetProcessDpiAwarenessContextFn>(
+            GetModuleHandleW(L"user32.dll"),
+            "SetProcessDpiAwarenessContext");
     if (set_dpi_awareness) {
-        if (!set_dpi_awareness(reinterpret_cast<DpiAwarenessContext>(-4))) {
+        if (!set_dpi_awareness(
+                reinterpret_cast<DpiAwarenessContext>(static_cast<INT_PTR>(-4)))) {
             const DWORD error = GetLastError();
             if (error == ERROR_ACCESS_DENIED) {
                 LogDebug(
