@@ -3,3 +3,4 @@ build/
 *.exe
 *.obj
 TrafficMonitor-master/
+.codex-temp/
