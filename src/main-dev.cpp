@@ -109,6 +109,7 @@ using simple_monitor::overlay_policy::PresentationVisibility;
 using simple_monitor::overlay_policy::ReduceSuppressionPolicy;
 using simple_monitor::overlay_policy::ReduceTaskbarIdentity;
 using simple_monitor::overlay_policy::ResolveSuppressionObservation;
+using simple_monitor::overlay_policy::ShouldPromoteOverlayDuringScreenshotResume;
 using simple_monitor::overlay_policy::SuppressionObservation;
 using simple_monitor::overlay_policy::SuppressionPolicyState;
 using simple_monitor::overlay_policy::SuppressionReason;
@@ -3955,6 +3956,35 @@ bool CommitOverlayHidden(HWND hwnd, const wchar_t* trigger, const wchar_t* reaso
     return true;
 }
 
+bool PromoteVisibleOverlayTopmost(HWND hwnd, const wchar_t* trigger) {
+    if (!hwnd || !IsWindow(hwnd) || !IsWindowVisible(hwnd)) {
+        return false;
+    }
+
+    const BOOL positioned = SetWindowPos(
+        hwnd,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    if (!positioned) {
+        LogErrorRateLimited(
+            L"overlay.screenshot_resume_topmost",
+            kFailureLogIntervalMs,
+            L"event=screenshot_resume_visibility result=failed trigger=%ls action=promote_topmost error=%lu",
+            trigger,
+            GetLastError());
+        return false;
+    }
+
+    LogFailureRecovered(
+        L"overlay.screenshot_resume_topmost",
+        L"event=component_recovered component=screenshot_resume_visibility action=promote_topmost");
+    return true;
+}
+
 bool PrepareOverlayForShow(HWND hwnd, const wchar_t* trigger, bool reset_surface) {
     if (!hwnd || !IsWindow(hwnd)) {
         return false;
@@ -4212,7 +4242,10 @@ void ReconcileOverlayStateOnce(const wchar_t* trigger, unsigned flags) {
 
     HWND foreground = GetForegroundWindow();
     const bool screenshot_foreground = IsBuiltinScreenshotForeground(foreground);
+    const bool screenshot_was_frozen = g_app.suppression.overlay_update_frozen;
     UpdateFreezePolicy(screenshot_foreground);
+    const bool screenshot_resumed =
+        screenshot_was_frozen && !g_app.suppression.overlay_update_frozen;
     const bool suppression_changed =
         UpdateSuppressionPolicy(trigger, foreground, screenshot_foreground);
     const OverlayIntent intent = ComputeOverlayIntent(
@@ -4240,7 +4273,22 @@ void ReconcileOverlayStateOnce(const wchar_t* trigger, unsigned flags) {
     const bool resume_pending =
         g_app.suppression.refresh_resume_tick != 0 &&
         !TickPassed(GetTickCount(), g_app.suppression.refresh_resume_tick);
-    if (intent.updates_frozen || resume_pending) {
+    if (intent.updates_frozen) {
+        defer_actions(OverlayReconcileResetSurface);
+        return;
+    }
+    if (ShouldPromoteOverlayDuringScreenshotResume(
+            intent,
+            screenshot_foreground,
+            resume_pending)) {
+        const bool promoted = PromoteVisibleOverlayTopmost(overlay, trigger);
+        if (screenshot_resumed) {
+            LogInfo(
+                L"event=screenshot_resume_visibility result=%ls trigger=%ls action=promote_topmost continuous_visible=%d",
+                promoted ? L"ok" : L"failed",
+                trigger,
+                IsWindowVisible(overlay) ? 1 : 0);
+        }
         defer_actions(OverlayReconcileResetSurface);
         return;
     }
@@ -4250,6 +4298,7 @@ void ReconcileOverlayStateOnce(const wchar_t* trigger, unsigned flags) {
             OverlayReconcileReposition |
             OverlayReconcileRender;
         g_app.suppression.refresh_resume_tick = 0;
+        PromoteVisibleOverlayTopmost(overlay, L"screenshot_resume_complete");
     }
 
     const bool restoring_visibility =

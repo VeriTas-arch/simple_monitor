@@ -187,6 +187,30 @@ void TestSuppressionDoesNotDestroyOverlayIntent() {
     Check(!screenshot_hidden.should_be_visible, "screenshot should preserve committed hidden state");
 }
 
+void TestScreenshotResumePromotesOnlyVisibleOverlay() {
+    const auto visible = policy::ComputeOverlayIntent(
+        true,
+        policy::SuppressionReason::None,
+        false);
+    Check(
+        policy::ShouldPromoteOverlayDuringScreenshotResume(visible, false, true),
+        "screenshot resume should promote an overlay that should remain visible");
+    Check(
+        !policy::ShouldPromoteOverlayDuringScreenshotResume(visible, true, true),
+        "active screenshot capture should remain above the overlay");
+    Check(
+        !policy::ShouldPromoteOverlayDuringScreenshotResume(visible, false, false),
+        "normal refresh should not churn the topmost z-order");
+
+    const auto suppressed = policy::ComputeOverlayIntent(
+        true,
+        policy::SuppressionReason::FullscreenPresentation,
+        false);
+    Check(
+        !policy::ShouldPromoteOverlayDuringScreenshotResume(suppressed, false, true),
+        "screenshot resume must not expose an overlay suppressed by a presentation");
+}
+
 void TestSuppressionCandidateMustRemainStable() {
     const policy::SuppressionPolicyConfig config{250, 500};
     const policy::SuppressionObservation enter{
@@ -337,6 +361,7 @@ int main() {
     TestFastSuppressionProfile();
     TestSuppressionProfileChangeRestartsDwell();
     TestSuppressionDoesNotDestroyOverlayIntent();
+    TestScreenshotResumePromotesOnlyVisibleOverlay();
     TestSuppressionCandidateMustRemainStable();
     TestInitialOwnerBindingRetryBoundary();
     TestRepairSeparatesRefreshFromVisibilityCommit();

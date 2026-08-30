@@ -167,6 +167,13 @@ struct OverlayIntent {
     bool updates_frozen = false;
 };
 
+constexpr bool ShouldPromoteOverlayDuringScreenshotResume(
+    OverlayIntent intent,
+    bool screenshot_foreground,
+    bool resume_pending) {
+    return intent.should_be_visible && !screenshot_foreground && resume_pending;
+}
+
 constexpr bool HasNewPresentation(
     std::uint64_t present_success_sequence,
     std::uint64_t required_after_sequence) {
