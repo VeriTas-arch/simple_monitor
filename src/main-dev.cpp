@@ -105,6 +105,7 @@ using simple_monitor::overlay_policy::ComputeOverlayRepairIntent;
 using simple_monitor::overlay_policy::DecideInitialOwnerBindingAction;
 using simple_monitor::overlay_policy::HasNewPresentation;
 using simple_monitor::overlay_policy::InitialOwnerBindingAction;
+using simple_monitor::overlay_policy::MatchesWeChatScreenshotWindowProfile;
 using simple_monitor::overlay_policy::OverlayIntent;
 using simple_monitor::overlay_policy::OverlayRepairObservation;
 using simple_monitor::overlay_policy::PresentationVisibility;
@@ -977,6 +978,28 @@ MonitorCoverageObservation ObserveWindowMonitorCoverage(HWND window) {
         window_rect.right >= monitor_info.rcMonitor.right - tolerance &&
         window_rect.bottom >= monitor_info.rcMonitor.bottom - tolerance;
     return covers ? MonitorCoverageObservation::Covers : MonitorCoverageObservation::Clear;
+}
+
+bool IsWeChatScreenshotForeground(HWND foreground) {
+    if (!foreground || foreground == g_app.window.overlay_hwnd) {
+        return false;
+    }
+
+    const LONG_PTR style = GetWindowLongPtrW(foreground, GWL_STYLE);
+    const LONG_PTR ex_style = GetWindowLongPtrW(foreground, GWL_EXSTYLE);
+    return MatchesWeChatScreenshotWindowProfile(
+        WindowProcessBasename(foreground) == L"weixin.exe",
+        WindowClassIs(foreground, L"Qt51514QWindowIcon"),
+        GetAncestor(foreground, GA_ROOT) == foreground &&
+            GetWindow(foreground, GW_OWNER) == nullptr,
+        ObserveWindowMonitorCoverage(foreground) == MonitorCoverageObservation::Covers,
+        (style & WS_CAPTION) == 0,
+        (ex_style & WS_EX_TOPMOST) != 0);
+}
+
+bool IsScreenshotForeground(HWND foreground) {
+    return IsBuiltinScreenshotForeground(foreground) ||
+           IsWeChatScreenshotForeground(foreground);
 }
 
 ForegroundCoverageObservation ObserveForegroundMonitorCoverage(HWND foreground) {
@@ -4328,7 +4351,7 @@ void ReconcileOverlayStateOnce(const wchar_t* trigger, unsigned flags) {
     }
 
     HWND foreground = GetForegroundWindow();
-    const bool screenshot_foreground = IsBuiltinScreenshotForeground(foreground);
+    const bool screenshot_foreground = IsScreenshotForeground(foreground);
     const bool screenshot_was_frozen = g_app.suppression.overlay_update_frozen;
     UpdateFreezePolicy(screenshot_foreground);
     const bool screenshot_resumed =

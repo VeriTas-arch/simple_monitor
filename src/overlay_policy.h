@@ -174,6 +174,21 @@ constexpr bool ShouldPromoteOverlayDuringScreenshotResume(
     return intent.should_be_visible && !screenshot_foreground && resume_pending;
 }
 
+constexpr bool MatchesWeChatScreenshotWindowProfile(
+    bool executable_matches,
+    bool window_class_matches,
+    bool top_level_unowned,
+    bool covers_monitor,
+    bool borderless,
+    bool topmost) {
+    return executable_matches &&
+           window_class_matches &&
+           top_level_unowned &&
+           covers_monitor &&
+           borderless &&
+           topmost;
+}
+
 constexpr bool ShouldPromoteOverlayForTaskViewTransition(
     OverlayIntent intent,
     bool overlay_visible,

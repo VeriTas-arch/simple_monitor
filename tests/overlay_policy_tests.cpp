@@ -211,6 +211,45 @@ void TestScreenshotResumePromotesOnlyVisibleOverlay() {
         "screenshot resume must not expose an overlay suppressed by a presentation");
 }
 
+void TestWeChatScreenshotRequiresExactWindowProfile() {
+    Check(
+        policy::MatchesWeChatScreenshotWindowProfile(
+            true,
+            true,
+            true,
+            true,
+            true,
+            true),
+        "the observed WeChat screenshot window profile should match");
+    Check(
+        !policy::MatchesWeChatScreenshotWindowProfile(
+            true,
+            true,
+            true,
+            false,
+            true,
+            true),
+        "a normal non-fullscreen WeChat window must not match");
+    Check(
+        !policy::MatchesWeChatScreenshotWindowProfile(
+            true,
+            true,
+            true,
+            true,
+            false,
+            true),
+        "a captioned fullscreen WeChat window must not match");
+    Check(
+        !policy::MatchesWeChatScreenshotWindowProfile(
+            false,
+            true,
+            true,
+            true,
+            true,
+            true),
+        "another application's fullscreen window must not match");
+}
+
 void TestTaskViewTransitionPromotesOnlyVisibleOverlay() {
     const auto visible = policy::ComputeOverlayIntent(
         true,
@@ -418,6 +457,7 @@ int main() {
     TestSuppressionProfileChangeRestartsDwell();
     TestSuppressionDoesNotDestroyOverlayIntent();
     TestScreenshotResumePromotesOnlyVisibleOverlay();
+    TestWeChatScreenshotRequiresExactWindowProfile();
     TestTaskViewTransitionPromotesOnlyVisibleOverlay();
     TestTaskViewTransitionCompletesOnNextForegroundWindow();
     TestTaskViewStabilizationRunsOnceDelayExpires();
