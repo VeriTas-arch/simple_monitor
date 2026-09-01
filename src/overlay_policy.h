@@ -174,6 +174,29 @@ constexpr bool ShouldPromoteOverlayDuringScreenshotResume(
     return intent.should_be_visible && !screenshot_foreground && resume_pending;
 }
 
+constexpr bool ShouldPromoteOverlayForTaskViewTransition(
+    OverlayIntent intent,
+    bool overlay_visible,
+    bool task_view_transition) {
+    return intent.should_be_visible &&
+           !intent.updates_frozen &&
+           overlay_visible &&
+           task_view_transition;
+}
+
+constexpr bool ShouldCompleteTaskViewTransition(
+    bool task_view_window,
+    bool transition_pending) {
+    return !task_view_window && transition_pending;
+}
+
+constexpr bool ShouldRunTaskViewStabilization(
+    bool pending,
+    std::uint64_t now_ms,
+    std::uint64_t stabilize_after_ms) {
+    return pending && now_ms >= stabilize_after_ms;
+}
+
 constexpr bool HasNewPresentation(
     std::uint64_t present_success_sequence,
     std::uint64_t required_after_sequence) {

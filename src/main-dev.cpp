@@ -72,6 +72,7 @@ constexpr DWORD kOverlayRepairIntervalMs = 5000;
 constexpr DWORD kPresentStaleThresholdMs = 5000;
 constexpr std::uint64_t kInitialOwnerBindingRetryIntervalMs = 500;
 constexpr unsigned kInitialOwnerBindingMaxAttempts = 8;
+constexpr std::uint64_t kTaskViewStabilizeDelayMs = 500;
 constexpr std::uint64_t kTaskbarIdentitySettleMs = 250;
 constexpr simple_monitor::overlay_policy::SuppressionPolicyConfig kSuppressionPolicyConfig{
     250,
@@ -87,6 +88,7 @@ constexpr UINT WM_TRAYICON = WM_APP + 1;
 constexpr UINT WM_TRAY_LAYOUT_CHANGED = WM_APP + 2;
 constexpr UINT WM_RECONCILE = WM_APP + 3;
 constexpr UINT WM_INITIALIZE_METRICS = WM_APP + 4;
+constexpr UINT WM_FOREGROUND_CHANGED = WM_APP + 5;
 constexpr int kAppIconResource = 101;
 
 enum MenuId : UINT {
@@ -109,7 +111,10 @@ using simple_monitor::overlay_policy::PresentationVisibility;
 using simple_monitor::overlay_policy::ReduceSuppressionPolicy;
 using simple_monitor::overlay_policy::ReduceTaskbarIdentity;
 using simple_monitor::overlay_policy::ResolveSuppressionObservation;
+using simple_monitor::overlay_policy::ShouldCompleteTaskViewTransition;
 using simple_monitor::overlay_policy::ShouldPromoteOverlayDuringScreenshotResume;
+using simple_monitor::overlay_policy::ShouldPromoteOverlayForTaskViewTransition;
+using simple_monitor::overlay_policy::ShouldRunTaskViewStabilization;
 using simple_monitor::overlay_policy::SuppressionObservation;
 using simple_monitor::overlay_policy::SuppressionPolicyState;
 using simple_monitor::overlay_policy::SuppressionReason;
@@ -127,6 +132,7 @@ enum OverlayReconcileFlag : unsigned {
     OverlayReconcileResetSurface = 1U << 4,
     OverlayReconcileRefreshTrayIcon = 1U << 5,
     OverlayReconcileApplyStyle = 1U << 6,
+    OverlayReconcilePromoteForTaskView = 1U << 7,
 };
 
 enum class PreferredAppMode {
@@ -278,6 +284,9 @@ struct ReconcileState {
     bool active = false;
     bool pending = false;
     bool message_queued = false;
+    bool task_view_transition_pending = false;
+    bool task_view_stabilize_pending = false;
+    std::uint64_t task_view_stabilize_after_ms = 0;
 };
 
 struct MetricsState {
@@ -816,6 +825,11 @@ bool IsTaskbarPreviewWindow(HWND hwnd) {
     // a fullscreen application.
     return WindowClassIs(hwnd, L"TaskListThumbnailWnd") ||
            WindowClassIs(hwnd, L"XamlExplorerHostIslandWindow");
+}
+
+bool IsTaskViewWindow(HWND hwnd) {
+    return WindowClassIs(hwnd, L"XamlExplorerHostIslandWindow") &&
+           WindowProcessBasename(hwnd) == L"explorer.exe";
 }
 
 bool IsBuiltinScreenshotForeground(HWND foreground) {
@@ -1798,12 +1812,35 @@ bool UpdateLayeredStyle(HWND hwnd) {
 
 void CALLBACK TrayEventProc(
     HWINEVENTHOOK,
-    DWORD,
+    DWORD event,
     HWND hwnd,
     LONG id_object,
     LONG,
     DWORD,
     DWORD) {
+    if (event == EVENT_SYSTEM_FOREGROUND) {
+        if (g_app.window.controller_hwnd &&
+            IsWindow(g_app.window.controller_hwnd) &&
+            hwnd != g_app.window.overlay_hwnd) {
+            if (!PostMessageW(
+                    g_app.window.controller_hwnd,
+                    WM_FOREGROUND_CHANGED,
+                    event,
+                    reinterpret_cast<LPARAM>(hwnd))) {
+                LogWarningRateLimited(
+                    L"shell.post_foreground",
+                    kFailureLogIntervalMs,
+                    L"event=shell_message_failed message=foreground error=%lu",
+                    GetLastError());
+            } else {
+                LogFailureRecovered(
+                    L"shell.post_foreground",
+                    L"event=component_recovered component=shell_message message=foreground");
+            }
+        }
+        return;
+    }
+
     if (!g_app.window.controller_hwnd ||
         !IsWindow(g_app.window.controller_hwnd) ||
         !IsTaskbarRelatedWindow(hwnd)) {
@@ -1838,6 +1875,7 @@ void RegisterTrayEventHooks() {
         EVENT_OBJECT_HIDE,
         EVENT_OBJECT_REORDER,
         EVENT_OBJECT_LOCATIONCHANGE,
+        EVENT_SYSTEM_FOREGROUND,
     };
 
     size_t installed = 0;
@@ -2644,23 +2682,6 @@ bool ReconcileInitialOwnerBinding(const wchar_t* trigger) {
         reinterpret_cast<LONG_PTR>(target));
     const DWORD set_error =
         previous_owner_value == 0 ? GetLastError() : ERROR_SUCCESS;
-    effective_owner = GetWindow(overlay, GW_OWNER);
-    state.next_retry_ms = now_ms + kInitialOwnerBindingRetryIntervalMs;
-    if (effective_owner != target) {
-        LogWarning(
-            L"event=overlay_owner_binding result=retry_failed trigger=%ls hwnd=%p target=%p effective_owner=%p "
-            L"attempt=%u max_attempts=%u set_error=%lu generation=%llu",
-            trigger,
-            overlay,
-            target,
-            effective_owner,
-            state.attempts,
-            kInitialOwnerBindingMaxAttempts,
-            set_error,
-            static_cast<unsigned long long>(g_app.diagnostics.overlay_generation));
-        return false;
-    }
-
     SetLastError(ERROR_SUCCESS);
     const BOOL positioned = SetWindowPos(
         overlay,
@@ -2671,6 +2692,23 @@ bool ReconcileInitialOwnerBinding(const wchar_t* trigger) {
         0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
     const DWORD position_error = positioned ? ERROR_SUCCESS : GetLastError();
+    effective_owner = GetWindow(overlay, GW_OWNER);
+    state.next_retry_ms = now_ms + kInitialOwnerBindingRetryIntervalMs;
+    if (effective_owner != target) {
+        LogWarning(
+            L"event=overlay_owner_binding result=retry_failed trigger=%ls hwnd=%p target=%p effective_owner=%p "
+            L"attempt=%u max_attempts=%u set_error=%lu topmost_error=%lu generation=%llu",
+            trigger,
+            overlay,
+            target,
+            effective_owner,
+            state.attempts,
+            kInitialOwnerBindingMaxAttempts,
+            set_error,
+            position_error,
+            static_cast<unsigned long long>(g_app.diagnostics.overlay_generation));
+        return false;
+    }
     LogInfo(
         L"event=overlay_owner_binding result=ok trigger=%ls hwnd=%p target=%p effective_owner=%p "
         L"attempt=%u set_error=%lu topmost_error=%lu generation=%llu",
@@ -2810,6 +2848,23 @@ bool EnsureOverlayWindow(DWORD* error_out) {
     g_app.window.dpi = WindowDpi(overlay);
     g_app.placement.taskbar_owner = taskbar;
     UpdateLayeredStyle(overlay);
+    const BOOL disable_transitions = TRUE;
+    const HRESULT transition_hresult = DwmSetWindowAttribute(
+        overlay,
+        DWMWA_TRANSITIONS_FORCEDISABLED,
+        &disable_transitions,
+        sizeof(disable_transitions));
+    if (SUCCEEDED(transition_hresult)) {
+        LogInfo(
+            L"event=overlay_dwm_attribute result=ok attribute=transitions_forced_disabled generation=%llu",
+            static_cast<unsigned long long>(g_app.diagnostics.overlay_generation));
+    } else {
+        LogWarningRateLimited(
+            L"overlay.dwm_disable_transitions",
+            kFailureLogIntervalMs,
+            L"event=overlay_dwm_attribute result=failed attribute=transitions_forced_disabled hresult=0x%08lx",
+            static_cast<unsigned long>(transition_hresult));
+    }
     const HWND effective_owner = GetWindow(overlay, GW_OWNER);
     LogInfo(
         L"event=overlay_created hwnd=%p requested_owner=%p effective_owner=%p owner_bound=%d generation=%llu",
@@ -3985,6 +4040,38 @@ bool PromoteVisibleOverlayTopmost(HWND hwnd, const wchar_t* trigger) {
     return true;
 }
 
+bool PromoteVisibleOverlayForTaskView(HWND hwnd, const wchar_t* trigger) {
+    if (!hwnd || !IsWindow(hwnd) || !IsWindowVisible(hwnd)) {
+        return false;
+    }
+
+    const BOOL positioned = SetWindowPos(
+        hwnd,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    const DWORD position_error = positioned ? ERROR_SUCCESS : GetLastError();
+    HWND above = GetWindow(hwnd, GW_HWNDPREV);
+    const std::wstring above_exe = WindowProcessBasename(above);
+    const std::wstring above_class = WindowClassName(above);
+    LogInfo(
+        L"event=task_view_visibility result=%ls trigger=%ls action=promote_topmost "
+        L"continuous_visible=%d owner=%p above=%p above_exe=%ls above_class=%ls above_visible=%d error=%lu",
+        positioned ? L"ok" : L"failed",
+        trigger,
+        IsWindowVisible(hwnd) ? 1 : 0,
+        GetWindow(hwnd, GW_OWNER),
+        above,
+        above_exe.c_str(),
+        above_class.c_str(),
+        above && IsWindowVisible(above) ? 1 : 0,
+        position_error);
+    return positioned != FALSE;
+}
+
 bool PrepareOverlayForShow(HWND hwnd, const wchar_t* trigger, bool reset_surface) {
     if (!hwnd || !IsWindow(hwnd)) {
         return false;
@@ -4348,6 +4435,12 @@ void ReconcileOverlayStateOnce(const wchar_t* trigger, unsigned flags) {
         SampleKeysIfChanged()) {
         should_render = true;
     }
+    if (ShouldPromoteOverlayForTaskViewTransition(
+            intent,
+            IsWindowVisible(overlay) != FALSE,
+            (flags & OverlayReconcilePromoteForTaskView) != 0)) {
+        PromoteVisibleOverlayForTaskView(overlay, trigger);
+    }
     if ((flags & OverlayReconcileReposition) != 0 && RepositionWindow()) {
         should_render = true;
     }
@@ -4707,7 +4800,19 @@ LRESULT HandleTimer(HWND hwnd, UINT_PTR timer_id) {
             }
         }
         g_app.diagnostics.last_state_timer_tick = now;
-        ReconcileOverlayState(L"state_timer", OverlayReconcileSampleKeys);
+        const std::uint64_t now_ms = GetTickCount64();
+        unsigned flags = OverlayReconcileSampleKeys;
+        const wchar_t* trigger = L"state_timer";
+        if (ShouldRunTaskViewStabilization(
+                g_app.reconcile.task_view_stabilize_pending,
+                now_ms,
+                g_app.reconcile.task_view_stabilize_after_ms)) {
+            g_app.reconcile.task_view_stabilize_pending = false;
+            g_app.reconcile.task_view_stabilize_after_ms = 0;
+            flags |= OverlayReconcileReposition | OverlayReconcilePromoteForTaskView;
+            trigger = L"task_view_stabilize";
+        }
+        ReconcileOverlayState(trigger, flags);
         MaybeLogHealth(L"state_timer");
         return 0;
     }
@@ -4763,7 +4868,50 @@ LRESULT HandleTrayLayoutChanged() {
     }
 
     LogInfo(L"event=tray_layout_changed");
-    RequestOverlayReconcile(L"tray_layout_change", OverlayReconcileReposition);
+    unsigned flags = OverlayReconcileReposition;
+    if (IsTaskViewWindow(GetForegroundWindow())) {
+        flags |= OverlayReconcilePromoteForTaskView;
+    }
+    RequestOverlayReconcile(L"tray_layout_change", flags);
+    return 0;
+}
+
+LRESULT HandleForegroundChanged(WPARAM source_event, LPARAM source_lparam) {
+    if (!g_app.window.monitor_initialized) {
+        return 0;
+    }
+
+    const HWND source = reinterpret_cast<HWND>(source_lparam);
+    const std::wstring source_exe = WindowProcessBasename(source);
+    const std::wstring source_class = WindowClassName(source);
+    const bool task_view =
+        source_exe == L"explorer.exe" &&
+        source_class == L"XamlExplorerHostIslandWindow";
+    LogInfo(
+        L"event=foreground_changed source_event=%llu source_exe=%ls source_class=%ls task_view=%d overlay_visible=%d",
+        static_cast<unsigned long long>(source_event),
+        source_exe.c_str(),
+        source_class.c_str(),
+        task_view ? 1 : 0,
+        IsWindowVisible(g_app.window.overlay_hwnd) ? 1 : 0);
+    const bool transition_completed = ShouldCompleteTaskViewTransition(
+        task_view,
+        g_app.reconcile.task_view_transition_pending);
+    if (!task_view && !transition_completed) {
+        return 0;
+    }
+    g_app.reconcile.task_view_transition_pending = task_view;
+    if (task_view) {
+        g_app.reconcile.task_view_stabilize_pending = false;
+        g_app.reconcile.task_view_stabilize_after_ms = 0;
+    } else {
+        g_app.reconcile.task_view_stabilize_pending = true;
+        g_app.reconcile.task_view_stabilize_after_ms =
+            GetTickCount64() + kTaskViewStabilizeDelayMs;
+    }
+    RequestOverlayReconcile(
+        task_view ? L"task_view_started" : L"task_view_completed",
+        OverlayReconcileReposition | OverlayReconcilePromoteForTaskView);
     return 0;
 }
 
@@ -4870,6 +5018,9 @@ LRESULT CALLBACK ControllerWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
 
     case WM_TRAY_LAYOUT_CHANGED:
         return HandleTrayLayoutChanged();
+
+    case WM_FOREGROUND_CHANGED:
+        return HandleForegroundChanged(wparam, lparam);
 
     case WM_RECONCILE:
         HandleQueuedOverlayReconcile();

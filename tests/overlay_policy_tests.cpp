@@ -211,6 +211,62 @@ void TestScreenshotResumePromotesOnlyVisibleOverlay() {
         "screenshot resume must not expose an overlay suppressed by a presentation");
 }
 
+void TestTaskViewTransitionPromotesOnlyVisibleOverlay() {
+    const auto visible = policy::ComputeOverlayIntent(
+        true,
+        policy::SuppressionReason::None,
+        false);
+    Check(
+        policy::ShouldPromoteOverlayForTaskViewTransition(visible, true, true),
+        "a task view transition should promote a visible overlay");
+    Check(
+        !policy::ShouldPromoteOverlayForTaskViewTransition(visible, true, false),
+        "normal reconciliation should not churn the shell z-order");
+    Check(
+        !policy::ShouldPromoteOverlayForTaskViewTransition(visible, false, true),
+        "a task view transition must not expose a currently hidden overlay");
+
+    const auto screenshot = policy::ComputeOverlayIntent(
+        true,
+        policy::SuppressionReason::None,
+        true);
+    Check(
+        !policy::ShouldPromoteOverlayForTaskViewTransition(screenshot, true, true),
+        "task view handling must not promote while screenshot updates are frozen");
+
+    const auto suppressed = policy::ComputeOverlayIntent(
+        true,
+        policy::SuppressionReason::FullscreenPresentation,
+        false);
+    Check(
+        !policy::ShouldPromoteOverlayForTaskViewTransition(suppressed, true, true),
+        "task view handling must not expose a suppressed overlay");
+}
+
+void TestTaskViewTransitionCompletesOnNextForegroundWindow() {
+    Check(
+        policy::ShouldCompleteTaskViewTransition(false, true),
+        "the first non-task-view foreground window must complete a pending transition");
+    Check(
+        !policy::ShouldCompleteTaskViewTransition(true, true),
+        "the task view foreground window must not complete its own transition");
+    Check(
+        !policy::ShouldCompleteTaskViewTransition(false, false),
+        "ordinary foreground changes must not create task view transition work");
+}
+
+void TestTaskViewStabilizationRunsOnceDelayExpires() {
+    Check(
+        policy::ShouldRunTaskViewStabilization(true, 500, 500),
+        "task view stabilization should run when its delay expires");
+    Check(
+        !policy::ShouldRunTaskViewStabilization(true, 499, 500),
+        "task view stabilization should wait for its delay");
+    Check(
+        !policy::ShouldRunTaskViewStabilization(false, 500, 500),
+        "cancelled task view stabilization must not run");
+}
+
 void TestSuppressionCandidateMustRemainStable() {
     const policy::SuppressionPolicyConfig config{250, 500};
     const policy::SuppressionObservation enter{
@@ -362,6 +418,9 @@ int main() {
     TestSuppressionProfileChangeRestartsDwell();
     TestSuppressionDoesNotDestroyOverlayIntent();
     TestScreenshotResumePromotesOnlyVisibleOverlay();
+    TestTaskViewTransitionPromotesOnlyVisibleOverlay();
+    TestTaskViewTransitionCompletesOnNextForegroundWindow();
+    TestTaskViewStabilizationRunsOnceDelayExpires();
     TestSuppressionCandidateMustRemainStable();
     TestInitialOwnerBindingRetryBoundary();
     TestRepairSeparatesRefreshFromVisibilityCommit();
